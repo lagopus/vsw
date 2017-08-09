@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package packets_io;
+
+message packet {
+  string subifname = 1;
+  uint32 len = 2;
+  bytes data = 3;
+}
+
+message bulk_packets {
+  int64 n = 1;
+  repeated packet packets = 2;
+}
+
+message result {
+  int64 r = 1;
+}
+
+message null {
+}
+
+service packets_io {
+  rpc send_bulk (bulk_packets) returns (result) {}
+  rpc recv_bulk (null) returns (bulk_packets) {}
+}

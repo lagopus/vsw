@@ -1,0 +1,62 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+Vagrant.configure("2") do |config|
+  # The most common configuration options are documented and commented below.
+  # For a complete reference, please see the online documentation at
+  # https://docs.vagrantup.com.
+
+  # Every Vagrant development environment requires a box. You can search for
+  # boxes at https://atlas.hashicorp.com/search.
+  config.vm.box = "ubuntu/xenial64"
+
+  config.vm.define "ingress" do |ingress|
+    ingress.vm.network "private_network", ip: "10.1.0.10", virtualbox__intnet: "ingress"
+    ingress.vm.provider "virtualbox" do |virtualbox|
+      virtualbox.memory = "1024"
+      virtualbox.cpus = "1"
+      virtualbox.customize ['modifyvm', :id, '--cableconnected1', 'on']
+      # Enable promiscuous mode
+      virtualbox.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
+    end
+    ingress.vm.provision "shell", inline: "ip route add 10.2.0.0/24 via 10.1.0.1"
+    ingress.vm.provision "shell", inline: "apt-get install -y iperf"
+  end
+  config.vm.define "lagopus" do |lagopus|
+    lagopus.vm.box_check_update = "false"
+    lagopus.vm.network "private_network", auto_config: false, virtualbox__intnet: "ingress"
+    lagopus.vm.network "private_network", auto_config: false, virtualbox__intnet: "egress"
+    lagopus.vm.synced_folder "..", "/home/ubuntu/vsw"
+    lagopus.vm.synced_folder "../../lagopus-router", "/home/ubuntu/lagopus-router"
+    lagopus.vm.synced_folder "../../../../../bin", "/home/ubuntu/bin"
+    lagopus.vm.provider "virtualbox" do |virtualbox|
+      virtualbox.memory = "2048"
+      virtualbox.cpus = "8"
+      virtualbox.customize ['modifyvm', :id, '--cableconnected1', 'on']
+      # Enable promiscuous mode
+      virtualbox.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
+#      virtualbox.customize ["modifyvm", :id, "--uartmode1", "server", "/tmp/vagrant-ttyS0.sock"]
+    end
+    lagopus.vm.provision "shell", path: "initial-setup.sh"
+    lagopus.vm.provision "shell", path: "setup.sh", run: "always"
+  end
+  config.vm.define "egress" do |egress|
+    egress.vm.network "private_network", ip: "10.2.0.10", virtualbox__intnet: "egress"
+    egress.vm.provider "virtualbox" do |virtualbox|
+      virtualbox.memory = "1024"
+      virtualbox.cpus = "1"
+      virtualbox.customize ['modifyvm', :id, '--cableconnected1', 'on']
+      # Enable promiscuous mode
+      virtualbox.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
+    end
+    egress.vm.provision "shell", inline: "ip route add 10.1.0.0/24 via 10.2.0.1"
+    egress.vm.provision "shell", inline: "apt-get install -y iperf"
+  end
+  # Enable provisioning with a shell script. Additional provisioners such as
+  # Puppet, Chef, Ansible, Salt, and Docker are also available. Please see the
+  # documentation for more information about their specific syntax and use.
+  # config.vm.provision "shell", inline: <<-SHELL
+  #   apt-get update
+  #   apt-get install -y apache2
+  # SHELL
+end

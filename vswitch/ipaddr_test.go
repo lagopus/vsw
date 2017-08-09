@@ -1,0 +1,109 @@
+//
+// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+package vswitch
+
+import (
+	"github.com/lagopus/vsw/utils/notifier"
+	"net"
+	"reflect"
+	"testing"
+	"time"
+)
+
+type testClass struct {
+	name string
+	*IPAddrs
+}
+
+func checkNoti(ch chan notifier.Notification, t notifier.Type, tgt interface{}, v interface{}) (bool, *notifier.Notification) {
+	timeout := time.NewTicker(1 * time.Second)
+	select {
+	case n := <-ch:
+		if n.Type != t || n.Target != tgt || !reflect.DeepEqual(n.Value, v) {
+			return false, &n
+		}
+		return true, nil
+
+	case <-timeout.C:
+		timeout.Stop()
+		return false, nil
+	}
+}
+
+func listener(t *testing.T, ch chan notifier.Notification) {
+	for noti := range ch {
+		t.Log(noti)
+	}
+}
+
+func TestIPAddrs(t *testing.T) {
+	c := &testClass{name: "test"}
+	c.IPAddrs = newIPAddrs(c)
+
+	ch := GetNotifier().Listen()
+	//	go listener(t, ch)
+
+	ipa := IPAddr{net.IPv4(192, 168, 1, 1), net.CIDRMask(24, 32)}
+	c.AddIPAddr(ipa)
+	t.Log(c.ListIPAddrs())
+
+	if ok, noti := checkNoti(ch, notifier.Add, c, ipa); !ok {
+		t.Errorf("Got %v. Expected %v, %v, %v\n", noti, notifier.Add, c, ipa)
+	} else {
+		t.Log("Notificaiton ok.")
+	}
+
+	ipa = IPAddr{net.IPv4(192, 168, 1, 1), net.CIDRMask(16, 32)}
+	c.AddIPAddr(ipa)
+	t.Log(c.ListIPAddrs())
+
+	if ok, noti := checkNoti(ch, notifier.Update, c, ipa); !ok {
+		t.Errorf("Got %v. Expected %v, %v, %v\n", noti, notifier.Update, c, ipa)
+	} else {
+		t.Log("Notificaiton ok.")
+	}
+
+	ipa2 := IPAddr{net.IPv4(192, 168, 1, 2), net.CIDRMask(32, 32)}
+	c.AddIPAddr(ipa2)
+	t.Log(c.ListIPAddrs())
+
+	if ok, noti := checkNoti(ch, notifier.Add, c, ipa2); !ok {
+		t.Errorf("Got %v. Expected %v, %v, %v\n", noti, notifier.Add, c, ipa2)
+	} else {
+		t.Log("Notificaiton ok.")
+	}
+
+	ipa3 := IPAddr{net.IPv4(192, 168, 1, 3), net.CIDRMask(32, 32)}
+	c.AddIPAddr(ipa3)
+	t.Log(c.ListIPAddrs())
+
+	if ok, noti := checkNoti(ch, notifier.Add, c, ipa3); !ok {
+		t.Errorf("Got %v. Expected %v, %v, %v\n", noti, notifier.Add, c, ipa3)
+	} else {
+		t.Log("Notificaiton ok.")
+	}
+
+	c.DeleteIPAddr(ipa2)
+	t.Log(c.ListIPAddrs())
+
+	if ok, noti := checkNoti(ch, notifier.Delete, c, ipa2); !ok {
+		t.Errorf("Got %v. Expected %v, %v, %v\n", noti, notifier.Delete, c, ipa2)
+	} else {
+		t.Log("Notificaiton ok.")
+	}
+
+}

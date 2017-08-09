@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package rpc;
+
+enum ResultCode {
+	SUCCESS = 0;
+	FAILURE = 1;
+}
+
+message Reply {
+	ResultCode code = 1;
+}
+
+message VifEntry {
+	string name = 1;
+	string addr = 2;
+}
+
+message VifInfo {
+	uint64 n = 1;
+	repeated VifEntry entries = 2;
+}
+
+service Vrrp {
+	rpc GetVifInfo(VifInfo) returns (VifInfo) {}
+	rpc ToMaster(VifInfo) returns (Reply) {}
+	rpc ToBackup(VifInfo) returns (Reply) {}
+}

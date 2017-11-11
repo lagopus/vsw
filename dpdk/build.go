@@ -18,6 +18,6 @@ package dpdk
 
 /*
 #cgo CFLAGS: -I/usr/local/include/dpdk -m64 -pthread -O3 -msse4.2
-#cgo LDFLAGS: -L/usr/local/lib -ldpdk
+#cgo LDFLAGS: -L/usr/local/lib -ldpdk -ldl
 */
 import "C"

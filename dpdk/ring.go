@@ -29,13 +29,17 @@ import (
 
 const (
 	SOCKET_ID_ANY = int(C.SOCKET_ID_ANY)
-	RING_F_SP_ENQ = uint(C.RING_F_SP_ENQ)
-	RING_F_SC_DEQ = uint(C.RING_F_SC_DEQ)
 )
 
 type Ring C.struct_rte_ring
+type RingFlags uint
 
-func RingCreate(name string, count uint, socket_id int, flags uint) *Ring {
+const (
+	RING_F_SP_ENQ = RingFlags(C.RING_F_SP_ENQ)
+	RING_F_SC_DEQ = RingFlags(C.RING_F_SC_DEQ)
+)
+
+func RingCreate(name string, count uint, socket_id int, flags RingFlags) *Ring {
 	cname := C.CString(name)
 	defer C.free((unsafe.Pointer)(cname))
 	return (*Ring)(C.rte_ring_create(cname, C.unsigned(count), C.int(socket_id), C.unsigned(flags)))
@@ -60,8 +64,14 @@ func (r *Ring) EnqueueMbuf(mbuf *Mbuf) int {
 func (r *Ring) DequeueMbuf(mbuf **Mbuf) int {
 	return r.Dequeue((*unsafe.Pointer)(unsafe.Pointer(mbuf)))
 }
+
 func (r *Ring) EnqueueBurst(obj_tbl *unsafe.Pointer, n uint) uint {
-	return uint(C.rte_ring_enqueue_burst((*C.struct_rte_ring)(r), obj_tbl, C.unsigned(n)))
+	return uint(C.rte_ring_enqueue_burst((*C.struct_rte_ring)(r), obj_tbl, C.unsigned(n), nil))
+}
+
+func (r *Ring) EnqueueBulk(obj_tbl *unsafe.Pointer, n uint) bool {
+	cn := C.unsigned(n)
+	return C.rte_ring_enqueue_bulk((*C.struct_rte_ring)(r), obj_tbl, cn, nil) == cn
 }
 
 func (r *Ring) EnqueueBurstMbufs(mbufs []*Mbuf) uint {
@@ -69,7 +79,12 @@ func (r *Ring) EnqueueBurstMbufs(mbufs []*Mbuf) uint {
 }
 
 func (r *Ring) DequeueBurst(obj_tbl *unsafe.Pointer, n uint) uint {
-	return uint(C.rte_ring_dequeue_burst((*C.struct_rte_ring)(r), obj_tbl, C.unsigned(n)))
+	return uint(C.rte_ring_dequeue_burst((*C.struct_rte_ring)(r), obj_tbl, C.unsigned(n), nil))
+}
+
+func (r *Ring) DequeueBulk(obj_tbl *unsafe.Pointer, n uint) bool {
+	cn := C.unsigned(n)
+	return C.rte_ring_dequeue_bulk((*C.struct_rte_ring)(r), obj_tbl, cn, nil) == cn
 }
 
 func (r *Ring) DequeueBurstMbufs(mbufs *[]*Mbuf) uint {

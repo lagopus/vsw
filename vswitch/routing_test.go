@@ -18,9 +18,10 @@ package vswitch
 
 import (
 	"fmt"
-	"github.com/lagopus/vsw/utils/notifier"
 	"net"
 	"testing"
+
+	"github.com/lagopus/vsw/utils/notifier"
 )
 
 type testRtClass struct {
@@ -33,6 +34,7 @@ func TestRouting(t *testing.T) {
 	c.RoutingTable = newRoutingTable(c)
 
 	ch := GetNotifier().Listen()
+	defer GetNotifier().Close(ch)
 	//	go listener(t, ch)
 
 	// expect to add

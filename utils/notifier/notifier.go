@@ -22,7 +22,7 @@ import (
 )
 
 type Notifier struct {
-	listeners map[chan Notification]chan Notification
+	listeners map[chan Notification]struct{}
 	buffers   int
 	mutex     sync.Mutex
 }
@@ -58,7 +58,7 @@ func NewNotifier(buffers int) *Notifier {
 		buffers = 0
 	}
 	return &Notifier{
-		listeners: make(map[chan Notification]chan Notification),
+		listeners: make(map[chan Notification]struct{}),
 		buffers:   buffers,
 	}
 }
@@ -67,8 +67,8 @@ func (n *Notifier) Notify(t Type, tgt interface{}, v interface{}) {
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
 
-	for _, listener := range n.listeners {
-		listener <- Notification{t, tgt, v}
+	for ch := range n.listeners {
+		ch <- Notification{t, tgt, v}
 	}
 }
 
@@ -77,7 +77,7 @@ func (n *Notifier) Listen() chan Notification {
 	defer n.mutex.Unlock()
 
 	ch := make(chan Notification, n.buffers)
-	n.listeners[ch] = ch
+	n.listeners[ch] = struct{}{}
 	return ch
 }
 

@@ -17,9 +17,10 @@
 package vswitch
 
 import (
-	"github.com/lagopus/vsw/utils/notifier"
 	"net"
 	"testing"
+
+	"github.com/lagopus/vsw/utils/notifier"
 )
 
 type testNeighClass struct {
@@ -32,6 +33,7 @@ func TestNeighbours(t *testing.T) {
 	c.Neighbours = newNeighbours(c)
 
 	ch := GetNotifier().Listen()
+	defer GetNotifier().Close(ch)
 	//	go listener(t, ch)
 
 	mac, _ := net.ParseMAC("01:23:45:67:89:ab")
@@ -112,4 +114,5 @@ func TestNeighbours(t *testing.T) {
 		}
 	}
 	t.Log(c.ListEntries())
+
 }

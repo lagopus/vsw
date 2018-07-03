@@ -22,24 +22,25 @@ package hostif
 import "C"
 
 import (
+	"fmt"
 	"net"
 	"unsafe"
 
-	"github.com/lagopus/vsw/vswitch"
 	"github.com/lagopus/vsw/dpdk"
+	"github.com/lagopus/vsw/vswitch"
 
+	pb "github.com/lagopus/vsw/modules/hostif/packets_io"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
-	pb "github.com/lagopus/vsw/modules/hostif/packets_io"
 )
 
 var log = vswitch.Logger
 
 type HostifModule struct {
-	vswitch.ModuleService
+	base    *vswitch.BaseInstance
 	running bool
 	done    chan int
-	server *grpc.Server
+	server  *grpc.Server
 }
 
 /*
@@ -52,17 +53,15 @@ type HostifConfig struct {
 }
 
 //
-func createHostifModule(p *vswitch.ModuleParam) (vswitch.Module, error) {
+func newHostifInstance(base *vswitch.BaseInstance, i interface{}) (vswitch.Instance, error) {
 	return &HostifModule{
-		ModuleService: vswitch.NewModuleService(p),
-		running:       true,
-		done:          make(chan int),
+		base:    base,
+		running: true,
+		done:    make(chan int),
 	}, nil
 }
 
-func (him *HostifModule) Control(c string, v interface{}) interface{} {
-	log.Printf("%s: Control(%v): Value=%v\n", him.Name(), c, v)
-	return true
+func (him *HostifModule) Free() {
 }
 
 func (him *HostifModule) ServerStart(sock net.Listener) {
@@ -70,49 +69,44 @@ func (him *HostifModule) ServerStart(sock net.Listener) {
 	close(him.done)
 }
 
-func (him *HostifModule) Start() bool {
-	log.Printf("%s: Start()", him.Name())
+func (him *HostifModule) Enable() error {
+	log.Printf("%s: Start()", him.base.Name())
 
 	if !him.running {
-		log.Printf("%s: Terminated before start", him.Name())
-		return false
+		return fmt.Errorf("%s: Terminated before start", him.base.Name())
 	}
 	sock, err := net.Listen("tcp", ":30020")
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("%s: %v", him.base.Name(), err)
 	}
 	him.server = grpc.NewServer()
 	pb.RegisterPacketsIoServer(him.server, him)
 	go him.ServerStart(sock)
-	return true
+	return nil
 }
 
 func (him *HostifModule) SendBulk(ctx context.Context, pkts *pb.BulkPackets) (*pb.Result, error) {
-	rings := make(map[string]*dpdk.Ring)
-	vifids := make(map[string]vswitch.VifIndex)
-	for _, rule := range him.Rules().SubRules(vswitch.MATCH_OUT_VIF) {
-		vifid := (vswitch.VifIndex)(rule.Param[0])
-		if vswitch.GetVifInfo(vifid) != nil {
-			rings[vswitch.GetVifInfo(vifid).String()] = rule.Ring
-			vifids[vswitch.GetVifInfo(vifid).String()] = vifid
-		}
-	}
+	pool := vswitch.GetDpdkResource().Mempool
+
 	if pkts.N > 0 {
-		dpdk := vswitch.GetDpdkResource()
-		mbufs := dpdk.Mempool.AllocBulkMbufs(uint(pkts.N));
 		/* pkts to mbufs */
 		for i := int64(0); i < pkts.N; i++ {
-			mbufs[i].SetData(pkts.Packets[i].Data)
-			md := (*vswitch.Metadata)(mbufs[i].Metadata())
 			vifname := pkts.Packets[i].GetSubifname()
-			if rings[vifname] != nil {
-				md.SetOutVIF(vifids[vifname])
-				if rings[vifname].Enqueue(unsafe.Pointer(mbufs[i])) != 0 {
-					mbufs[i].Free()
+
+			if vif := vswitch.GetVIFByName(vifname); vif != nil {
+				if mbuf := pool.AllocMbuf(); mbuf != nil {
+					mbuf.SetData(pkts.Packets[i].Data)
+					md := (*vswitch.Metadata)(mbuf.Metadata())
+					md.SetOutVIF(vif.Index())
+
+					if vif.Input().Enqueue(unsafe.Pointer(mbuf)) != 0 {
+						mbuf.Free()
+					}
+				} else {
+					log.Printf("%s: AllocMbuf() failed", him.base.Name())
 				}
 			} else {
-				log.Printf("rings[\"%s\"] == nil", vifname)
-				mbufs[i].Free()
+				log.Printf(`%s: rings["%s"] == nil`, him.base.Name(), vifname)
 			}
 		}
 	}
@@ -122,42 +116,39 @@ func (him *HostifModule) SendBulk(ctx context.Context, pkts *pb.BulkPackets) (*p
 func (him *HostifModule) RecvBulk(ctx context.Context, in *pb.Null) (*pb.BulkPackets, error) {
 	mbufs := make([]*dpdk.Mbuf, 1024)
 
-	for _, iring := range [...]*dpdk.Ring{him.Input(), him.VifInput()} {
-		if iring != nil {
-			rxc := iring.DequeueBurstMbufs(&mbufs)
-			if rxc > 0 {
-				pkts := make([]*pb.Packet, rxc)
-				for i := uint(0); i < rxc; i++ {
-					m := mbufs[i]
-					mlen := uint32(m.DataLen())
-					pkts[i] = new(pb.Packet)
-					pkts[i].Len = mlen
-					md := (*vswitch.Metadata)(m.Metadata())
-					pkts[i].Subifname = vswitch.GetVifInfo(md.InVIF()).String()
-					for _,b := range m.Data() {
-						pkts[i].Data = append(pkts[i].Data, b)
-					}
-				}
-				bps := &pb.BulkPackets{
-					N:       int64(rxc),
-					Packets: pkts,
-				}
-				return bps, nil
+	iring := him.base.Input()
+
+	rxc := iring.DequeueBurstMbufs(&mbufs)
+	if rxc > 0 {
+		pkts := make([]*pb.Packet, rxc)
+		for i := uint(0); i < rxc; i++ {
+			m := mbufs[i]
+			md := (*vswitch.Metadata)(m.Metadata())
+			name := vswitch.GetVIFByIndex(md.InVIF()).Name()
+
+			pkts[i] = &pb.Packet{
+				Len:       uint32(m.DataLen()),
+				Subifname: name,
+				Data:      append([]byte(nil), m.Data()...),
 			}
+
+			m.Free()
 		}
+		bps := &pb.BulkPackets{
+			N:       int64(rxc),
+			Packets: pkts,
+		}
+		return bps, nil
 	}
+
 	bps := &pb.BulkPackets{}
 	return bps, nil
 }
 
-func (him *HostifModule) Stop() {
-	log.Printf("%s: Stop()", him.Name())
+func (him *HostifModule) Disable() {
+	log.Printf("%s: Disable()", him.base.Name())
 	him.running = false
 	him.server.Stop()
-}
-
-func (him *HostifModule) Wait() {
-	log.Printf("%s: Wait()", him.Name())
 	<-him.done
 }
 
@@ -168,10 +159,9 @@ func init() {
 	rp := &vswitch.RingParam{
 		Count:    C.MAX_HOSTIF_MBUFS,
 		SocketId: dpdk.SOCKET_ID_ANY,
-		Flags:    0,
 	}
 
-	if !vswitch.RegisterModule("hostif", createHostifModule, rp, vswitch.TypeOther) {
-		log.Fatalf("Failed to register the class.")
+	if err := vswitch.RegisterModule("hostif", newHostifInstance, rp, vswitch.TypeOther); err != nil {
+		log.Fatalf("Failed to register hostif: %v", err)
 	}
 }

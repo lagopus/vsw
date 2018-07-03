@@ -43,13 +43,13 @@ func TestNotify(t *testing.T) {
 		}()
 	}
 
-	noti.Notify(NotifyAdd, "notify 1")
+	noti.Notify(Add, "notify 1", nil)
 
 	for _, ack := range acks {
 		<-ack
 	}
 
-	noti.Notify(NotifyDelete, "notify 2")
+	noti.Notify(Delete, "notify 2", nil)
 
 	for _, ack := range acks {
 		<-ack
@@ -59,5 +59,5 @@ func TestNotify(t *testing.T) {
 		noti.Close(sub)
 	}
 
-	noti.Notify(NotifyAdd, "notify 3")
+	noti.Notify(Add, "notify 3", nil)
 }

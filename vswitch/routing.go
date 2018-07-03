@@ -18,10 +18,11 @@ package vswitch
 
 import (
 	"fmt"
-	"github.com/lagopus/vsw/utils/notifier"
 	"net"
 	"sync"
 	"syscall"
+
+	"github.com/lagopus/vsw/utils/notifier"
 )
 
 type RouteScope uint8
@@ -49,13 +50,13 @@ type Route struct {
 	Src      net.IP
 	Gw       net.IP
 	Metrics  int
-	VifIndex VifIndex
+	VIFIndex VIFIndex
 	Scope    RouteScope
 }
 
 func (r Route) String() string {
-	return fmt.Sprintf("Dst:%v Src:%v Gw:%v Metrics:%d Scope:%v Vif:%d",
-		r.Dst, r.Src, r.Gw, r.Metrics, r.Scope, r.VifIndex)
+	return fmt.Sprintf("Dst:%v Src:%v Gw:%v Metrics:%d Scope:%v VIF:%d",
+		r.Dst, r.Src, r.Gw, r.Metrics, r.Scope, r.VIFIndex)
 }
 
 // RoutingTable

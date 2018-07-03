@@ -30,80 +30,85 @@ const notificationBuffer = 100
 //
 // 1. VRF is created:
 //      Type: Notifier.Add
-//      Target: VrfInfo
+//      Target: *VRF
 //      Value: nil
 //
 // 2. VRF is deleted (XXX: Not supported yet):
 //      Type: Notifier.Delete
-//      Target: VrfInfo
+//      Target: *VRF
 //      Value: nil
 //
 // 3. VIF is added to VRF:
 //      Type: Notifier.Add
-//      Target: VrfInfo
-//      Value: VifInfo
+//      Target: *VRF
+//      Value: *VIF
 //
-// 4. Route is added to VRF:
+// 4. VIF is deleted from VRF:
+//      Type: Notifier.Delete
+//      Target: *VRF
+//      Value: *VIF
+//
+// 5. Route is added to VRF:
 //	Type: Notifier.Add
-//	Target: VrfInfo
+//	Target: *VRF
 //	Value: Route
 //
-// 5. Route is deleted from VRF:
+// 6. Route is deleted from VRF:
 //	Type: Notifier.Delete
-//	Target: VrfInfo
+//	Target: *VRF
 //	Value: Route
 //
 // VIF Related
 //
 // 1. VIF is deleted:
 //      Type: Notifier.Delete
-//      Target: VifInfo
+//      Target: *VIF
 //      Value: nil
 //
-// 2. MAC Address has been set:
+// 2. MTU has been set:
 //      Type: Notifier.Update
-//      Target: VifInfo
-//      Value: net.HardwareAddr
-//
-// 3. MTU has been set:
-//      Type: Notifier.Update
-//      Target: VifInfo
+//      Target: *VIF
 //      Value: MTU
 //
-// 4. IP Address is added:
+// 3. IP Address is added:
 //      Type: Notifer.Add
-//      Target: VifInfo
+//      Target: *VIF
 //      Value: IPAddr
 //
-// 5. IP Address is deleted:
+// 4. IP Address is deleted:
 //      Type: Notifer.Delete
-//      Target: VifInfo
+//      Target: *VIF
 //      Value: IPAddr
 //
-// 6. Prefix of IP Address has changed:
+// 5. Prefix of IP Address has changed:
 //      Type: Notifer.Update
-//      Target: VifInfo
+//      Target: *VIF
 //      Value: IPAddr
 //
-// 7. Link status has changed:
+// 6. VIF enabled or disabled
 // 	Type: Notifier.Update
-//	Target: VifInfo
-//	Value: LinkStatus
+//	Target: *VIF
+//	Value: bool
 //
-// 8. Neighbour entry added:
+// 7. Neighbour entry added:
 //	Type: Notifier.Add
-//	Target: VifInfo
+//	Target: *VIF
 //	Value: Neighbour
 //
-// 9. Neighbour entry updated:
+// 8. Neighbour entry updated:
 //	Type: Notifier.Update
-//	Target: VifInfo
+//	Target: *VIF
 //	Value: Neighbour
 //
-// 10. Neighbour entry deleted:
+// 9. Neighbour entry deleted:
 //	Type: Notifier.Delete
-//	Target: VifInfo
+//	Target: *VIF
 //	Value: Neighbour
+//
+// 10. MAC Address has changed:
+//	Type: Notifier.Update
+//	Target: *VIF
+//	Value: net.HardwareAddr
 //
 func GetNotifier() *notifier.Notifier {
 	return noti

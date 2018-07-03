@@ -17,90 +17,156 @@
 package tap
 
 import (
-	nlagent "github.com/lagopus/vsw/agents/netlink"
-	"github.com/lagopus/vsw/dpdk"
-	"github.com/lagopus/vsw/vswitch"
-	"os"
+	"errors"
+	"fmt"
 	"reflect"
 	"runtime"
 	"sync"
+	"syscall"
 	"time"
+
+	"github.com/lagopus/vsw/dpdk"
+	"github.com/lagopus/vsw/utils/notifier"
+	"github.com/lagopus/vsw/vswitch"
 )
 
 const (
+	queueLength      = 64
 	tapMaxRetryCount = 100
 	tapRetryInterval = 100 * time.Millisecond
 )
 
 var log = vswitch.Logger
 
-type vif struct {
-	output *dpdk.Ring
-	tap    *os.File
-	ch     chan *dpdk.Mbuf
+type vifInfo struct {
+	vif *vswitch.VIF
+	ch  chan *dpdk.Mbuf
 }
 
-type TapModule struct {
-	vswitch.ModuleService
-	running bool
+type TapInstance struct {
 	pool    *dpdk.MemPool
-	input   *dpdk.Ring
-	indices map[vswitch.VifIndex]int
-	vifs    []vif
-	stop    chan struct{}
+	base    *vswitch.BaseInstance
+	noti    *notifier.Notifier
+	notiCh  chan notifier.Notification
+	txCh    chan vifInfo
+	rxCh    chan struct{}
+	enabled bool
 	wg      sync.WaitGroup
+	rs      int
+	vrf     string
 }
 
-func newTap(p *vswitch.ModuleParam) (vswitch.Module, error) {
-	module := &TapModule{
-		ModuleService: vswitch.NewModuleService(p),
-		pool:          vswitch.GetDpdkResource().Mempool,
-		indices:       make(map[vswitch.VifIndex]int),
+func newTapInstance(base *vswitch.BaseInstance, i interface{}) (vswitch.Instance, error) {
+	vrf, ok := i.(string)
+	if !ok {
+		return nil, errors.New("VRF not specified")
 	}
-	return module, nil
+
+	t := &TapInstance{
+		base: base,
+		pool: vswitch.GetDpdkResource().Mempool,
+		noti: base.Rules().Notifier(),
+		txCh: make(chan vifInfo, 1),
+		rxCh: make(chan struct{}, 1),
+		vrf:  vrf,
+	}
+	t.notiCh = t.noti.Listen()
+	go t.listener()
+	go t.txTask()
+	return t, nil
 }
 
-func (tm *TapModule) Control(cmd string, v interface{}) interface{} {
-	return false
+func (t *TapInstance) Free() {
+	t.noti.Close(t.notiCh)
+	close(t.txCh)
+}
+
+func (t *TapInstance) listener() {
+	for n := range t.notiCh {
+		rule, ok := n.Value.(vswitch.Rule)
+		if !ok || rule.Match != vswitch.MATCH_OUT_VIF {
+			continue
+		}
+
+		vif, ok := rule.Param.(*vswitch.VIF)
+		if !ok {
+			continue
+		}
+
+		switch n.Type {
+		case notifier.Add:
+			ch := make(chan *dpdk.Mbuf)
+			t.txCh <- vifInfo{vif, ch}
+			go t.readFromTap(vif, ch)
+
+		case notifier.Delete:
+			// Deletion comes for free. If the netlink closes the tap,
+			// Read in readFromTap fails which causes channel to be closed.
+			// txTask then stops reading from the channel.
+		}
+	}
 }
 
 func newCase(v interface{}) reflect.SelectCase {
 	return reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(v)}
 }
 
-func (tm *TapModule) txTask() {
-	len := len(tm.vifs)
-	cases := make([]reflect.SelectCase, len+1)
-	for i, vif := range tm.vifs {
-		cases[i] = newCase(vif.ch)
-	}
-	cases[len] = newCase(tm.stop)
+func (t *TapInstance) txTask() {
+	cases := []reflect.SelectCase{newCase(t.txCh)}
+	vifs := make(map[int]*vswitch.VIF)
 
 	for {
 		chosen, value, ok := reflect.Select(cases)
+
 		if !ok {
-			// Stop requested
-			if chosen == len {
-				tm.wg.Done()
+			// Need to quit
+			if chosen == 0 {
 				return
 			}
-			cases[chosen].Chan = reflect.ValueOf(nil)
+
+			// Delete closed channel
+			l := len(cases) - 1
+			cases[chosen] = cases[l]
+			cases = cases[:l]
+
+			vifs[chosen] = vifs[l]
+			delete(vifs, l)
+
 			continue
 		}
-		if mbuf, ok := value.Interface().(*dpdk.Mbuf); ok {
-			//			log.Printf("%v: Forwarding packet to %d.", tm, chosen)
-			tm.vifs[chosen].output.EnqueueMbuf(mbuf)
+
+		switch v := value.Interface().(type) {
+		case vifInfo:
+			cases = append(cases, newCase(v.ch))
+			vifs[len(cases)-1] = v.vif
+
+		case *dpdk.Mbuf:
+			vif := vifs[chosen]
+			vif.Input().EnqueueMbuf(v)
 		}
 	}
 }
 
-func (tm *TapModule) readFromTap(vidx vswitch.VifIndex) {
+func (t *TapInstance) readFromTap(vif *vswitch.VIF, ch chan *dpdk.Mbuf) {
 	// MAC Header (14 Bytes) + MTU
-	buf := make([]byte, vswitch.GetVifInfo(vidx).MTU()+14)
+	buf := make([]byte, vif.MTU()+14)
 
-	index := tm.indices[vidx]
-	ch := tm.vifs[index].ch
-	tap := tm.vifs[index].tap
+	index := vif.Index()
+	vid := uint16(vif.VID())
+
+	retry := 0
+	tap := vif.TAP()
+	for tap == nil {
+		if retry < tapMaxRetryCount {
+			retry++
+		} else {
+			// XXX: error
+			return
+		}
+
+		time.Sleep(tapRetryInterval)
+		tap = vif.TAP()
+	}
 
 	for {
 		// XXX: We may want to imporove this by passing the pointer to
@@ -108,118 +174,120 @@ func (tm *TapModule) readFromTap(vidx vswitch.VifIndex) {
 		// Mbuf.
 		n, err := tap.Read(buf)
 		if err != nil {
-			log.Printf("%v: Read from Tap failed: %v", tm, err)
+			log.Printf("%v: Read from Tap failed: %v", t, err)
+			// If TAP is closed by the agent, we can glacefully quit.
+			close(ch)
 			return
 		}
 
-		if mbuf := tm.pool.AllocMbuf(); mbuf != nil {
+		// If the module is not enabled, just skip.
+		if !t.enabled {
+			continue
+		}
+
+		if mbuf := t.pool.AllocMbuf(); mbuf != nil {
 			mbuf.SetData(buf[:n])
+			mbuf.SetVlanTCI(vid)
+			md := (*vswitch.Metadata)(mbuf.Metadata())
+			md.Reset()
+			md.SetOutVIF(index)
+			md.SetInVIF(index)
 			ch <- mbuf
 		} else {
-			log.Printf("%v: %d bytes packet from tap of VIF %d dropped. No Mbuf.", tm, n, vidx)
+			log.Printf("%v: %d bytes packet from tap of VIF %d dropped. No Mbuf.", t, n, index)
 		}
 	}
 }
 
-func (tm *TapModule) rxTask() {
-	input := tm.input
+func (t *TapInstance) rxTask() {
+	input := t.base.Input()
 	mbufs := make([]*dpdk.Mbuf, queueLength)
-	for tm.running {
+	for t.enabled {
 		n := input.DequeueBurstMbufs(&mbufs)
 		for _, mbuf := range mbufs[:n] {
 			md := (*vswitch.Metadata)(mbuf.Metadata())
-			index := tm.indices[md.InVIF()]
-			tap := tm.vifs[index].tap
-			frame := mbuf.Data()
-			_, err := tap.Write(frame)
-			mbuf.Free()
-			if err != nil {
-				log.Printf("%v: Write to Tap failed: %v", tm, err)
-				return
+
+			if md.Local() {
+				// Concatenate scattered Mbuf
+				p := mbuf.Data()[14:]
+				nxt := mbuf.Next()
+				for nxt != nil {
+					p = append(p, nxt.Data()...)
+					nxt = nxt.Next()
+				}
+
+				// Copy Dst IP
+				var dst [4]byte
+				copy(dst[:], p[16:20])
+				addr := syscall.SockaddrInet4{
+					Port: 0,
+					Addr: dst,
+				}
+				if err := syscall.Sendto(t.rs, p, 0, &addr); err != nil {
+					log.Printf("%v: Can't Write to Rawsocket: %v", t, err)
+				}
+			} else {
+				if vif := vswitch.GetVIFByIndex(md.InVIF()); vif != nil {
+					tap := vif.TAP()
+					frame := mbuf.Data()
+					_, err := tap.Write(frame)
+					if err != nil {
+						log.Printf("%v: Write to Tap failed: %v", t, err)
+					}
+				} else {
+					log.Printf("%v: can't find VIF Index = %d", t, md.InVIF())
+				}
 			}
-			//			log.Printf("%v: Written %d bytes packet to tap of VIF %d.", tm, len(frame), md.InVIF())
+
+			mbuf.Free()
 		}
 		runtime.Gosched()
 	}
-	tm.wg.Done()
+	t.rxCh <- struct{}{}
 }
 
-const queueLength = 64
-
-func (tm *TapModule) Start() bool {
-	log.Printf("%v: Start()", tm)
-
-	tm.input = tm.Input()
-	if tm.input == nil {
-		log.Printf("%v: Input ring not specified.", tm)
-		return false
+func (t *TapInstance) Enable() error {
+	rs, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
+	if err != nil {
+		return fmt.Errorf("Can't open raw socket: %v", err)
 	}
 
-	rules := tm.Rules().SubRules(vswitch.MATCH_OUT_VIF)
-
-	if len(rules) == 0 {
-		log.Printf("%v: No outputs specified.", tm)
-		return false
+	if err := syscall.SetsockoptInt(rs, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1); err != nil {
+		syscall.Close(rs)
+		return fmt.Errorf("Can't set IP_HDRINCL: %v", err)
 	}
 
-	tm.vifs = make([]vif, len(rules))
-	for n, rule := range rules {
-		vifidx := vswitch.VifIndex(rule.Param[0])
-
-		var tap *os.File
-		ok := false
-		for i := 0; i < tapMaxRetryCount; i++ {
-			tap, ok = nlagent.GetTapFile(vifidx)
-			if ok {
-				break
-			}
-			time.Sleep(tapRetryInterval)
-		}
-
-		if !ok {
-			log.Fatalf("%v: No tap for VIF %v", tm, vifidx)
-		}
-
-		tm.indices[vifidx] = n
-		tm.vifs[n] = vif{rule.Ring, tap, make(chan *dpdk.Mbuf)}
-
-		go tm.readFromTap(vifidx)
+	if err := syscall.SetsockoptString(rs, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, t.vrf); err != nil {
+		syscall.Close(rs)
+		return fmt.Errorf("Can't set SO_BINDTODEVICE: %v", err)
 	}
+
+	t.rs = rs
 
 	// launch
-	tm.running = true
-	tm.stop = make(chan struct{})
-	go tm.txTask()
-	go tm.rxTask()
+	t.enabled = true
+	go t.rxTask()
 
-	return true
+	return nil
 }
 
-func (tm *TapModule) Stop() {
-	tm.wg.Add(2)
-	for _, vif := range tm.vifs {
-		vif.tap.Close()
-	}
-	close(tm.stop)
-	tm.running = false
+func (t *TapInstance) Disable() {
+	t.enabled = false
+	<-t.rxCh
+	syscall.Close(t.rs)
 }
 
-func (tm *TapModule) Wait() {
-	tm.wg.Wait()
-}
-
-func (tm *TapModule) String() string {
-	return tm.Name()
+func (t *TapInstance) String() string {
+	return t.base.Name()
 }
 
 func init() {
 	rp := &vswitch.RingParam{
 		Count:    queueLength,
 		SocketId: dpdk.SOCKET_ID_ANY,
-		Flags:    0,
 	}
 
-	if !vswitch.RegisterModule("tap", newTap, rp, vswitch.TypeOther) {
-		log.Fatalf("Failed to register Tap class.")
+	if err := vswitch.RegisterModule("tap", newTapInstance, rp, vswitch.TypeOther); err != nil {
+		log.Fatalf("Failed to register Tap class: %v", err)
 	}
 }

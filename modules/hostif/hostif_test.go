@@ -19,17 +19,17 @@ package hostif
 import (
 	"bytes"
 	"flag"
-	"github.com/lagopus/vsw/dpdk"
-	_ "github.com/lagopus/vsw/modules/testvif"
-	_ "github.com/lagopus/vsw/modules/hostif"
-	"github.com/lagopus/vsw/vswitch"
-	"google.golang.org/grpc"
-	pb "github.com/lagopus/vsw/modules/hostif/packets_io"
 	"net"
 	"os"
-	context "golang.org/x/net/context"
-	"log"
 	"testing"
+
+	"github.com/lagopus/vsw/dpdk"
+	pb "github.com/lagopus/vsw/modules/hostif/packets_io"
+	"github.com/lagopus/vsw/modules/testvif"
+	"github.com/lagopus/vsw/vswitch"
+
+	context "golang.org/x/net/context"
+	"google.golang.org/grpc"
 )
 
 var tx_chan chan *dpdk.Mbuf
@@ -48,12 +48,12 @@ func rpcclient() {
 	for i := 0; i < 2; i++ {
 		for {
 			pkts, _ = io.RecvBulk(context.Background(), new(pb.Null))
-			if pkts.N > 0 {
+			if pkts != nil && pkts.N > 0 {
 				break
 			}
 		}
 		for _, pkt := range pkts.Packets {
-			pkt.Subifname = "tv0"
+			pkt.Subifname = "tv0-0"
 		}
 		io.SendBulk(context.Background(), pkts)
 	}
@@ -69,16 +69,16 @@ func send(t *testing.T, mbuf *dpdk.Mbuf, self bool) bool {
 	t.Logf("Sending: %s -> %s\n", src_ha, dst_ha)
 
 	// send
-	tx_chan <- mbuf
+	rx_chan <- mbuf
 
 	// recv
-	rmbuf := <-rx_chan
+	rmbuf := <-tx_chan
 	reh := rmbuf.EtherHdr()
 	md := (*vswitch.Metadata)(rmbuf.Metadata())
 
 	t.Logf("Rcv'd: src=%s, dst=%s, vif=%d, self=%v\n", reh.SrcAddr(), reh.DstAddr(), md.InVIF(), md.Self())
 
-	return 	bytes.Compare(reh.SrcAddr(), src_ha) == 0 &&
+	return bytes.Compare(reh.SrcAddr(), src_ha) == 0 &&
 		bytes.Compare(reh.DstAddr(), dst_ha) == 0
 }
 
@@ -89,7 +89,7 @@ func TestNormalFlow(t *testing.T) {
 	dst_ha, _ := net.ParseMAC("aa:bb:cc:dd:ee:ff")
 
 	mbuf := pool.AllocMbuf()
-	eh :=make(dpdk.EtherHdr, 14)
+	eh := make(dpdk.EtherHdr, 14)
 	eh.SetSrcAddr(src_ha)
 	eh.SetDstAddr(dst_ha)
 	mbuf.SetEtherHdr(eh)
@@ -106,61 +106,45 @@ func TestNormalFlow(t *testing.T) {
 	}
 }
 
-func initDpdk() {
-	dc := &vswitch.DpdkConfig{
-		CoreMask:      0xff,
-		MemoryChannel: 2,
-		PmdPath:       "/usr/local/lib/dpdk-pmd",
-	}
-
-	dc.Vdevs = flag.Args()
-
-	if !vswitch.InitDpdk(dc) {
-		log.Fatalf("DPDK initialization failed.\n")
-	}
-}
-
 func TestMain(m *testing.M) {
-	// Initialize DPDK
-	initDpdk()
-
+	// Initialize vswitch core
+	vswitch.Init("../../vsw.conf")
+	vswitch.EnableLog(true)
 	pool = vswitch.GetDpdkResource().Mempool
 
 	//
 	// Setup Vswitch
 	//
-	vrf := vswitch.NewVRF("vrf0", 0)
 
 	// Create Instances
-	testvif := vrf.NewModule("testvif", "tv0")
-	hostif := vrf.NewModule("hostif", "hostif0")
+	tv0, _ := vswitch.NewInterface("testvif", "tv0", nil)
+	tv0_0, _ := tv0.NewVIF(0)
+	hostif, _ := vswitch.NewTestModule("hostif", "hostif0", nil)
+
+	testif, _ := tv0.Instance().(*testvif.TestIF)
 
 	// Connect Instances
-	testvif.Connect(hostif, vswitch.MATCH_ANY)
-	hostif.Connect(testvif, vswitch.MATCH_OUT_VIF)
+	hostif.AddVIF(tv0_0)
 
 	// Get Channels
-	tx_chan, _ = testvif.Control("GET_TX_CHAN", nil).(chan *dpdk.Mbuf)
-	rx_chan, _ = testvif.Control("GET_RX_CHAN", nil).(chan *dpdk.Mbuf)
-	vif_mac, _ = testvif.Control("GET_MAC_ADDRESS", nil).(net.HardwareAddr)
+	tx_chan = testif.TxChan()
+	rx_chan = testif.RxChan()
+	vif_mac = tv0.MACAddress()
 
-	// Link up
-	for _, idx := range vswitch.AllVifs() {
-		vi := vswitch.GetVifInfo(idx)
-		vi.SetLink(vswitch.LinkUp)
-	}
-
-	// Start
+	// Enable Modules
 	go rpcclient()
-	vswitch.Start()
+	tv0.Enable()
+	tv0_0.Enable()
+	hostif.Enable()
 
 	// Execute test
 	flag.Parse()
 	rc := m.Run()
 
 	// Teardown
-	vswitch.Stop()
-	vswitch.Wait()
+	hostif.Disable()
+	tv0_0.Disable()
+	tv0.Disable()
 
 	// Done
 	os.Exit(rc)

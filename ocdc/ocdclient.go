@@ -18,33 +18,46 @@ package ocdc
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	pb "github.com/lagopus/openconfigd/proto"
+	"strings"
+	"sync"
+
+	pb "github.com/coreswitch/openconfigd/proto"
 	"github.com/lagopus/vsw/vswitch"
 	"google.golang.org/grpc"
-	"io"
-	"math"
-	"os"
-	"reflect"
-	"sync"
 )
 
 var log = vswitch.Logger
 
+// ConfigType is a type of configuration service
 type ConfigType int
 
 const (
-	TypeSet    ConfigType = ConfigType(pb.ConfigType_SET)
-	TypeDelete            = ConfigType(pb.ConfigType_DELETE)
+	CT_Set    = ConfigType(pb.ConfigType_SET)
+	CT_Delete = ConfigType(pb.ConfigType_DELETE)
 )
 
-var ConfigTypeStrings = map[ConfigType]string{
-	TypeSet:    "Set",
-	TypeDelete: "Delete",
+func (ct ConfigType) String() string {
+	if ct == CT_Set {
+		return "Set"
+	}
+	return "Delete"
 }
 
-func (c ConfigType) String() string {
-	return ConfigTypeStrings[c]
+// ConfigMode is a configuration mode of a transaction.
+type ConfigMode int
+
+const (
+	CM_Validate ConfigMode = iota
+	CM_Commit
+)
+
+func (cm ConfigMode) String() string {
+	if cm == CM_Validate {
+		return "Validate"
+	}
+	return "Commit"
 }
 
 type Config struct {
@@ -52,314 +65,300 @@ type Config struct {
 	Type ConfigType
 }
 
-// Validate is true when a Type of received message is VALIDATE.
-// Config is configuration received from openconfig and module has subscribed to paths.
 type ConfigMessage struct {
-	Validate bool
-	Configs  []*Config
+	Mode    ConfigMode
+	Configs []*Config
 }
 
-// Each modules have a Handle that is used to subscribe, validate or commit.
-type Handle struct {
-	subscriberId int
-	paths        [][]string
-	name         string
-	conn         *connect
-
-	ConfigMessage chan *ConfigMessage
-	Rc            chan bool
+type Subscriber struct {
+	paths [][]string
+	conn  *connect
+	C     chan *ConfigMessage
+	RC    chan bool
 }
 
-// connect is a parameter to connect openconfig.
 type connect struct {
-	client  pb.ConfigClient
-	connect *grpc.ClientConn
+	cliconn *grpc.ClientConn
 	stream  pb.Config_DoConfigClient
 
-	handles map[int]*Handle
+	confc            chan *pb.ConfigReply
+	errorc           chan error
+	subscribers      map[*Subscriber]struct{}
+	subscribersMutex sync.RWMutex
+	subscribedPaths  map[string]struct{}
+	subedPathMutex   sync.Mutex
+	refcnt           int
 }
 
-const (
-	DefaultServer = ":2650"
-	ServerNameEnv = "OPENCONFIGD_SERVER"
-)
+const defaultServer = ":2650"
 
-// Connect to the server
-func connectServer() (pb.ConfigClient, *grpc.ClientConn, error) {
-	var err error
+var ocdServer = defaultServer
 
-	server := os.Getenv(ServerNameEnv)
-	if server == "" {
-		server = DefaultServer
-	}
-
-	log.Printf("Connecting to the server: \"%s\"\n", server)
-
-	cliconn, err := grpc.Dial(server, grpc.WithInsecure())
-	if err != nil {
-		return nil, nil, fmt.Errorf("ocdclient: Can't create a new config client.")
-	}
-
-	client := pb.NewConfigClient(cliconn)
-	if client == nil {
-		return nil, nil, fmt.Errorf("ocdclient: can't create a new config client.")
-	}
-
-	log.Printf("Connected: client=%v\n", client)
-	return client, cliconn, nil
+// SetOcdServer allows to override OpenConfigd network address.
+// host is server address, and can be "" for localhost.
+// port is port number of OpenConfigd.
+func SetOcdServer(host string, port uint16) {
+	ocdServer = fmt.Sprintf("%s:%d", host, port)
 }
 
-func startConnection() *connect {
-	client, cliconn, err := connectServer()
-	if err != nil {
-		log.Fatalf("%v\n", err)
+// Subscribe subscribes to ocdclient, and creates a new Subscriber. paths are
+// subscribed to OpenConfigd.
+func Subscribe(paths [][]string) (*Subscriber, error) {
+	if len(paths) == 0 {
+		return nil, errors.New("Doesn't save paths to subscribe.")
 	}
 
-	stream, err := client.DoConfig(context.Background())
-	if err != nil {
-		log.Fatalf("Creating a client stub faild: %v", err)
-	}
-
-	c := &connect{
-		client:  client,
-		connect: cliconn,
-		stream:  stream,
-		handles: make(map[int]*Handle),
-	}
-
-	go c.receive()
-	go c.send()
-
-	return c
+	return newSubscriber(paths)
 }
 
-type sendMsg struct {
-	confReq *pb.ConfigRequest
-	err     chan error
+// newSubscriber creates a Subscriber.
+func newSubscriber(paths [][]string) (*Subscriber, error) {
+	c, err := getConnection()
+	if err != nil {
+		return nil, err
+	}
+
+	s := &Subscriber{
+		paths: paths,
+		conn:  c,
+		C:     make(chan *ConfigMessage, 1),
+		RC:    make(chan bool),
+	}
+	c.registerSubscriber(s)
+	c.registerSubscribedPaths(paths)
+
+	return s, nil
 }
 
 var (
-	sMsg = &sendMsg{
-		confReq: &pb.ConfigRequest{},
-		err:     make(chan error),
-	}
-	sc = make(chan *sendMsg)
+	connMutex sync.Mutex
+	conn      *connect
 )
 
-func (c *connect) send() {
-	//	log.Printf("start send\n")
-	for {
-		sMsg := <-sc
-		//		log.Printf("Send message confRep = %v\n", sMsg.confReq)
-		sMsg.err <- c.stream.Send(sMsg.confReq)
+// getConnection returns a connection to OpenConfigd. Connect to it, if the connection
+// is not existing.
+func getConnection() (*connect, error) {
+	connMutex.Lock()
+	defer connMutex.Unlock()
+
+	if conn != nil {
+		conn.refcnt++
+		return conn, nil
 	}
+
+	log.Printf("ocdclient: Connect to \"%s\"\n", ocdServer)
+	cliconn, err := grpc.Dial(ocdServer, grpc.WithInsecure())
+	if err != nil {
+		return nil, fmt.Errorf("Crerating a client connection failed: %v", err)
+	}
+	client := pb.NewConfigClient(cliconn)
+	stream, err := client.DoConfig(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("Creating a client stream failed: %v", err)
+	}
+
+	conn = &connect{
+		cliconn: cliconn,
+		stream:  stream,
+
+		confc:           make(chan *pb.ConfigReply),
+		errorc:          make(chan error),
+		subscribers:     make(map[*Subscriber]struct{}),
+		subscribedPaths: make(map[string]struct{}),
+		refcnt:          1,
+	}
+	go conn.control()
+	go conn.receive()
+
+	return conn, nil
 }
 
-// receive receives configurations from openconfig.
-func (c *connect) receive() {
-	//	log.Printf("start receive\n")
+func (c *connect) registerSubscriber(s *Subscriber) {
+	c.subscribersMutex.Lock()
+	c.subscribers[s] = struct{}{}
+	c.subscribersMutex.Unlock()
+}
 
-	var (
-		confs    []*Config // configurations received in one transaction
-		validate = false
-	)
-
-	for {
-		// in is receive configration
-		in, err := c.stream.Recv()
-
-		if err == io.EOF {
-			log.Printf("EOF detected.\n")
-		} else if err != nil {
-			log.Fatalf("Receive failed: %v", err)
-		}
-
-		switch in.Type {
-		case pb.ConfigType_SET, pb.ConfigType_DELETE:
-			// duplicate path check
-			if !checkDuplicate(in.Path, confs) {
-				c := &Config{
-					Path: in.Path,
-					Type: ConfigType(in.Type),
-				}
-				//				log.Printf("%v %v\n", c.Type, c.Path)
-				confs = append(confs, c)
-			}
-
-		case pb.ConfigType_VALIDATE_START:
-			validate = true
-
-		case pb.ConfigType_COMMIT_START:
-			validate = false
-
-		case pb.ConfigType_VALIDATE_END:
-			if len(confs) > 0 {
-				sMsg.confReq.Type = c.selectPaths(validate, confs)
-				sc <- sMsg
-				<-sMsg.err
-
-				confs = make([]*Config, 0)
-			}
-			sMsg.confReq = &pb.ConfigRequest{}
-
-		case pb.ConfigType_COMMIT_END:
-			if len(confs) > 0 {
-				c.selectPaths(validate, confs)
-				confs = make([]*Config, 0)
-			}
-
-		default:
-			log.Printf("Unexecuted message received")
+// registerSubscribePaths registers subscribedPaths on connect struct.
+// If a path is not subscribed, subscribes to OpenConfigd befor registering.
+func (c *connect) registerSubscribedPaths(paths [][]string) {
+	c.subedPathMutex.Lock()
+	for _, p := range paths {
+		key := strings.Join(p, " ")
+		if _, ok := c.subscribedPaths[key]; ok {
 			continue
 		}
-	}
-}
 
-func (c *connect) selectPaths(validate bool, confs []*Config) pb.ConfigType {
-	cType := pb.ConfigType_VALIDATE_SUCCESS
-
-	for _, h := range c.handles {
-		confToSend := make([]*Config, 0)
-
-		for _, path := range h.paths {
-		nextConfRep:
-			for _, conf := range confs {
-				for i, p := range path {
-					if p != conf.Path[i] {
-						continue nextConfRep
-					}
-				}
-				confToSend = append(confToSend, conf)
-			}
-		}
-
-		if len(confToSend) > 0 {
-			cmsg := &ConfigMessage{
-				Validate: validate,
-				Configs:  confToSend,
-			}
-			log.Printf("Send configuration to module\n")
-			h.ConfigMessage <- cmsg
-
-			rc := <-h.Rc
-			if validate && !rc {
-				cType = pb.ConfigType_VALIDATE_FAILED
+		for {
+			if err := c.send(pb.ConfigType_SUBSCRIBE, p); err == nil {
 				break
 			}
 		}
+		c.subscribedPaths[key] = struct{}{}
 	}
-	return cType
+	c.subedPathMutex.Unlock()
 }
 
-// checkDuplicate checks duplicate paths.
-// Return true when it is same recvPath and Path in confs.
-func checkDuplicate(recvPath []string, confs []*Config) bool {
-	if len(confs) == 0 {
+const moduleName = "ocdclient"
+
+// send sends a configuration request to OpenConfigd.
+func (c *connect) send(ct pb.ConfigType, path []string) error {
+	cr := &pb.ConfigRequest{
+		Type:   ct,
+		Module: moduleName,
+		Path:   path,
+	}
+
+	return c.stream.Send(cr)
+}
+
+// receive receives a configuration from OpenConfigd.
+func (c *connect) receive() {
+	for {
+		conf, err := c.stream.Recv()
+		if err != nil {
+			c.errorc <- err
+			return
+		}
+		c.confc <- conf
+	}
+}
+
+// control controls received configuration.
+func (c *connect) control() {
+	var confs []*Config // configurations that is received in a transaction
+
+	for {
+		select {
+		// configuration
+		case recvConf := <-c.confc:
+			switch recvConf.Type {
+			case pb.ConfigType_VALIDATE_START, pb.ConfigType_COMMIT_START:
+				confs = nil
+
+			case pb.ConfigType_SET, pb.ConfigType_DELETE:
+				c := &Config{
+					Path: recvConf.Path,
+					Type: ConfigType(recvConf.Type),
+				}
+				confs = append(confs, c)
+
+			case pb.ConfigType_VALIDATE_END:
+				ct := pb.ConfigType_VALIDATE_SUCCESS
+
+				if ok := c.notifyConfig(confs, CM_Validate); !ok {
+					ct = pb.ConfigType_VALIDATE_FAILED
+				}
+
+				for {
+					if err := c.send(ct, nil); err == nil {
+						break
+					}
+				}
+
+			case pb.ConfigType_COMMIT_END:
+				c.notifyConfig(confs, CM_Commit)
+
+			default:
+				log.Printf("ocdclient: Unexecuted message received")
+				continue
+			}
+
+		// receive error
+		case err := <-c.errorc:
+			log.Printf("ocdclient receives error: %v", err)
+			c.subscribersMutex.RLock()
+			for s := range c.subscribers {
+				s.notifyEOS()
+			}
+			c.subscribersMutex.RUnlock()
+			return
+		}
+	}
+}
+
+// notifyConfig notifys configurations to each subscriber.
+func (c *connect) notifyConfig(recvs []*Config, mode ConfigMode) bool {
+	c.subscribersMutex.RLock()
+	defer c.subscribersMutex.RUnlock()
+	pairs := c.selectPaths(recvs)
+	if len(pairs) == 0 {
 		return false
 	}
 
-	for _, c := range confs {
-		if reflect.DeepEqual(c.Path, recvPath) {
-			return true
+	for s, confs := range pairs {
+		s.C <- &ConfigMessage{
+			Mode:    mode,
+			Configs: confs,
+		}
+
+		if rc := <-s.RC; !rc {
+			return false
 		}
 	}
-	return false
+
+	return true
 }
 
-var (
-	subscriberId = 0
+// selectPaths selects paths that a subscriber was subscribed from recvs,
+// and returns pairs of the subscriber and the paths.
+func (c *connect) selectPaths(recvs []*Config) map[*Subscriber][]*Config {
+	pairs := make(map[*Subscriber][]*Config)
 
-	conn       *connect
-	streamOnce sync.Once
-	subMutex   sync.Mutex
-)
+	for s := range c.subscribers {
+		var selects []*Config
 
-// Subscribe subscribes paths to openconfig.
-// paths are paths that modules want to subscribe.
-func Subscribe(name string, paths [][]string) *Handle {
-	if len(paths) == 0 {
-		log.Printf("module doesn't have paths for Subscribe.")
-		return nil
-	}
+		for _, path := range s.paths {
+		next:
+			for _, r := range recvs {
+				for i, p := range path {
+					if p != r.Path[i] {
+						continue next
+					}
+				}
+				selects = append(selects, r)
+			}
+		}
 
-	streamOnce.Do(func() {
-		conn = startConnection()
-	})
-
-	subMutex.Lock()
-	defer subMutex.Unlock()
-	log.Printf("subscriberId: %d\n", subscriberId)
-
-	if subscriberId == math.MaxInt32 {
-		log.Printf("Can't create subscriber anymore.\n")
-		return nil
-	}
-
-	name = fmt.Sprintf("%v-%v", name, subscriberId)
-	handle := &Handle{
-		subscriberId: subscriberId,
-		paths:        paths,
-		name:         name,
-		conn:         conn,
-
-		ConfigMessage: make(chan *ConfigMessage),
-		Rc:            make(chan bool),
-	}
-	conn.handles[subscriberId] = handle
-
-	// set a message to send openconfig
-	sMsg.confReq.Type = pb.ConfigType_SUBSCRIBE
-	sMsg.confReq.Module = name
-
-	// subscribe paths to the server
-	for _, path := range paths {
-
-		sMsg.confReq.Path = path
-		sc <- sMsg
-		err := <-sMsg.err
-
-		if err != nil {
-			log.Printf("Sending subscription message faild: %v", err)
-			conn.stream.CloseSend()
-			defer delete(conn.handles, subscriberId)
-			return nil
+		if len(selects) > 0 {
+			pairs[s] = selects
 		}
 	}
-	sMsg.confReq = &pb.ConfigRequest{}
-
-	log.Printf("Subscribe success\n")
-	subscriberId++
-	return handle
+	return pairs
 }
 
-func (h *Handle) Unsubscribe() {
-	// close hadnle for h.subscriberId
-	subMutex.Lock()
-	defer subMutex.Unlock()
-
-	if _, ok := h.conn.handles[h.subscriberId]; ok {
-		log.Printf("unsubscribe: name= %v id= %v\n", h.name, h.subscriberId)
-		delete(h.conn.handles, h.subscriberId)
-	}
-
-	if len(h.conn.handles) == 0 {
-		log.Printf("close conn\n")
-		h.conn.closeConn()
-	}
-	log.Printf("Unsubscribe() done\n")
+// notifyEOS notifys the end of stream by closing a channel.
+func (s *Subscriber) notifyEOS() {
+	close(s.C)
 }
 
-// close disconnect to the server when ocdc does't have subscriber.
-func (c *connect) closeConn() {
+// free decreases reference count of the connect, and frees connection
+// when the count equals 0.
+func (c *connect) free() {
+	connMutex.Lock()
+	defer connMutex.Unlock()
+	c.refcnt--
 
-	if c.stream != nil {
-		if err := c.stream.CloseSend(); err != nil {
-			log.Fatalf("Can't close stream: %v\n", err)
-		}
-
-		if err := c.connect.Close(); err != nil {
-			log.Fatalf("Can't disconnect to the server.\n")
-		}
-		c.client = nil
+	if c.refcnt > 0 {
+		return
 	}
+
+	log.Printf("ocdclient: Close connection.\n")
+	c.stream.CloseSend()
+	c.cliconn.Close()
+
+	conn = nil
+}
+
+func (c *connect) unregisterSubscriber(s *Subscriber) {
+	c.subscribersMutex.Lock()
+	delete(c.subscribers, s)
+	c.subscribersMutex.Unlock()
+}
+
+// Unsubscribe unsubscribes to ocdclient. Don't use the subscriber
+// after unsubscribing.
+func (s *Subscriber) Unsubscribe() {
+	s.conn.unregisterSubscriber(s)
+	s.conn.free()
 }

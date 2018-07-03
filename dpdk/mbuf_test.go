@@ -23,9 +23,9 @@ import (
 )
 
 func TestMbufEtherHdr(t *testing.T) {
-	pool := PktMbufPoolCreate("mbuf-test", 128, 0, 0, RTE_PKTMBUF_HEADROOM+2048, SOCKET_ID_ANY)
-	if pool == nil {
-		t.Fatal("Can't create mempool")
+	pool, err := PktMbufPoolCreate("mbuf-test", 128, 0, 0, RTE_PKTMBUF_HEADROOM+2048, SOCKET_ID_ANY)
+	if err != nil {
+		t.Fatal("Can't create mempool:", err)
 	}
 
 	mbuf := pool.AllocMbuf()
@@ -58,9 +58,9 @@ func TestMbufEtherHdr(t *testing.T) {
 }
 
 func TestMbuf(t *testing.T) {
-	pool := PktMbufPoolCreate("mbuf-test", 128, 0, 0, RTE_PKTMBUF_HEADROOM+2048, SOCKET_ID_ANY)
-	if pool == nil {
-		t.Fatal("Can't create mempool")
+	pool, err := PktMbufPoolCreate("mbuf-test", 128, 0, 0, RTE_PKTMBUF_HEADROOM+2048, SOCKET_ID_ANY)
+	if err != nil {
+		t.Fatal("Can't create mempool:", err)
 	}
 
 	mbuf := pool.AllocMbuf()
@@ -116,6 +116,15 @@ func TestMbuf(t *testing.T) {
 
 	t.Logf("Data:\n%s", hex.Dump(mbuf.Data()))
 	t.Logf("DataLen: %v", mbuf.DataLen())
+
+	// Test vlan tci
+	const vid = uint16(0x1234)
+	mbuf.SetVlanTCI(vid)
+	t.Logf("Setting VLAN TCI to %#v", vid)
+	if v := mbuf.VlanTCI(); v != vid {
+		t.Errorf("VLAN TCI doesn't match to what web set to: %d", v)
+	}
+	t.Logf("VLAN TCI set correctly")
 
 	// tear down
 	mbuf.Free()

@@ -18,16 +18,79 @@ package vswitch
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"testing"
 )
 
-func TestMain(m *testing.M) {
-	dc := &DpdkConfig{
-		CoreMask:      0xff,
-		MemoryChannel: 2,
+type opcode int
+
+const (
+	OpInvalid opcode = iota
+	OpEnable
+	OpDisable
+	OpFree
+	OpNewVIF
+	OpMACAddress
+	OpSetMACAddress
+	OpMTU
+	OpSetMTU
+	OpInterfaceMode
+	OpSetInterfaceMode
+	OpAddVID
+	OpDeleteVID
+	OpAddVIF
+	OpDeleteVIF
+	OpSetNativeVID
+	OpVIFFree
+	OpVIFEnable
+	OpVIFDisable
+	OpVIFSetVRF
+)
+
+var opstr = map[opcode]string{
+	OpInvalid:          "INVALID OP",
+	OpEnable:           "Enable",
+	OpDisable:          "Disable",
+	OpFree:             "Free",
+	OpNewVIF:           "NewVIF",
+	OpMACAddress:       "MACAddress",
+	OpSetMACAddress:    "SetMACAddress",
+	OpMTU:              "MTU",
+	OpSetMTU:           "SetMTU",
+	OpInterfaceMode:    "InterfaceMode",
+	OpSetInterfaceMode: "SetInterfaceMode",
+	OpAddVID:           "AddVID",
+	OpDeleteVID:        "DeleteVID",
+	OpAddVIF:           "AddVIF",
+	OpDeleteVIF:        "DeleteVIF",
+	OpSetNativeVID:     "SetNativeVID",
+	OpVIFFree:          "VIF.Free",
+	OpVIFEnable:        "VIF.Enable",
+	OpVIFDisable:       "VIF.Disable",
+}
+
+func (o opcode) String() string {
+	return opstr[o]
+}
+
+func (o opcode) Expect(ch chan opcode) error {
+	for {
+		select {
+		case rc := <-ch:
+			if rc == o {
+				return nil
+			}
+			return fmt.Errorf("Expected %v. Got %v", o, rc)
+		default:
+			return fmt.Errorf("Instance not called.")
+		}
 	}
-	InitDpdk(dc)
+
+}
+
+func TestMain(m *testing.M) {
+	Init("../vsw.conf")
 
 	flag.Parse()
 	os.Exit(m.Run())

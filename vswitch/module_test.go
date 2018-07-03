@@ -22,102 +22,104 @@ import (
 )
 
 type MyModule struct {
-	ModuleService
+	base    *BaseInstance
+	str     string
+	enabled bool
 }
 
-func (m *MyModule) Start() bool {
-	fmt.Printf("%s: Start()\n", m.Name())
-	return true
+func (m *MyModule) Enable() error {
+	fmt.Printf("%s: Enable()\n", m.base.Name())
+	m.enabled = true
+	return nil
 }
 
-func (m *MyModule) Stop() {
-	fmt.Printf("%s: Stop()\n", m.Name())
+func (m *MyModule) Disable() {
+	fmt.Printf("%s: Disable()\n", m.base.Name())
+	m.enabled = false
 }
 
-func (m *MyModule) Wait() {
-	fmt.Printf("%s: Wait()\n", m.Name())
+func (m *MyModule) Free() {
+	fmt.Printf("%s: Free()\n", m.base.Name())
 }
 
-func (m *MyModule) Control(cmd string, v interface{}) interface{} {
-	rc := true
-	fmt.Printf("%s: Control(%v, %v) -> %v\n", m.Name(), cmd, v, rc)
-	return rc
-}
-
-func createMyModule(p *ModuleParam) (Module, error) {
-	return &MyModule{NewModuleService(p)}, nil
+func newMyModule(base *BaseInstance, priv interface{}) (Instance, error) {
+	if s, ok := priv.(string); ok {
+		return &MyModule{base, s, false}, nil
+	}
+	return nil, fmt.Errorf("Invalid parameter passed: %v", priv)
 }
 
 const (
-	TM = "testModule"
-	M0 = "test0"
-	M1 = "test1"
-	TV = "testVIF"
-	V0 = "vif0"
-	V1 = "vif1"
+	TM  = "testModule"
+	M0  = "test0"
+	M1  = "test1"
+	TV  = "testVIF"
+	V0  = "vif0"
+	V1  = "vif1"
+	BM  = "testBridge"
+	BM2 = "testBridge2"
+	RM  = "testRouter"
+	RM2 = "testRouter2"
+	STR = "PRIVATE DATA"
 )
 
-func checkInputRing(t *testing.T, m Module, input bool, vif bool) {
-	ir := (m.Input() != nil)
-	vr := (m.VifInput() != nil)
-	if ir == input && vr == vif {
-		return
-	}
-	t.Errorf("Input(), VifInput() not properly created: %s: (%v, %v)\n", m.Name(), ir, vr)
-}
+var testModules = make(map[string]Instance)
 
-var testModules = make(map[string]Module)
-
-func createModule(t *testing.T, moduleName, name string) Module {
-	m := newModule(moduleName, name, nil)
-	if m == nil {
-		t.Fatalf("Can't instantiate module: %s\n", name)
+func TestModuleRegistration(t *testing.T) {
+	if err := RegisterModule(TM, newMyModule, nil, TypeOther); err != nil {
+		t.Fatalf("Module registration failed: %v", err)
 	}
-	testModules[name] = m
-	return m
+	t.Logf("Module registartion succeeded: %s", TM)
+
+	t.Logf("Try registering module with same name again.")
+	if err := RegisterModule(TM, newMyModule, nil, TypeOther); err == nil {
+		t.Fatalf("Module registered. Should fail.")
+	} else {
+		t.Logf("Module registartion failed. Success: %v", err)
+	}
 }
 
 func TestModuleBasic(t *testing.T) {
-	// register
-	if !RegisterModule(TM, createMyModule, nil, TypeOther) {
-		t.Fatalf("Can't register module\n")
+	b, err := newInstance(TM, M0, STR)
+	if err != nil {
+		t.Fatalf("Instantiation failed: %v\n", err)
+	}
+	t.Logf("Module instantiation succeeded: %s", TM)
+
+	if name := b.Name(); name != M0 {
+		t.Fatalf("Module name mismatch: %s != %s", M0, name)
+	}
+	t.Logf("Module name matched.")
+
+	if str := fmt.Sprintf("%v", b); str != M0 {
+		t.Fatalf("Module stringer mismatch: %s != %s", M0, str)
+	}
+	t.Logf("Stringer matched.")
+
+	if b.Input() == nil {
+		t.Fatalf("No input ring")
+	}
+	t.Logf("Input ring created.")
+
+	if b.isEnabled() {
+		t.Fatalf("Module enabled before enabling")
 	}
 
-	// register
-	if !RegisterModule(TV, createMyModule, nil, TypeVif) {
-		t.Fatalf("Can't register module\n")
+	if err := b.enable(); err != nil {
+		t.Fatalf("Can't enable module: %v", err)
 	}
 
-	// create
-	m0 := createModule(t, TM, M0)
-	m1 := createModule(t, TM, M1)
-	v0 := createModule(t, TV, V0)
-	v1 := createModule(t, TV, V1)
+	if !b.isEnabled() {
+		t.Fatalf("Module disabled after enabling")
+	}
+	t.Logf("Module enabled")
 
-	// connection
-	v0.Connect(m0, MATCH_ANY)
-	v1.Connect(m0, MATCH_ANY)
-	m0.Connect(v0, MATCH_OUT_VIF)
-	m1.Connect(v1, MATCH_OUT_VIF)
-	m0.Connect(m1, MATCH_ANY)
+	b.disable()
 
-	// check input rings
-	checkInputRing(t, m0, false, true)
-	checkInputRing(t, m1, true, false)
-	checkInputRing(t, v0, true, false)
-	checkInputRing(t, v1, true, false)
+	if b.isEnabled() {
+		t.Fatalf("Module still enabled after disabling")
+	}
+	t.Logf("Module disabled")
 
-	// Call
-	for _, m := range testModules {
-		m.Start()
-	}
-	for _, m := range testModules {
-		m.Stop()
-	}
-	for _, m := range testModules {
-		m.Wait()
-	}
-	for _, m := range testModules {
-		m.Control(m.Name(), false)
-	}
+	b.free()
 }

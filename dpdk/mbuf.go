@@ -21,6 +21,7 @@ package dpdk
 #include <rte_config.h>
 #include <rte_mbuf.h>
 #include <rte_ether.h>
+#include "dpdk.h"
 */
 import "C"
 
@@ -38,11 +39,15 @@ const (
 type Mbuf C.struct_rte_mbuf
 type MemPool C.struct_rte_mempool
 
-func PktMbufPoolCreate(name string, n, cache_size, priv_size, data_room_size uint, socket_id int) *MemPool {
+func PktMbufPoolCreate(name string, n, cache_size, priv_size, data_room_size uint, socket_id int) (*MemPool, error) {
 	cname := C.CString(name)
 	defer C.free((unsafe.Pointer)(cname))
-	return (*MemPool)(C.rte_pktmbuf_pool_create(cname, C.unsigned(n), C.unsigned(cache_size),
+	pool := (*MemPool)(C.rte_pktmbuf_pool_create(cname, C.unsigned(n), C.unsigned(cache_size),
 		C.uint16_t(priv_size), C.uint16_t(data_room_size), C.int(socket_id)))
+	if pool == nil {
+		return nil, Errno(C.get_rte_errno())
+	}
+	return pool, nil
 }
 
 func (mp *MemPool) Free() {
@@ -83,6 +88,11 @@ func (mb *Mbuf) SetEtherHdr(eh EtherHdr) {
 	mb.checkAndUpdateMbufLen()
 }
 
+// PktLen returns sum of all segments.
+func (mb *Mbuf) PktLen() int {
+	return int(mb.pkt_len)
+}
+
 // DataCap returns maximum available data storage in the mbuf.
 func (mb *Mbuf) DataCap() int {
 	return int(mb.buf_len) - int(RTE_PKTMBUF_HEADROOM)
@@ -121,6 +131,16 @@ func (mb *Mbuf) SetData(data []byte) int {
 	return len
 }
 
+// VlanTCI returns the current VLAN TCI value.
+func (mb *Mbuf) VlanTCI() uint16 {
+	return uint16(mb.vlan_tci)
+}
+
+// SetVlanTCI sets VLAN TCI value.
+func (mb *Mbuf) SetVlanTCI(vt uint16) {
+	mb.vlan_tci = C.uint16_t(vt)
+}
+
 func (mb *Mbuf) Metadata() unsafe.Pointer {
 	return (unsafe.Pointer)(uintptr(unsafe.Pointer(mb)) + C.sizeof_struct_rte_mbuf)
 }
@@ -135,4 +155,9 @@ func (mb *Mbuf) Refcnt() int {
 
 func (mb *Mbuf) Free() {
 	C.rte_pktmbuf_free((*C.struct_rte_mbuf)(mb))
+}
+
+// Next returns a next segment of scattered packet.
+func (mb *Mbuf) Next() *Mbuf {
+	return (*Mbuf)(mb.next)
 }

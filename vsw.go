@@ -18,45 +18,27 @@ package main
 
 import (
 	"flag"
-	"github.com/lagopus/vsw/agents/config"
-	_ "github.com/lagopus/vsw/agents/netlink"
-	_ "github.com/lagopus/vsw/agents/vrrp"
-	_ "github.com/lagopus/vsw/modules/bridge"
-	_ "github.com/lagopus/vsw/modules/hostif"
-	_ "github.com/lagopus/vsw/modules/l3"
-	_ "github.com/lagopus/vsw/modules/tap"
-	_ "github.com/lagopus/vsw/modules/vif"
-	"github.com/lagopus/vsw/vswitch"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
+
+	_ "github.com/lagopus/vsw/agents/config"
+	_ "github.com/lagopus/vsw/agents/netlink"
+	_ "github.com/lagopus/vsw/modules/bridge"
+	_ "github.com/lagopus/vsw/modules/ethdev"
+	_ "github.com/lagopus/vsw/modules/hostif"
+	_ "github.com/lagopus/vsw/modules/rif"
+	_ "github.com/lagopus/vsw/modules/router"
+	_ "github.com/lagopus/vsw/modules/tap"
+	_ "github.com/lagopus/vsw/modules/tunnel"
+	_ "github.com/lagopus/vsw/modules/tunnel/ipip"
+	"github.com/lagopus/vsw/vswitch"
 )
 
+const defaultConfigPath = "/usr/local/etc/vsw.conf"
+
 var log = vswitch.Logger
-
-func initDpdk() {
-	dc := &vswitch.DpdkConfig{
-		CoreMask:      0xfe,
-		MemoryChannel: 2,
-	}
-
-	if coreMask != 0 {
-		dc.CoreMask = coreMask
-	} else if coreList != "" {
-		dc.CoreList = coreList
-		dc.CoreMask = 0
-	}
-	if pmdPath != "" {
-		dc.PmdPath = pmdPath
-	}
-
-	dc.Vdevs = flag.Args()
-
-	if !vswitch.InitDpdk(dc) {
-		log.Fatalf("DPDK initialization failed.\n")
-	}
-}
-
 var quit = make(chan int)
 
 func initSignalHandling() {
@@ -73,56 +55,37 @@ func initSignalHandling() {
 
 func main() {
 	flag.Parse()
+
 	vswitch.EnableLog(logging)
 
-	initDpdk()
+	if err := vswitch.Init(configPath); err != nil {
+		fmt.Println(err)
+		return
+	}
 
 	initSignalHandling()
 
 	// Start DP Agents
-	agents := vswitch.StartNamedAgents("Netlink Agent", "Config Agent", "vrrp")
+	agents := vswitch.EnableAgents("Netlink Agent", "config")
 	for _, agent := range agents {
 		vswitch.Logger.Printf("Agent %v started.\n", agent)
 	}
 
-	// Wait for Config Agent to complete configuration
-	if agent, err := vswitch.GetAgent("Config Agent"); err == nil {
-		if c, ok := agent.(config.ConfigAgentAPI); ok {
-			vswitch.Logger.Printf("Waiting for Config Agent to set up modules")
-			c.Wait()
-			vswitch.Logger.Printf("Ready to start")
-
-		}
-	} else {
-		vswitch.Logger.Fatalf("error: %v", err)
-	}
-
-	// Start threads
-	vswitch.Start()
-
 	// Wait for signal
 	<-quit
 
-	// Tear down
-	vswitch.Stop()
-
-	// Wait...
-	vswitch.Wait()
-
 	// Stop Agents
 	for _, agent := range agents {
-		agent.Stop()
+		agent.Disable()
 	}
+
+	vswitch.Deinit()
 }
 
 var logging bool
-var coreMask int
-var coreList string
-var pmdPath string
+var configPath string
 
 func init() {
+	flag.StringVar(&configPath, "f", defaultConfigPath, "Config file")
 	flag.BoolVar(&logging, "v", false, "verbose mode")
-	flag.IntVar(&coreMask, "c", 0, "DPDK core mask")
-	flag.StringVar(&coreList, "l", "", "DPDK core list")
-	flag.StringVar(&pmdPath, "p", "", "DPDK PMD path")
 }

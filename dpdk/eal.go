@@ -20,13 +20,20 @@ package dpdk
 #include <stdlib.h>
 #include <rte_config.h>
 #include <rte_eal.h>
+#include "dpdk.h"
 */
 import "C"
 
-func EalInit(argv []string) int {
+import "unsafe"
+
+func EalInit(argv []string) error {
 	cargv := make([]*C.char, len(argv))
 	for i, arg := range argv {
 		cargv[i] = C.CString(arg)
+		defer C.free(unsafe.Pointer(cargv[i]))
 	}
-	return int(C.rte_eal_init(C.int(len(cargv)), (**C.char)(&cargv[0])))
+	if int(C.rte_eal_init(C.int(len(cargv)), (**C.char)(&cargv[0]))) == -1 {
+		return Errno(C.get_rte_errno())
+	}
+	return nil
 }

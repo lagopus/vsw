@@ -19,12 +19,14 @@ package dumb
 import (
 	"bytes"
 	"flag"
-	"github.com/lagopus/vsw/dpdk"
-	_ "github.com/lagopus/vsw/modules/testvif"
-	"github.com/lagopus/vsw/vswitch"
+	"fmt"
 	"net"
 	"os"
 	"testing"
+
+	"github.com/lagopus/vsw/dpdk"
+	"github.com/lagopus/vsw/modules/testvif"
+	"github.com/lagopus/vsw/vswitch"
 )
 
 var tx_chan chan *dpdk.Mbuf
@@ -41,10 +43,10 @@ func send(t *testing.T, mbuf *dpdk.Mbuf, self bool) bool {
 	t.Logf("Sending: %s -> %s\n", src_ha, dst_ha)
 
 	// send
-	tx_chan <- mbuf
+	rx_chan <- mbuf
 
 	// recv
-	rmbuf := <-rx_chan
+	rmbuf := <-tx_chan
 	reh := rmbuf.EtherHdr()
 	md := (*vswitch.Metadata)(rmbuf.Metadata())
 
@@ -79,24 +81,10 @@ func TestNormalFlow(t *testing.T) {
 	}
 }
 
-func initDpdk() {
-	dc := &vswitch.DpdkConfig{
-		CoreMask:      0xff,
-		MemoryChannel: 2,
-		PmdPath:       "/usr/local/lib/dpdk-pmd",
-	}
-
-	dc.Vdevs = flag.Args()
-
-	if !vswitch.InitDpdk(dc) {
-		log.Fatalf("DPDK initialization failed.\n")
-	}
-}
-
 func TestMain(m *testing.M) {
-	// Initialize DPDK
-	initDpdk()
-
+	// Initialize vswitch core
+	vswitch.Init("../../vsw.conf")
+	vswitch.EnableLog(true)
 	pool = vswitch.GetDpdkResource().Mempool
 
 	//
@@ -104,29 +92,35 @@ func TestMain(m *testing.M) {
 	//
 
 	// Create Instances
-	vrf := vswitch.NewVRF("testvrf", 0)
-	testvif := vrf.NewModule("testvif", "tv0")
-	dumb := vrf.NewModule("dumb", "dumb0")
+	tv0, _ := vswitch.NewInterface("testvif", "tv0", nil)
+	tv0_0, _ := tv0.NewVIF(0)
+	dumb, _ := vswitch.NewTestModule("dumb", "dumb0", nil)
+	testif, _ := tv0.Instance().(*testvif.TestIF)
 
 	// Connect Instances
-	testvif.Connect(dumb, vswitch.MATCH_ANY)
-	dumb.Connect(testvif, vswitch.MATCH_ANY)
+	dumb.AddVIF(tv0_0)
 
 	// Get Channels
-	tx_chan, _ = testvif.Control("GET_TX_CHAN", nil).(chan *dpdk.Mbuf)
-	rx_chan, _ = testvif.Control("GET_RX_CHAN", nil).(chan *dpdk.Mbuf)
-	vif_mac, _ = testvif.Control("GET_MAC_ADDRESS", nil).(net.HardwareAddr)
+	tx_chan = testif.TxChan()
+	rx_chan = testif.RxChan()
+	vif_mac = tv0.MACAddress()
 
-	// Start
-	vswitch.Start()
+	// Enable Modules
+	tv0.Enable()
+	tv0_0.Enable()
+	if err := dumb.Enable(); err != nil {
+		fmt.Printf("Can't enable dumb module: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Execute test
 	flag.Parse()
 	rc := m.Run()
 
 	// Teardown
-	vswitch.Stop()
-	vswitch.Wait()
+	tv0.Disable()
+	tv0_0.Disable()
+	dumb.Disable()
 
 	// Done
 	os.Exit(rc)

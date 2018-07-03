@@ -24,6 +24,8 @@ package dpdk
 import "C"
 
 import (
+	"errors"
+	"fmt"
 	"net"
 	"syscall"
 	"unsafe"
@@ -33,9 +35,11 @@ type EthConf C.struct_rte_eth_conf
 type EthRxConf C.struct_rte_eth_rxconf
 type EthTxConf C.struct_rte_eth_txconf
 type EthDevInfo C.struct_rte_eth_dev_info
+type EthDevPortID = C.uint16_t
 
 type EthDev struct {
-	port_id uint
+	port_id   uint
+	socket_id int
 }
 
 type EthRxQueue struct {
@@ -48,11 +52,20 @@ type EthTxQueue struct {
 	queue_id uint
 }
 
-func EthDevOpen(port_id uint) *EthDev {
-	if int(C.rte_eth_dev_is_valid_port(C.uint8_t(port_id))) == 0 {
-		return nil
+func EthDevOpen(port_id uint) (*EthDev, error) {
+	pid := EthDevPortID(port_id)
+	if int(C.rte_eth_dev_is_valid_port(pid)) == 0 {
+		return nil, fmt.Errorf("Invalid port ID: %v", port_id)
 	}
-	return &EthDev{port_id}
+	return &EthDev{port_id, int(C.rte_eth_dev_socket_id(pid))}, nil
+}
+
+func EthDevOpenByName(name string) (*EthDev, error) {
+	pid, err := EthDevGetPortByName(name)
+	if err != nil {
+		return nil, err
+	}
+	return &EthDev{pid, int(C.rte_eth_dev_socket_id(EthDevPortID(pid)))}, nil
 }
 
 func EthDevCount() uint {
@@ -62,7 +75,7 @@ func EthDevCount() uint {
 func EthDevGetPortByName(name string) (uint, error) {
 	cname := C.CString(name)
 	defer C.free(unsafe.Pointer(cname))
-	var cpid C.uint8_t
+	var cpid EthDevPortID
 	if rc := int(C.rte_eth_dev_get_port_by_name(cname, &cpid)); rc < 0 {
 		return 0, syscall.Errno(-rc)
 	}
@@ -71,22 +84,30 @@ func EthDevGetPortByName(name string) (uint, error) {
 
 func EthDevGetNameByPort(port_id uint) (string, error) {
 	var cname [C.RTE_ETH_NAME_MAX_LEN]C.char
-	if rc := int(C.rte_eth_dev_get_name_by_port(C.uint8_t(port_id), &cname[0])); rc < 0 {
+	if rc := int(C.rte_eth_dev_get_name_by_port(EthDevPortID(port_id), &cname[0])); rc < 0 {
 		return "", syscall.Errno(-rc)
 	}
 	return C.GoString(&cname[0]), nil
 }
 
+func (re *EthDev) PortID() uint {
+	return re.port_id
+}
+
+func (re *EthDev) SocketID() int {
+	return re.socket_id
+}
+
 func (re *EthDev) Configure(nb_rx_queue, nb_tx_queue uint, eth_conf *EthConf) int {
-	return int(C.rte_eth_dev_configure(C.uint8_t(re.port_id),
+	return int(C.rte_eth_dev_configure(EthDevPortID(re.port_id),
 		C.uint16_t(nb_rx_queue), C.uint16_t(nb_tx_queue),
 		(*C.struct_rte_eth_conf)(eth_conf)))
 }
 
-func (re *EthDev) RxQueueSetup(rx_queue_id, nb_rx_desc, socket_id uint,
+func (re *EthDev) RxQueueSetup(rx_queue_id, nb_rx_desc uint, socket_id int,
 	rx_conf *EthRxConf, mb_pool *MemPool) *EthRxQueue {
 
-	if int(C.rte_eth_rx_queue_setup(C.uint8_t(re.port_id),
+	if int(C.rte_eth_rx_queue_setup(EthDevPortID(re.port_id),
 		C.uint16_t(rx_queue_id), C.uint16_t(nb_rx_desc),
 		C.unsigned(socket_id), (*C.struct_rte_eth_rxconf)(rx_conf),
 		(*C.struct_rte_mempool)(mb_pool))) != 0 {
@@ -99,10 +120,10 @@ func (re *EthDev) RxQueueSetup(rx_queue_id, nb_rx_desc, socket_id uint,
 	}
 }
 
-func (re *EthDev) TxQueueSetup(tx_queue_id, nb_tx_desc, socket_id uint,
+func (re *EthDev) TxQueueSetup(tx_queue_id, nb_tx_desc uint, socket_id int,
 	tx_conf *EthTxConf) *EthTxQueue {
 
-	if int(C.rte_eth_tx_queue_setup(C.uint8_t(re.port_id),
+	if int(C.rte_eth_tx_queue_setup(EthDevPortID(re.port_id),
 		C.uint16_t(tx_queue_id), C.uint16_t(nb_tx_desc),
 		C.unsigned(socket_id), (*C.struct_rte_eth_txconf)(tx_conf))) != 0 {
 		return nil
@@ -116,20 +137,31 @@ func (re *EthDev) TxQueueSetup(tx_queue_id, nb_tx_desc, socket_id uint,
 
 func (re *EthDev) DevInfo() *EthDevInfo {
 	var di EthDevInfo
-	C.rte_eth_dev_info_get(C.uint8_t(re.port_id), (*C.struct_rte_eth_dev_info)(&di))
+	C.rte_eth_dev_info_get(EthDevPortID(re.port_id), (*C.struct_rte_eth_dev_info)(&di))
 	return &di
 }
 
-func (re *EthDev) MacAddr() net.HardwareAddr {
+func (re *EthDev) SetDefaultMACAddr(mac net.HardwareAddr) error {
+	rc := int(C.rte_eth_dev_default_mac_addr_set(EthDevPortID(re.port_id), (*C.struct_ether_addr)(unsafe.Pointer(&mac[0]))))
+	switch rc {
+	case -C.ENOTSUP:
+		return errors.New("Hardware doesn't support setting MAC Address")
+	case -C.EINVAL:
+		return errors.New("Invalid MAC Address")
+	}
+	return nil
+}
+
+func (re *EthDev) MACAddr() net.HardwareAddr {
 	addr := make([]byte, C.ETHER_ADDR_LEN)
-	C.rte_eth_macaddr_get(C.uint8_t(re.port_id), (*C.struct_ether_addr)(unsafe.Pointer(&addr[0])))
+	C.rte_eth_macaddr_get(EthDevPortID(re.port_id), (*C.struct_ether_addr)(unsafe.Pointer(&addr[0])))
 	return (net.HardwareAddr)(addr)
 }
 
 func (re *EthDev) GetMaxQueues() (rxQueueMax, txQueueMax uint) {
 	var dev_info C.struct_rte_eth_dev_info
 
-	C.rte_eth_dev_info_get(C.uint8_t(re.port_id), &dev_info)
+	C.rte_eth_dev_info_get(EthDevPortID(re.port_id), &dev_info)
 
 	rxQueueMax = uint(dev_info.max_rx_queues)
 	txQueueMax = uint(dev_info.max_tx_queues)
@@ -139,69 +171,66 @@ func (re *EthDev) GetMaxQueues() (rxQueueMax, txQueueMax uint) {
 
 func (re *EthDev) MTU() int {
 	var mtu C.uint16_t
-	if C.rte_eth_dev_get_mtu(C.uint8_t(re.port_id), &mtu) == 0 {
+	if C.rte_eth_dev_get_mtu(EthDevPortID(re.port_id), &mtu) == 0 {
 		return int(mtu)
 	}
 	return -1
 }
 
-func (re *EthDev) SetMTU(mtu uint16) int {
-	return int(C.rte_eth_dev_set_mtu(C.uint8_t(re.port_id), C.uint16_t(mtu)))
+func (re *EthDev) SetMTU(mtu uint16) error {
+	if rc := int(C.rte_eth_dev_set_mtu(EthDevPortID(re.port_id), C.uint16_t(mtu))); rc < 0 {
+		return syscall.Errno(-rc)
+	}
+	return nil
 }
 
 func (re *EthDev) Promiscuous() bool {
-	if C.rte_eth_promiscuous_get(C.uint8_t(re.port_id)) == 1 {
-		return true
-	}
-	return false
+	return C.rte_eth_promiscuous_get(EthDevPortID(re.port_id)) == 1
 }
 
 func (re *EthDev) SetPromiscuous(enable bool) {
 	if enable {
-		C.rte_eth_promiscuous_enable(C.uint8_t(re.port_id))
+		C.rte_eth_promiscuous_enable(EthDevPortID(re.port_id))
 	} else {
-		C.rte_eth_promiscuous_disable(C.uint8_t(re.port_id))
+		C.rte_eth_promiscuous_disable(EthDevPortID(re.port_id))
 	}
 }
 
 func (re *EthDev) AllMulticast() bool {
-	if C.rte_eth_allmulticast_get(C.uint8_t(re.port_id)) == 1 {
-		return true
-	}
-	return false
+	return C.rte_eth_allmulticast_get(EthDevPortID(re.port_id)) == 1
 }
 
 func (re *EthDev) SetAllMulticast(enable bool) {
 	if enable {
-		C.rte_eth_allmulticast_enable(C.uint8_t(re.port_id))
+		C.rte_eth_allmulticast_enable(EthDevPortID(re.port_id))
 	} else {
-		C.rte_eth_allmulticast_disable(C.uint8_t(re.port_id))
+		C.rte_eth_allmulticast_disable(EthDevPortID(re.port_id))
 	}
 }
 
 func (re *EthDev) Start() int {
-	return int(C.rte_eth_dev_start(C.uint8_t(re.port_id)))
+	return int(C.rte_eth_dev_start(EthDevPortID(re.port_id)))
 }
 
 func (re *EthDev) Stop() {
-	C.rte_eth_dev_stop(C.uint8_t(re.port_id))
+	C.rte_eth_dev_stop(EthDevPortID(re.port_id))
 }
 
 func (re *EthDev) SetLinkUp() int {
-	return int(C.rte_eth_dev_set_link_up(C.uint8_t(re.port_id)))
+	return int(C.rte_eth_dev_set_link_up(EthDevPortID(re.port_id)))
 }
 
 func (re *EthDev) SetLinkDown() int {
-	return int(C.rte_eth_dev_set_link_down(C.uint8_t(re.port_id)))
+	return int(C.rte_eth_dev_set_link_down(EthDevPortID(re.port_id)))
 }
 
 func (rq *EthRxQueue) Burst(rx_pkts *unsafe.Pointer, nb_pkts uint) uint {
-	return uint(C.rte_eth_rx_burst(C.uint8_t(rq.dev.port_id), C.uint16_t(rq.queue_id),
+	return uint(C.rte_eth_rx_burst(EthDevPortID(rq.dev.port_id), C.uint16_t(rq.queue_id),
 		(**C.struct_rte_mbuf)(unsafe.Pointer(rx_pkts)), C.uint16_t(nb_pkts)))
 }
 
 func (rq *EthTxQueue) Burst(tx_pkts *unsafe.Pointer, nb_pkts uint) uint {
-	return uint(C.rte_eth_tx_burst(C.uint8_t(rq.dev.port_id), C.uint16_t(rq.queue_id),
+	return uint(C.rte_eth_tx_burst(EthDevPortID(rq.dev.port_id), C.uint16_t(rq.queue_id),
 		(**C.struct_rte_mbuf)(unsafe.Pointer(tx_pkts)), C.uint16_t(nb_pkts)))
 }
 

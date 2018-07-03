@@ -17,557 +17,68 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
-	"github.com/lagopus/vsw/dpdk"
-	"github.com/lagopus/vsw/modules/bridge"
-	"github.com/lagopus/vsw/modules/l3"
-	"github.com/lagopus/vsw/modules/vif"
+
 	"github.com/lagopus/vsw/ocdc"
 	"github.com/lagopus/vsw/vswitch"
-	"net"
-	"strconv"
-	"strings"
 )
 
-type VRF struct {
-	Name         string
-	Interfaces   map[string]*VIF
-	Enabled      bool
-	RD           uint64
-	MTU          int
-	BridgeConfig bridge.Config
-	vrf          *vswitch.Vrf
-	tap          vswitch.Module
-	layer3       vswitch.Module
-	hostif       vswitch.Module
-	updated      bool
-	ready        bool
-	ca           *ConfigAgent
-}
+const (
+	DriverDPDK             = "ethdev"
+	DriverRIF              = "rif"
+	DriverTunnel           = "tunnel"
+	DefaultOpenconfigdHost = "localhost"
+	DefaultOpenconfigdPort = uint16(2650)
+	DefaultListenPort      = uint16(2653)
+)
 
-func (v VRF) String() string {
-	updated := ""
-	if v.updated {
-		updated = "*"
-	}
-	vrf := ""
-	if v.vrf != nil {
-		vrf = "Created"
-	}
-	return fmt.Sprintf("%v%s: RD=%016x Interfaces=[%v] Enabled=%v MTU=%d FDBConfig=[%v] %s",
-		v.Name, updated, v.RD, v.Interfaces, v.Enabled, v.MTU, v.BridgeConfig, vrf)
-}
-
-type Interface struct {
-	Name    string
-	Device  string
-	Driver  string
-	Enabled bool
-	MTU     int
-	VIFs    map[int]*VIF
-	updated bool
-	ca      *ConfigAgent
-}
-
-func (i Interface) String() string {
-	updated := ""
-	if i.updated {
-		updated = "*"
-	}
-	return fmt.Sprintf("%v%s: Device=%v Driver=%v Enabled=%v MTU=%d VIFs=%v",
-		i.Name, updated, i.Device, i.Driver, i.Enabled, i.MTU, i.VIFs)
-}
-
-type VIF struct {
-	Name        string
-	IfName      string
-	Index       int
-	VRF         *VRF
-	Interface   *Interface
-	Enabled     bool
-	VRRP        bool
-	IPAddresses map[string]*vswitch.IPAddr
-	updated     bool
-	ready       bool
-	bridge      vswitch.Module
-	vif         vswitch.Module
-}
-
-func (v VIF) String() string {
-	updated := ""
-	if v.updated {
-		updated = "*"
-	}
-	module := ""
-	if v.vif != nil {
-		module = "Created"
-	}
-	return fmt.Sprintf("%v-%d%s: Enabled=%v IPAddr(s)=%v %s",
-		v.IfName, v.Index, updated, v.Enabled, v.IPAddresses, module)
-}
+const configAgentStr = "config"
 
 type ConfigAgent struct {
-	handle *ocdc.Handle
-	vrfs   map[string]*VRF
-	ifs    map[string]*Interface
-	vifs   map[string]*VIF
-	ready  chan struct{}
+	subscriber *ocdc.Subscriber
+	p          *parser
+	oc         *openconfig
+	updatedNI  map[*ni]struct{}
+	updatedIF  map[*iface]struct{}
+	Setting    ocdSetting `toml:"openconfig"`
+
+	iface map[string]*vswitch.Interface
+	vif   map[string]*vswitch.VIF
+	vrf   map[string]*vswitch.VRF
+	vsi   map[string]*vswitch.VSI
 }
 
-type ConfigAgentAPI interface {
-	DumpConfig()
-	Wait()
+type ocdSetting struct {
+	Server string `toml:"server_host"` // OpenConfigd Server Host
+	Port   uint16 `toml:"server_port"` // OpenConfigd Server Port #
+	Listen uint16 `toml:"listen_port"` // Show server listen port number
+	DryRun bool   `toml:"dry_run"`     // Dry Run
 }
 
 var log = vswitch.Logger
 
-const configAgentStr = "Config Agent"
-
-const (
-	instanceType   = 1
-	instanceID     = 2
-	instanceConfig = 3
-
-	configKey = 0
-
-	niFdbConfigKey   = 2
-	niFdbConfigValue = 3
-
-	niIfaceID          = 2
-	niIfaceConfigKey   = 4
-	niIfaceConfigValue = 5
-	niIfaceConfigLen   = 6
-
-	niConfigKey   = 1
-	niConfigValue = 2
-
-	ifConfigKey   = 1
-	ifConfigValue = 2
-
-	ifSubifIndex          = 2
-	ifSubifIPv4ID         = 3
-	ifSubifIPv4ConfigType = 4
-	ifSubifIPv4Key        = 5
-	ifSubifIPv4Value      = 6
-	ifSubifIPv4ConfigLen  = 7
-)
-
-func (v *VRF) configFdb(key, value string) bool {
-	switch key {
-	case "mac-aging-time":
-		v.BridgeConfig.MacAgingTime, _ = strconv.Atoi(value)
-	case "mac-learning":
-		v.BridgeConfig.MacLearning, _ = strconv.ParseBool(value)
-	case "maximum-entries":
-		v.BridgeConfig.MaxEntries, _ = strconv.Atoi(value)
-	default:
-		log.Printf("%s: Unknown fdb config: %v=%v", configAgentStr, key, value)
-		return false
-	}
-	return true
-}
-
-func (v *VRF) configVRF(key, value string) {
-	switch key {
-	case "route-distinguisher":
-		f := strings.Split(value, ":")
-
-		// Assigned Number
-		n, _ := strconv.Atoi(f[1])
-		num := uint16(n)
-
-		// Administrator Field
-		n, err := strconv.Atoi(f[0])
-
-		var asn uint32
-		var t uint64
-		if err == nil {
-			asn = uint32(n)
-			t = 0x02 << 48
-		} else {
-			ip := strings.Split(f[0], ".")
-			if len(ip) != 4 {
-				log.Printf("%s: Unknown route-distinguisher: %v", configAgentStr, value)
-				return
-			}
-			for _, s := range ip {
-				d, _ := strconv.Atoi(s)
-				asn = (asn << 8) | uint32(d)
-			}
-			t = uint64(0x01 << 48)
-		}
-
-		v.RD = t | uint64(asn)<<16 | uint64(num)
-
-	case "enabled":
-		v.Enabled, _ = strconv.ParseBool(value)
-	case "mtu":
-		v.MTU, _ = strconv.Atoi(value)
-	case "name":
-		if v.Name != value {
-			log.Printf("%s: network-instance name doesn't match: %v != %v",
-				configAgentStr, v.Name, value)
-		}
-	default:
-		log.Printf("%s: Unknown network-instance config: %v=%v", configAgentStr, key, value)
-		return
-	}
-	v.updated = true
-}
-
-func (v *VRF) configNetworkInstance(config []string) {
-	if len(config) < 1 {
-		return
-	}
-
-	switch config[configKey] {
-	case "config":
-		v.configVRF(config[niConfigKey], config[niConfigValue])
-	case "fdb":
-		if v.configFdb(config[niFdbConfigKey], config[niFdbConfigValue]) {
-			v.updated = true
-		}
-	case "interfaces":
-		// As we can extract interface and subinterface from the name
-		// we don't bother extracting from config sent to us.
-		if len(config) == niIfaceConfigLen {
-			ifname := config[niIfaceID]
-			vif := v.ca.VIF(ifname)
-			vif.VRF = v
-			v.Interfaces[ifname] = vif
-			v.updated = true
-		}
-	default:
-		log.Printf("%s: Unknown network-instance config: %v", configAgentStr, config)
-		return
-	}
-}
-
-func (v *VRF) VRFInstance() *vswitch.Vrf {
-	if v.vrf == nil {
-		v.vrf = vswitch.NewVRF(v.Name, v.RD)
-	}
-	return v.vrf
-}
-
-func (v *VRF) TAPInstance() vswitch.Module {
-	if v.tap == nil {
-		v.tap = v.VRFInstance().NewModule("tap", v.Name+"-tap")
-	}
-	return v.tap
-}
-
-func (v *VRF) Layer3Instance() vswitch.Module {
-	if v.layer3 == nil {
-		v.layer3 = v.VRFInstance().NewModule("l3", v.Name+"-l3")
-		v.layer3.Connect(v.TAPInstance(), vswitch.MATCH_IPV4_DST_SELF)
-	}
-	return v.layer3
-}
-
-func (v *VRF) HostIFInstance() vswitch.Module {
-	if v.hostif == nil {
-		v.hostif = v.VRFInstance().NewModule("hostif", v.Name+"-hostif")
-
-		l3m := v.Layer3Instance()
-		l3m.Connect(v.hostif, vswitch.MATCH_IPV4_DST)
-
-		entry := l3.InterfaceIpEntry{
-			VrfRd: v.RD,
-			IpAddress: vswitch.IPAddr{
-				IP:   net.IPv4(224, 0, 0, 18),
-				Mask: net.IPv4Mask(255, 255, 255, 255),
-			},
-		}
-		l3m.Control("INTERFACE_HOSTIF_IP_ADD", entry)
-	}
-	return v.hostif
-}
-
-func (v *VRF) instantiateVRF() {
-	for _, vif := range v.Interfaces {
-		log.Printf("%s: Setting VIF: %v", configAgentStr, vif)
-		if !vif.Enabled || vif.ready {
-			continue
-		}
-
-		tap := v.TAPInstance()
-		l3m := v.Layer3Instance()
-
-		bi := vif.BridgeInstance()
-		vi := vif.VIFInstance()
-
-		bi.Control("SET_CONFIG", v.BridgeConfig)
-		bid := bi.Control("GET_BRIDGE_ID", nil).(uint32)
-
-		vi.Connect(bi, vswitch.MATCH_ANY)
-		bi.Connect(vi, vswitch.MATCH_OUT_VIF)
-		bi.Connect(tap, vswitch.MATCH_ETH_TYPE_ARP)
-		bi.Connect(l3m, vswitch.MATCH_ETH_DST_SELF)
-		l3m.Connect(bi, vswitch.MATCH_BRIDGE_ID, uint64(bid))
-		tap.Connect(vi, vswitch.MATCH_OUT_VIF)
-
-		// VRRP
-		if vif.VRRP {
-			log.Printf("%s: Connecting hostif to %v for VRRP", configAgentStr, vif.Name)
-			v.HostIFInstance().Connect(vi, vswitch.MATCH_OUT_VIF)
-		}
-
-		// ready to bring up VIF
-		vi.Vif().VifInfo().SetLink(vswitch.LinkUp)
-
-		vif.updated = false
-	}
-
-	v.ready = true
-	for _, vif := range v.Interfaces {
-		if !vif.ready {
-			v.ready = false
-			break
-		}
-	}
-}
-
-func (v *VIF) configVIF(key, value string) {
-	switch key {
-	case "enabled":
-		v.Enabled, _ = strconv.ParseBool(value)
-	case "index":
-		if idx, err := strconv.Atoi(value); err == nil {
-			if idx != v.Index {
-				log.Printf("%s: Subinterface index doesn'match: %d != %d",
-					configAgentStr, v.Index, idx)
-				return
-			}
-		}
-	default:
-		log.Printf("%s: Unknown interface config: %v=%v", configAgentStr, key, value)
-		return
-	}
-	v.updated = true
-}
-
-func (v *VIF) IPAddress(id string) *vswitch.IPAddr {
-	ip := v.IPAddresses[id]
-
-	if ip == nil {
-		ip = &vswitch.IPAddr{}
-		v.IPAddresses[id] = ip
-	}
-
-	return ip
-}
-
-func (v *VIF) configIPv4Address(id, key, value string) {
-	ip := v.IPAddress(id)
-
-	switch key {
-	case "ip":
-		ip.IP = net.ParseIP(value)
-	case "prefix-length":
-		plen, err := strconv.Atoi(value)
-		if err != nil {
-			log.Printf("%s: Bad prefix-length: %v", configAgentStr, value)
-			return
-		}
-		ip.Mask = net.CIDRMask(plen, 32)
-	default:
-		log.Printf("%s: Unknown IPv4 address config: %v=%v", configAgentStr, key, value)
-		return
-	}
-	v.updated = true
-}
-
-func (v *VIF) configSubinterface(config []string) {
-	if len(config) < 1 {
-		return
-	}
-
-	switch config[configKey] {
-	case "config":
-		v.configVIF(config[ifConfigKey], config[ifConfigValue])
-	case "ipv4":
-		configLen := len(config)
-		if configLen > ifSubifIPv4ConfigType {
-			switch config[ifSubifIPv4ConfigType] {
-			case "config":
-				if len(config) == ifSubifIPv4ConfigLen {
-					id := config[ifSubifIPv4ID]
-					key := config[ifSubifIPv4Key]
-					value := config[ifSubifIPv4Value]
-					v.configIPv4Address(id, key, value)
-				} else {
-					log.Printf("%s: Unknown subinterface config: %v", configAgentStr, config)
-				}
-			case "vrrp":
-				v.VRRP = true
-			}
-		}
-	default:
-		log.Printf("%s: Unknown subinterface config: %v", configAgentStr, config)
-		return
-	}
-}
-
-func (v *VIF) BridgeInstance() vswitch.Module {
-	if v.bridge == nil {
-		if v.VRF == nil {
-			return nil
-		}
-		v.bridge = v.VRF.VRFInstance().NewModule("bridge", v.IfName+"-bridge")
-		log.Printf("%s: Creating bridge instance - %s-bridge", configAgentStr, v.IfName)
-	}
-	return v.bridge
-}
-
-func (v *VIF) VIFInstance() vswitch.Module {
-	if v.vif == nil {
-		if v.VRF == nil {
-			return nil
-		}
-
-		if v.Interface.Device == "" || !v.Enabled {
-			return nil
-		}
-
-		log.Printf("%s: Creating VIF instance - %s", configAgentStr, v.Name)
-
-		port, err := dpdk.EthDevGetPortByName(v.Interface.Device)
-		if err != nil {
-			log.Printf("%s: Can't find device %v: %v", configAgentStr, v.Interface.Device, err)
-			return nil
-		}
-
-		v.vif = v.VRF.VRFInstance().NewModule("vif", v.Name)
-
-		v.vif.Control("CONFIG",
-			vif.VifConfig{
-				SocketId: 0,
-				PortId:   port,
-				RxQueue:  vif.VifQueue{QueueId: 0, QueueLen: 4096},
-				TxQueue:  vif.VifQueue{QueueId: 0, QueueLen: 2048},
-			})
-
-		vi := v.vif.Vif().VifInfo()
-		for _, ipaddr := range v.IPAddresses {
-			vi.AddIPAddr(*ipaddr)
-		}
-		v.ready = true
-	}
-	return v.vif
-}
-
-func (i *Interface) configInterface(key, value string) {
-	switch key {
-	case "name":
-		i.Name = value
-	case "device":
-		i.Device = value
-	case "driver":
-		i.Driver = value
-	case "enabled":
-		i.Enabled, _ = strconv.ParseBool(value)
-	case "mtu":
-		i.MTU, _ = strconv.Atoi(value)
-	default:
-		log.Printf("%s: Unknown interface config: %v=%v)", configAgentStr, key, value)
-		return
-	}
-	i.updated = true
-}
-
-func (i *Interface) configInterfaceInstance(config []string) {
-	if len(config) < 1 {
-		return
-	}
-
-	switch config[configKey] {
-	case "config":
-		i.configInterface(config[ifConfigKey], config[ifConfigValue])
-	case "subinterfaces":
-		if idx, err := strconv.Atoi(config[ifSubifIndex]); err == nil {
-			vif := i.ca.VIF(i.Name + "-" + strconv.Itoa(idx))
-			vif.configSubinterface(config[ifSubifIndex+1:])
-		}
-	default:
-		log.Printf("%s: Unknown interface config: %v", configAgentStr, config)
-	}
-}
-
-func (c *ConfigAgent) VRF(name string) *VRF {
-	vrf := c.vrfs[name]
-
-	if vrf == nil {
-		vrf = &VRF{
-			Name:       name,
-			Interfaces: make(map[string]*VIF),
-			ca:         c,
-		}
-		c.vrfs[name] = vrf
-	}
-
-	return vrf
-}
-
-func (c *ConfigAgent) Interface(name string) *Interface {
-	iface := c.ifs[name]
-
-	if iface == nil {
-		iface = &Interface{
-			Name: name,
-			VIFs: make(map[int]*VIF),
-			ca:   c,
-		}
-		c.ifs[name] = iface
-	}
-
-	return iface
-}
-
-func (c *ConfigAgent) VIF(name string) *VIF {
-	vif := c.vifs[name]
-
-	if vif == nil {
-		f := strings.Split(name, "-")
-		index, _ := strconv.Atoi(f[1])
-
-		iface := c.Interface(f[0])
-		vif = &VIF{
-			Name:        name,
-			IfName:      f[0],
-			Index:       index,
-			Interface:   iface,
-			IPAddresses: make(map[string]*vswitch.IPAddr),
-		}
-		iface.VIFs[index] = vif
-		c.vifs[name] = vif
-	}
-
-	return vif
-}
-
 func (c *ConfigAgent) commit(configs []*ocdc.Config) {
 	for _, config := range configs {
-		if config.Type == ocdc.TypeDelete {
+		if config.Type == ocdc.CT_Delete {
 			log.Printf("%s: Delete Not Supported yet; Requested to delete %v",
 				configAgentStr, config.Path)
 			continue
 		}
 
-		instance := config.Path[instanceID]
-		configPath := config.Path[instanceConfig:]
-
-		switch config.Path[instanceType] {
-		case "network-instance":
-			vrf := c.VRF(instance)
-			vrf.configNetworkInstance(configPath)
-
-		case "interface":
-			iface := c.Interface(instance)
-			iface.configInterfaceInstance(configPath)
-
-		default:
-			log.Printf("%s: Unknown config: %v", configAgentStr, config.Path)
+		if i, err := c.p.parse(config.Path); err != nil {
+			if pe, ok := err.(parserError); !ok || pe != noMatchingSyntaxError {
+				log.Printf("%s: Error while parsing '%v': %v", configAgentStr, config.Path, err)
+			}
+		} else {
+			log.Printf("%s: parsed: %v", configAgentStr, config.Path)
+			switch v := i.(type) {
+			case *iface:
+				c.updatedIF[v] = struct{}{}
+			case *ni:
+				c.updatedNI[v] = struct{}{}
+			}
 		}
 	}
 }
@@ -577,127 +88,492 @@ func (c *ConfigAgent) validate(configs []*ocdc.Config) bool {
 	return true
 }
 
+func (c *ConfigAgent) getInterfaceInstance(i *iface) (*vswitch.Interface, error) {
+	if iface, ok := c.iface[i.name]; ok {
+		return iface, nil
+	}
+
+	// Not enough info yet
+	if i.driver == DRV_UNKNOWN {
+		return nil, errors.New("Driver not set")
+	}
+
+	if i.iftype == IF_UNKNOWN {
+		return nil, errors.New("Interface type not set")
+	}
+
+	// DPDK driver requires device info
+	if i.driver == DRV_DPDK && i.device == "" {
+		return nil, errors.New("Device info not set for DPDK driver type")
+	}
+
+	// Get appropriate module for each interface type
+	driverName := DriverDPDK
+	if i.driver == DRV_LOCAL {
+		if i.iftype == IF_ETHERNETCSMACD {
+			driverName = DriverRIF
+		} else {
+			driverName = DriverTunnel
+		}
+	}
+
+	iface, err := vswitch.NewInterface(driverName, i.name, i.device)
+	if err != nil {
+		return nil, fmt.Errorf("Can't instantiate interface %v: %v", i.name, err)
+	}
+	c.iface[i.name] = iface
+	return iface, nil
+}
+
+func (c *ConfigAgent) getVIFInstance(i *vswitch.Interface, s *subiface) (*vswitch.VIF, error) {
+	if vif, ok := c.vif[s.name]; ok {
+		return vif, nil
+	}
+
+	var vif *vswitch.VIF
+	var err error
+	if s.tunnel == nil {
+		vif, err = i.NewVIF(s.id)
+	} else {
+		vif, err = i.NewTunnel(s.id, s.tunnel)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("Creating New VIF %v failed: %v", s.name, err)
+	}
+
+	c.vif[s.name] = vif
+	return vif, err
+}
+
+func (c *ConfigAgent) configSubinterface(iface *vswitch.Interface, s *subiface, vids map[vswitch.VID]struct{}, i *iface) error {
+	vif, err := c.getVIFInstance(iface, s)
+	if err != nil {
+		return err
+	}
+
+	// Set VID
+	if s.vid != vif.VID() {
+		if err := vif.SetVID(s.vid); err != nil {
+			s.vid = vif.VID()
+			log.Printf("%s: Can't set VID for %v (rolling back to %d): %v", configAgentStr, s.name, s.vid, err)
+		}
+	}
+
+	// Update IPAddress
+	for _, ip := range s.ipaddr {
+		vif.AddIPAddr(ip)
+	}
+	for _, ip := range vif.ListIPAddrs() {
+		if _, ok := s.ipaddr[ip.String()]; !ok {
+			vif.DeleteIPAddr(ip)
+		}
+	}
+
+	// Enable
+	if s.enabled {
+		if err := vif.Enable(); err != nil {
+			return fmt.Errorf("Can't enable VIF %v: %v", s.name, err)
+		}
+	} else {
+		vif.Disable()
+	}
+
+	// Check if the VIF is associated with any NI
+	// NOTE: we MUST connect VIF to VSI first. Not otherway around.
+	for name := range s.ni {
+		if vsi, ok := c.vsi[name]; ok {
+			vsi.AddVIF(vif)
+		}
+	}
+	for name := range s.ni {
+		if vrf, ok := c.vrf[name]; ok {
+			vrf.AddVIF(vif)
+		}
+	}
+
+	return nil
+}
+
+func (c *ConfigAgent) configInterface(i *iface) error {
+	iface, err := c.getInterfaceInstance(i)
+	if err != nil {
+		return err
+	}
+
+	// Update interface
+
+	// Update MAC
+	if i.mac != nil && bytes.Compare(i.mac, iface.MACAddress()) != 0 {
+		if err := iface.SetMACAddress(i.mac); err != nil {
+			i.mac = iface.MACAddress()
+			log.Printf("%s: Setting MAC for %s failed (rolling back to %v): %v", configAgentStr, i.name, i.mac, err)
+		}
+	}
+
+	// Update MTU
+	if i.mtu != 0 && i.mtu != vswitch.InvalidMTU && i.mtu != iface.MTU() {
+		if err := iface.SetMTU(i.mtu); err != nil {
+			i.mtu = iface.MTU()
+			log.Printf("%s: Setting MTU for %s failed (rolling back to %v): %v", configAgentStr, i.name, i.mtu, err)
+		}
+	}
+
+	// Update VLAN Mode
+	if i.ifmode != iface.InterfaceMode() {
+		if err := iface.SetInterfaceMode(i.ifmode); err != nil {
+			i.ifmode = iface.InterfaceMode()
+			log.Printf("%s: Setting InterfaceMode for %s failed (rolling back to %v): %v", configAgentStr, i.name, i.ifmode, err)
+		}
+	}
+
+	// Add missing VID
+	// We delete unused VID after updating subinterfaces
+	vids := make(map[vswitch.VID]struct{})
+	for _, vid := range iface.VID() {
+		vids[vid] = struct{}{}
+	}
+	for vid := range i.vids {
+		if _, ok := vids[vid]; !ok {
+			iface.AddVID(vid)
+		}
+	}
+
+	// Update subinterfaces
+	for _, s := range i.subs {
+		if err := c.configSubinterface(iface, s, vids, i); err != nil {
+			return err
+		}
+	}
+
+	// Delete unused VID
+	for vid := range vids {
+		if _, ok := i.vids[vid]; !ok {
+			iface.DeleteVID(vid)
+		}
+	}
+
+	// Change enable status
+	if i.enabled {
+		if err := iface.Enable(); err != nil {
+			return fmt.Errorf("Can't enable interface %v: %v", i.name, err)
+		}
+	} else {
+		iface.Disable()
+	}
+	return nil
+}
+
+type networkInstance interface {
+	AddVIF(*vswitch.VIF) error
+	DeleteVIF(*vswitch.VIF) error
+	VIF() []*vswitch.VIF
+}
+
+func configVswitchNI(ni *ni, vsw networkInstance) error {
+	// Add VIF
+	for name := range ni.vifs {
+		if vif := vswitch.GetVIFByName(name); vif != nil {
+			if err := vsw.AddVIF(vif); err != nil {
+				return fmt.Errorf("Adding VIF %s to %s failed: %v", name, ni.name, err)
+			}
+		}
+	}
+
+	// Delete VIF
+	for _, vif := range vsw.VIF() {
+		if _, ok := ni.vifs[vif.Name()]; !ok {
+			vsw.DeleteVIF(vif)
+		}
+	}
+
+	return nil
+}
+
+func (c *ConfigAgent) getVSI(ni *ni) (*vswitch.VSI, error) {
+	if vsi, ok := c.vsi[ni.name]; ok {
+		return vsi, nil
+	}
+
+	var vsi *vswitch.VSI
+	var err error
+	if ni.niType == NI_L2VSI {
+		vsi, err = vswitch.NewVSI(ni.name)
+	} else {
+		vsi, err = vswitch.NewMAT(ni.name)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	c.vsi[ni.name] = vsi
+	return vsi, nil
+}
+
+func (c *ConfigAgent) configVSI(ni *ni) error {
+	vsi, err := c.getVSI(ni)
+	if err != nil {
+		return err
+	}
+
+	// Add and Enable/Disable VID
+	for vid, state := range ni.vlans {
+		if err := vsi.AddVID(vid); err != nil {
+			return fmt.Errorf("Adding VID %d to %s failed: %v", vid, ni.name, err)
+		}
+		if state {
+			if err := vsi.EnableVID(vid); err != nil {
+				return fmt.Errorf("Enabling VID %d on %s failed: %v", vid, ni.name, err)
+			}
+		} else {
+			if err := vsi.DisableVID(vid); err != nil {
+				return fmt.Errorf("Disabling VID %d on %s failed: %v", vid, ni.name, err)
+			}
+		}
+	}
+
+	// Delete unused VID
+	for _, vid := range vsi.VID() {
+		if _, ok := ni.vlans[vid]; !ok {
+			vsi.DeleteVID(vid)
+		}
+	}
+
+	// Update VIF
+	configVswitchNI(ni, vsi)
+
+	// Set FDB Config
+	if ni.macLearning != vsi.MACLearning() {
+		if ni.macLearning {
+			vsi.EnableMACLearning()
+		} else {
+			vsi.DisableMACLearning()
+		}
+	}
+
+	if ni.macAgingTime != vsi.MACAgingTime() {
+		if err := vsi.SetMACAgingTime(ni.macAgingTime); err != nil {
+			ni.macAgingTime = vsi.MACAgingTime()
+			return fmt.Errorf("Setting MAC aging time failed. Falling back to %d: %v", ni.macAgingTime, err)
+		}
+	}
+
+	if ni.maximumEntries != vsi.MaximumEntries() {
+		if err := vsi.SetMaximumEntries(ni.maximumEntries); err != nil {
+			ni.maximumEntries = vsi.MaximumEntries()
+			return fmt.Errorf("Setting max entries failed. Falling back to %d: %v", ni.maximumEntries, err)
+		}
+	}
+
+	// Enable/Disable
+	if ni.enabled {
+		if err := vsi.Enable(); err != nil {
+			return fmt.Errorf("Can't enable VSI %v: %v", ni.name, err)
+		}
+	} else {
+		vsi.Disable()
+	}
+
+	return nil
+}
+
+func (c *ConfigAgent) getVRF(ni *ni) (*vswitch.VRF, error) {
+	if vrf, ok := c.vrf[ni.name]; ok {
+		return vrf, nil
+	}
+
+	vrf, err := vswitch.NewVRF(ni.name)
+	if err != nil {
+		return nil, err
+	}
+
+	c.vrf[ni.name] = vrf
+	return vrf, nil
+}
+
+func (c *ConfigAgent) configVRF(ni *ni) error {
+	vrf, err := c.getVRF(ni)
+	if err != nil {
+		return err
+	}
+
+	// XXX: AF ignored for now
+
+	// Update VIF
+	configVswitchNI(ni, vrf)
+
+	// Update SAD
+	if ni.sad != nil {
+		sadb := vrf.SADatabases()
+		for _, sa := range ni.sad {
+			sadb.AddSADEntry(*sa)
+		}
+
+		for _, sa := range sadb.SAD() {
+			if _, ok := ni.sad[sa.SPI]; !ok {
+				sadb.DeleteSADEntry(sa.SPI)
+			}
+		}
+	}
+
+	// Update SPD
+	if ni.spd != nil {
+		sadb := vrf.SADatabases()
+		for _, sp := range ni.spd {
+			sadb.AddSPDEntry(*sp)
+		}
+
+		for _, sp := range sadb.SPD() {
+			if _, ok := ni.spd[sp.Name]; !ok {
+				sadb.DeleteSPDEntry(sp.Name)
+			}
+		}
+	}
+
+	// Enable/Disable
+	if ni.enabled {
+		if err := vrf.Enable(); err != nil {
+			return fmt.Errorf("Can't enable VRF %s: %v", ni.name, err)
+		}
+	} else {
+		vrf.Disable()
+	}
+
+	fmt.Printf("> %v", vrf.Dump())
+
+	return nil
+}
+
 func (c *ConfigAgent) config() {
-	for id, vrf := range c.vrfs {
-		if vrf.updated {
-			log.Printf("VRF %v ready: %v", id, vrf)
-			vrf.instantiateVRF()
-			vrf.updated = false
+	for iface := range c.updatedIF {
+		if err := c.configInterface(iface); err != nil {
+			log.Printf("%s: %v", configAgentStr, err)
 		}
 	}
 
-	needVRFSetting := false
-	for id, iface := range c.ifs {
-		if iface.updated {
-			log.Printf("Interface %v ready: %v", id, iface)
-			needVRFSetting = true
-			iface.updated = false
+	// NOTE: we MUST connect VIF to VSI first. Not otherway around.
+	for ni := range c.updatedNI {
+		if ni.niType == NI_L3VRF {
+			continue
 		}
-
-		for id, vif := range iface.VIFs {
-			if vif.updated {
-				log.Printf("Subinterface %v ready: %v", id, vif)
-				if vif.Enabled {
-					needVRFSetting = true
-				}
-				vif.updated = false
-			}
+		if err := c.configVSI(ni); err != nil {
+			log.Printf("%s: %v", configAgentStr, err)
 		}
 	}
 
-	if needVRFSetting {
-		for _, vrf := range c.vrfs {
-			log.Printf("%s: Updating %v", configAgentStr, vrf.Name)
-			vrf.instantiateVRF()
+	for ni := range c.updatedNI {
+		if ni.niType != NI_L3VRF {
+			continue
 		}
-	}
-
-	if len(c.vrfs) > 0 {
-		ready := true
-		for _, vrf := range c.vrfs {
-			if !vrf.ready {
-				ready = false
-				break
-			}
-		}
-		if ready {
-			c.ready <- struct{}{}
+		if err := c.configVRF(ni); err != nil {
+			log.Printf("%s: %v", configAgentStr, err)
 		}
 	}
 }
 
-func (c *ConfigAgent) Start() bool {
+func (c *ConfigAgent) Enable() error {
 	paths := [][]string{
 		{"interfaces", "interface"},
 		{"network-instances", "network-instance"},
 	}
 
-	c.handle = ocdc.Subscribe("config-agent", paths)
-	if c.handle == nil {
-		log.Printf("%s: Can't subscribe to OpenConfigd", configAgentStr)
-		return false
+	// Fetch openconfig related configuration
+	vswitch.GetConfig().Decode(c)
+	ocdc.SetOcdServer(c.Setting.Server, c.Setting.Port)
+
+	var err error
+	if c.subscriber, err = ocdc.Subscribe(paths); err != nil {
+		return fmt.Errorf("%s: %v", configAgentStr, err)
 	}
 
 	go func() {
-		for cm := range c.handle.ConfigMessage {
-			rc := true
-			if cm.Validate {
+		for recvConf := range c.subscriber.C {
+			r := true
+			switch recvConf.Mode {
+			case ocdc.CM_Validate:
 				log.Printf("%s: Validation Start", configAgentStr)
-				rc = c.validate(cm.Configs)
-				log.Printf("%s: Validation Done (%v)", configAgentStr, rc)
-			} else {
+				r = c.validate(recvConf.Configs)
+				log.Printf("%s: Validation Done (%v)", configAgentStr, r)
+			case ocdc.CM_Commit:
 				log.Printf("%s: Commit Start", configAgentStr)
-				c.commit(cm.Configs)
-				c.config()
-				log.Printf("%s: Commit Done", configAgentStr)
+				c.commit(recvConf.Configs)
+				c.updates()
+				if !c.Setting.DryRun {
+					c.config()
+					log.Printf("%s: Commit Done", configAgentStr)
+				} else {
+					log.Printf("%s: Commit Done (Dry Run)", configAgentStr)
+				}
+				c.DumpConfig()
 			}
-			c.handle.Rc <- rc
+			c.subscriber.RC <- r
 		}
 	}()
 
-	return true
+	return nil
 }
 
-func (c *ConfigAgent) Stop() {
-	if c.handle != nil {
-		c.handle.Unsubscribe()
+func (c *ConfigAgent) Disable() {
+	if c.subscriber != nil {
+		c.subscriber.Unsubscribe()
+		close(c.subscriber.C)
 	}
+	// TODO: We must free all created instances
+
+	// clean infos
+	c.oc.free()
 }
 
 func (c *ConfigAgent) String() string {
 	return configAgentStr
 }
 
-func (c *ConfigAgent) DumpConfig() {
-	for id, vc := range c.vrfs {
-		log.Printf("VRF ID: %v\n", id)
-		log.Printf("%v", vc)
+func (c *ConfigAgent) updates() {
+	for id, v := range c.updatedNI {
+		log.Printf("Network Instance: %v\n", id)
+		log.Printf("%v\n", v)
 		log.Printf("-------------------\n")
 	}
 
-	for id, iface := range c.ifs {
-		log.Printf("Interface ID: %v\n", id)
-		log.Printf("%v", iface)
-		log.Printf("-------------------\n")
-	}
-
-	for id, vif := range c.vifs {
-		log.Printf("VIF ID: %v\n", id)
-		log.Printf("%v", vif)
+	for id, v := range c.updatedIF {
+		log.Printf("Interface: %v\n", id)
+		log.Printf("%v", v)
 		log.Printf("-------------------\n")
 	}
 }
 
-func (c *ConfigAgent) Wait() {
-	<-c.ready
+func (c *ConfigAgent) DumpConfig() {
+	for id, v := range c.oc.nis {
+		log.Printf("Network Instance: %v\n", id)
+		log.Printf("%v\n", v)
+		log.Printf("-------------------\n")
+	}
+
+	for id, v := range c.oc.ifs {
+		log.Printf("Interface: %v\n", id)
+		log.Printf("%v", v)
+		log.Printf("-------------------\n")
+	}
 }
 
 func init() {
 	agent := &ConfigAgent{
-		vrfs:  make(map[string]*VRF),
-		ifs:   make(map[string]*Interface),
-		vifs:  make(map[string]*VIF),
-		ready: make(chan struct{}),
+		oc: newOpenConfig(),
+
+		iface: make(map[string]*vswitch.Interface),
+		vif:   make(map[string]*vswitch.VIF),
+		vsi:   make(map[string]*vswitch.VSI),
+		vrf:   make(map[string]*vswitch.VRF),
+
+		updatedNI: make(map[*ni]struct{}),
+		updatedIF: make(map[*iface]struct{}),
+
+		Setting: ocdSetting{
+			Server: DefaultOpenconfigdHost,
+			Port:   DefaultOpenconfigdPort,
+			Listen: DefaultListenPort,
+		},
 	}
+
+	agent.p = initParser(agent.oc)
 	vswitch.RegisterAgent(agent)
 }

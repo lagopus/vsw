@@ -17,305 +17,237 @@
 package vswitch
 
 import (
+	"errors"
 	"fmt"
+
 	"github.com/lagopus/vsw/dpdk"
-	"sync"
 )
 
-type ModuleFactory func(*ModuleParam) (Module, error)
+type InstanceFactory func(*BaseInstance, interface{}) (Instance, error)
 
 // ModuleType is the type of the module
 type ModuleType int
 
 const (
-	// Other than VIF or Bridge Modules
-	TypeOther ModuleType = iota
-	// VIF Module
-	TypeVif
+	// Interface Module
+	TypeInterface ModuleType = iota
 	// Bridge Module
 	TypeBridge
+	// Router Module
+	TypeRouter
+	// Other than any type listed above
+	TypeOther
 )
 
 var moduleTypeString = [...]string{
-	TypeOther:  "Others",
-	TypeVif:    "VIF",
-	TypeBridge: "Bridge",
+	TypeOther:     "Others",
+	TypeInterface: "Interface",
+	TypeBridge:    "Bridge", // XXX: Should OF bridge belongs to TypeBridge?
+	TypeRouter:    "Router",
 }
 
 func (mt ModuleType) String() string { return moduleTypeString[mt] }
 
-// ModuleParam is a set of parameters passed to the module factory.
-type ModuleParam struct {
-	t            ModuleType
-	name         string
-	vrf          *VrfInfo
-	input        *dpdk.Ring // Non-VIFs send mbuf to this ring.
-	vifInput     *dpdk.Ring // VIFs send mbuf to this ring.
-	rules        *Rules
-	vif          *Vif
-	bridge       *BridgeInfo
-	rp           RingParam // RingParam for input
-	vrp          RingParam // RingParam for vifInput
-	onceInput    sync.Once
-	onceVifInput sync.Once
+// BaseInstance is a base class of the module instance
+type BaseInstance struct {
+	name     string
+	input    *dpdk.Ring // Default input ring.
+	input2   *dpdk.Ring // Optional input ring. If non-nil, used for Inbound mbufs by VIF.
+	rules    *Rules
+	instance Instance
+	enabled  bool
 }
 
 // RingParam defines a parameter for an input ring.
 type RingParam struct {
-	Count    uint // Number of mbufs to be queueable
-	SocketId int  // Memory Socket ID
-	Flags    uint // dpdk.RING_F_SP_ENQ and/or dpdk.RING_F_SC_DEQ
+	Count          uint // Number of mbufs to be queueable
+	SocketId       int  // Memory Socket ID
+	SecondaryInput bool // Set true to separate inbound and outbound rings. For TypeInterface only.
 }
 
 var defaultRingParam = RingParam{
-	Count:    32,
-	SocketId: dpdk.SOCKET_ID_ANY,
+	Count:          32,
+	SocketId:       dpdk.SOCKET_ID_ANY,
+	SecondaryInput: false,
 }
 
-// Module defines the interface that each module shall comply to.
-type Module interface {
-	Start() bool                             // Start the packet processing. Return immediately.
-	Stop()                                   // Request to stop the packet processing. Return immediately.
-	Wait()                                   // Wait for the packet processing to stop. Block until stops.
-	Control(string, interface{}) interface{} // Control the instance. Implementation dependent.
-	ModuleService
+// Instance defines basic interfaces that each instance shall comply to.
+// There're also ModuleType specific interface that each ModuleType shall
+// comply to, e.g. InterfaceInstance.
+type Instance interface {
+	Enable() error // Enable enables the instance
+	Disable()      // Disable disables the instance
+	Free()         // Free the instance.
 }
 
-// ModuleService defines internal API to support Module.
-// Call NewModuleService() to create one for your module.
-type ModuleService interface {
-	Connect(Module, VswMatch, ...uint64) bool
-	Type() ModuleType             // Type of this module
-	Vrf() *VrfInfo                // VRF RD that this module belongs to.
-	inputInternal() *dpdk.Ring    // internal
-	Input() *dpdk.Ring            // Input Ring for this module.
-	vifInputInternal() *dpdk.Ring // internal
-	VifInput() *dpdk.Ring         // VIFs send mbuf to this ring.
-	Rules() *Rules                // Rules for output.
-	Vif() *Vif                    // Non-nil if this module is VIF.
-	Bridge() *BridgeInfo          // Non-nil if the module is Bridge.
-	Name() string                 // Name of the module instance.
-	RingParam() RingParam         // Get DPDK Ring Parameter to be used for the Input()
-	SetRingParam(RingParam)       // Set DPDK Ring Parameter to be used for the Input()
-	VifRingParam() RingParam      // Get DPDK Ring Parameter to be used for the VifInput()
-	SetVifRingParam(RingParam)    // Set DPDK Ring Parameter to be used for the VifInput()
-}
-
-type moduleService struct {
-	*ModuleParam
-}
-
-var moduleFactories = make(map[string]ModuleFactory)
-var modules []Module
+var instanceFactories = make(map[string]InstanceFactory)
 var ringParams = make(map[string]RingParam)
 var moduleTypes = make(map[string]ModuleType)
+var bridgeModuleName = ""
+var routerModuleName = ""
 
 // RegisterModule registers a module with the given name.
 // Factory returns a module comply to Module interface.
 // T is the type of the module to be registered.
-// Returns true on success, false on failure.
+// Returns error on failure.
 // Intended to be called from modules' init.
-func RegisterModule(name string, factory ModuleFactory, rp *RingParam, t ModuleType) bool {
+func RegisterModule(moduleName string, factory InstanceFactory, rp *RingParam, t ModuleType) error {
 	if factory == nil {
-		Logger.Printf("No module factory for '%s' given", name)
-		return false
+		return fmt.Errorf("No module factory for '%s' given", moduleName)
 	}
 
-	if moduleFactories[name] != nil {
-		Logger.Printf("'%s' already exists. ignoring.\n", name)
-		return false
+	if t != TypeInterface && rp != nil && rp.SecondaryInput {
+		return errors.New("Only TypeInterface may enable SecondaryInput of RingParam")
 	}
 
-	moduleFactories[name] = factory
+	if instanceFactories[moduleName] != nil {
+		return fmt.Errorf("'%s' already exists. ignoring.", moduleName)
+	}
+
+	switch t {
+	case TypeBridge:
+		if bridgeModuleName != "" {
+			return fmt.Errorf("Bridge module already exists. (Existing bridge: %s)", bridgeModuleName)
+		}
+		bridgeModuleName = moduleName
+	case TypeRouter:
+		if routerModuleName != "" {
+			return fmt.Errorf("Router module already exists. (Existing router: %s)", routerModuleName)
+		}
+		routerModuleName = moduleName
+	default:
+	}
+
+	instanceFactories[moduleName] = factory
 	if rp != nil {
-		ringParams[name] = *rp
+		ringParams[moduleName] = *rp
 	}
-	moduleTypes[name] = t
-	Logger.Printf("'%s' registerd. (Type=%v)\n", name, t)
-	return true
+
+	moduleTypes[moduleName] = t
+	return nil
 }
 
-// NewModule creates a new module of the moduleName. The created module
-// is idqntified with the given name, and must be unique.
-func newModule(moduleName, name string, vrf *VrfInfo) Module {
-	factory, found := moduleFactories[moduleName]
+// NewInstance creates a new instance of the moduleName.
+// The created instance is identified with the given name, and must be unique.
+// Priv is a module specific parameter passed to create an instance.
+func newInstance(moduleName, name string, priv interface{}) (*BaseInstance, error) {
+	factory, found := instanceFactories[moduleName]
 	if !found {
-		Logger.Printf("Module '%s' doesn't exist.\n", moduleName)
-		return nil
+		return nil, fmt.Errorf("Module '%s' doesn't exist.\n", moduleName)
 	}
 
-	rp, ok := ringParams[name]
+	rp, ok := ringParams[moduleName]
 	if !ok {
 		rp = defaultRingParam
 	}
-	rp.Flags = dpdk.RING_F_SC_DEQ
 
-	// Create a parameter for the module
-	modType := moduleTypes[moduleName]
-	param := &ModuleParam{
-		t:     modType,
-		name:  name,
-		vrf:   vrf,
-		rp:    rp,
-		vrp:   rp,
-		rules: newRules(),
+	bi := &BaseInstance{name: name}
+
+	ringName := fmt.Sprintf("input-%s", name)
+	bi.input = dpdk.RingCreate(ringName, rp.Count, rp.SocketId, dpdk.RING_F_SC_DEQ)
+	if bi.input == nil {
+		return nil, fmt.Errorf("Input ring creation faild for %s.\n", name)
 	}
 
-	switch modType {
-	case TypeVif:
-		param.vif = newVif()
-	case TypeBridge:
-		param.bridge = newBridge()
-	default:
-		// nop
+	if rp.SecondaryInput {
+		ringName := fmt.Sprintf("input2-%s", name)
+		bi.input2 = dpdk.RingCreate(ringName, rp.Count, rp.SocketId, dpdk.RING_F_SC_DEQ)
+		if bi.input2 == nil {
+			return nil, fmt.Errorf("Second input ring creation failed for %s", name)
+		}
 	}
 
-	module, err := factory(param)
+	bi.rules = newRules()
+
+	instance, err := factory(bi, priv)
 	if err != nil {
-		Logger.Printf("Creating module '%s' with name '%s' failed.\n", moduleName, name)
-		return nil
+		return nil, fmt.Errorf("Creating module '%s' with name '%s' failed: %v\n", moduleName, name, err)
 	}
+	bi.instance = instance
 
-	switch modType {
-	case TypeVif:
-		op, ok := module.(VifOp)
-		if !ok {
-			Logger.Fatalf("'%s' doesn't conform to VifModule interface!\n", moduleName)
-			break
-		}
-		ms, _ := module.(ModuleService)
-		param.vif.config(op, ms)
-
-	default:
-		// nop
-	}
-
-	modules = append(modules, module)
-
-	return module
+	return bi, nil
 }
 
-func NewModuleService(param *ModuleParam) ModuleService {
-	return &moduleService{param}
+// newSubInstance creates a new subinstance that inherits input ring from the parent.
+// This function is used to create a VIF from Interfaces.
+func newSubInstance(parent *BaseInstance, name string) *BaseInstance {
+	bi := &BaseInstance{
+		name:     name,
+		input:    parent.input,
+		input2:   parent.input2,
+		rules:    newRules(),
+		enabled:  false,
+		instance: parent.instance,
+	}
+	return bi
 }
 
-// Connect connects output ring for the module instance to the given dst.
+func (bi *BaseInstance) baseInstance() *BaseInstance {
+	return bi
+}
+
+// connect connects output of the instance to the ring specified by dst.
+// Rules to match shall be specified as well.
+func (bi *BaseInstance) connect(dst *dpdk.Ring, match VswMatch, param interface{}) error {
+	return bi.rules.add(match, param, dst)
+}
+
+// disconnect connects output ring of the instance to the given dst instance.
 // Rules to match shall be specified.
-// If the destination is VIF and MATCH_OUT_VIF is specified, it passes
-// VIF index of the VIF module as a parameter automatically.
-// Only modules that belongs to the same VRF may be connected.
-// Returns true on success, and false on failure.
-func (m *moduleService) Connect(dst Module, match VswMatch, param ...uint64) bool {
-	if m.Vrf() != dst.Vrf() {
-		return false
-	}
-
-	dstVif := dst.Vif()
-	if match == MATCH_OUT_VIF && dstVif != nil {
-		param = []uint64{uint64(dstVif.VifIndex())}
-	}
-
-	var dstInput *dpdk.Ring
-	if m.Type() == TypeVif {
-		dstInput = dst.vifInputInternal()
-	} else {
-		dstInput = dst.inputInternal()
-	}
-
-	m.Rules().add(match, param, dstInput)
-	return true
-}
-
-// internal
-func (m *moduleService) inputInternal() *dpdk.Ring {
-	m.onceInput.Do(func() {
-		// Create an input ring
-		ringName := fmt.Sprintf("input-%s", m.Name())
-		rp := m.RingParam()
-		m.input = dpdk.RingCreate(ringName, rp.Count, rp.SocketId, rp.Flags)
-		if m.input == nil {
-			Logger.Printf("Input ring creation faild for %s.\n", m.Name())
-		}
-	})
-
-	return m.input
-}
-
-// internal
-func (m *moduleService) vifInputInternal() *dpdk.Ring {
-	m.onceVifInput.Do(func() {
-		// Create an input ring
-		ringName := fmt.Sprintf("vif-input-%s", m.Name())
-		rp := m.VifRingParam()
-		m.vifInput = dpdk.RingCreate(ringName, rp.Count, rp.SocketId, rp.Flags)
-		if m.vifInput == nil {
-			Logger.Printf("Input ring creation faild for %s.\n", m.Name())
-		}
-	})
-
-	return m.vifInput
+func (bi *BaseInstance) disconnect(match VswMatch, param interface{}) error {
+	return bi.rules.remove(match, param)
 }
 
 // Input returns input ring for the module
-func (m *moduleService) Input() *dpdk.Ring {
-	return m.input
+func (bi *BaseInstance) Input() *dpdk.Ring {
+	return bi.input
 }
 
-// VifInput returns input ring dedicated for VIF of the module.
-func (m *moduleService) VifInput() *dpdk.Ring {
-	return m.vifInput
-}
-
-// RingParam returns DPDK Ring Parameter to be used for the Input()
-func (m *moduleService) RingParam() RingParam {
-	return m.rp
-}
-
-// SetRingParam sets DPDK Ring Parameter to be used for the Input()
-func (m *moduleService) SetRingParam(rp RingParam) {
-	m.rp = rp
-}
-
-// VifRingParam returns DPDK Ring Parameter to be used for the VifInput()
-func (m *moduleService) VifRingParam() RingParam {
-	return m.vrp
-}
-
-// SetVifRingParam sets DPDK Ring Parameter to be used for the VifInput()
-func (m *moduleService) SetVifRingParam(rp RingParam) {
-	m.vrp = rp
-}
-
-// Vif returns VIF information of the module.
-// If the module is not a VIF, then it returns nil.
-func (m *moduleService) Vif() *Vif {
-	return m.vif
+// SecondaryInput returns secondary input ring for the module.
+// If the module doesn't have one, nil is returned.
+func (bi *BaseInstance) SecondaryInput() *dpdk.Ring {
+	return bi.input2
 }
 
 // Rules returns output rule of the module.
-func (m *moduleService) Rules() *Rules {
-	return m.rules
+func (bi *BaseInstance) Rules() *Rules {
+	return bi.rules
 }
 
 // Name returns the name of this module instance.
-func (m *moduleService) Name() string {
-	return m.name
+func (bi *BaseInstance) Name() string {
+	return bi.name
 }
 
-// Vrf returns a VRF that this modules belongs to.
-func (m *moduleService) Vrf() *VrfInfo {
-	return m.vrf
+func (bi *BaseInstance) String() string {
+	return bi.name
 }
 
-func (m *moduleService) Bridge() *BridgeInfo {
-	return m.bridge
+func (bi *BaseInstance) isEnabled() bool {
+	return bi.enabled
 }
 
-// Type returns the type of this module.
-func (m *moduleService) Type() ModuleType {
-	return m.t
+func (bi *BaseInstance) enable() error {
+	if !bi.enabled {
+		if err := bi.instance.Enable(); err != nil {
+			return err
+		}
+		bi.enabled = true
+	}
+	return nil
 }
 
-func (m *moduleService) String() string {
-	return m.name
+func (bi *BaseInstance) disable() {
+	if bi.enabled {
+		bi.instance.Disable()
+		bi.enabled = false
+	}
+}
+
+func (bi *BaseInstance) free() {
+	if bi.enabled {
+		bi.instance.Disable()
+	}
+	bi.instance.Free()
+	bi.input.Free()
 }

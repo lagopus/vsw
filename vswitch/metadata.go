@@ -21,60 +21,47 @@ package vswitch
 */
 import "C"
 
-import "fmt"
-
-const (
-	VifInvalidIndex   = C.VIF_INVALID_INDEX // Invalid VIF Index
-	VifMaxIndex       = C.VIF_MAX_INDEX     // The maximum VIF Index number
-	VifBroadcastIndex = C.VIF_BROADCAST     //VIF Index for broadcast
-	BridgeMaxID       = C.BRIDGE_MAX_ID     // Max Bridge ID number
+import (
+	"fmt"
+	"unsafe"
 )
 
 // Metadata is a Lagopus2 internal data associated with each packet.
 // Use dpdk.Mbuf's Metadata() to get a pointer to the metadata in the packet.
 type Metadata C.struct_lagopus_packet_metadata
 
-// VifIndex represents VIF index.
-type VifIndex C.vifindex_t
-
-// Get VRF.
-func (m *Metadata) Vrf() uint64 {
-	return uint64((*C.struct_lagopus_packet_metadata)(m).md_vif.vrf)
-}
-
-// Set VRF.
-func (m *Metadata) SetVrf(vrf uint64) {
-	(*C.struct_lagopus_packet_metadata)(m).md_vif.vrf = C.uint64_t(vrf)
-}
-
-// Get Tunnel ID.
-func (m *Metadata) TunnelId() uint64 {
-	return uint64((*C.struct_lagopus_packet_metadata)(m).md_vif.tunnel_id)
-}
-
-// Set Tunnel ID.
-func (m *Metadata) SetTunnelId(tid uint64) {
-	(*C.struct_lagopus_packet_metadata)(m).md_vif.tunnel_id = C.uint64_t(tid)
-}
+// VIFIndex represents VIF index.
+type VIFIndex C.vifindex_t
+type VRFIndex C.vrfindex_t
 
 // Get Input VIF.
-func (m *Metadata) InVIF() VifIndex {
-	return VifIndex((*C.struct_lagopus_packet_metadata)(m).md_vif.in_vif)
+func (m *Metadata) InVIF() VIFIndex {
+	return VIFIndex((*C.struct_lagopus_packet_metadata)(m).md_vif.in_vif)
 }
 
 // Set Input VIF.
-func (m *Metadata) SetInVIF(vif VifIndex) {
+func (m *Metadata) SetInVIF(vif VIFIndex) {
 	(*C.struct_lagopus_packet_metadata)(m).md_vif.in_vif = C.vifindex_t(vif)
 }
 
 // Get Output VIF.
-func (m *Metadata) OutVIF() VifIndex {
-	return VifIndex((*C.struct_lagopus_packet_metadata)(m).md_vif.out_vif)
+func (m *Metadata) OutVIF() VIFIndex {
+	return VIFIndex((*C.struct_lagopus_packet_metadata)(m).md_vif.out_vif)
 }
 
 // Set Output VIF.
-func (m *Metadata) SetOutVIF(vif VifIndex) {
+func (m *Metadata) SetOutVIF(vif VIFIndex) {
 	(*C.struct_lagopus_packet_metadata)(m).md_vif.out_vif = C.vifindex_t(vif)
+}
+
+// Get Local Flag.
+func (m *Metadata) Local() bool {
+	return bool((*C.struct_lagopus_packet_metadata)(m).md_vif.local)
+}
+
+// Set Local Flag.
+func (m *Metadata) SetLocal(l bool) {
+	(*C.struct_lagopus_packet_metadata)(m).md_vif.local = C.bool(l)
 }
 
 // Check if the packet is sent to the router itself.
@@ -91,17 +78,11 @@ func (m *Metadata) SetSelf(self bool) {
 	}
 }
 
-// Get incoming bridge domain ID.
-func (m *Metadata) BridgeID() uint32 {
-	return uint32((*C.struct_lagopus_packet_metadata)(m).md_vif.bridge_id)
-}
-
-// Set incoming bridge domain ID.
-func (m *Metadata) SetBridgeID(bid uint32) {
-	(*C.struct_lagopus_packet_metadata)(m).md_vif.bridge_id = C.uint32_t(bid)
+// Reset clears the metadata
+func (m *Metadata) Reset() {
+	C.memset(unsafe.Pointer(m), 0, C.sizeof_struct_vif_metadata)
 }
 
 func (m *Metadata) String() string {
-	return fmt.Sprintf("VRF=%d TunnelID=%d InVIF=%d OutVIF=%d Self=%v",
-		m.Vrf(), m.TunnelId(), m.InVIF(), m.OutVIF(), m.Self())
+	return fmt.Sprintf("InVIF=%d OutVIF=%d Self=%v", m.InVIF(), m.OutVIF(), m.Self())
 }

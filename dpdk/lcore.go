@@ -17,14 +17,19 @@
 package dpdk
 
 /*
-#include <stdlib.h>
 #include <rte_config.h>
 #include <rte_lcore.h>
 */
 import "C"
 
+const MaxLcore = uint(C.RTE_MAX_LCORE)
+
 func LcoreId() uint {
 	return uint(C.rte_lcore_id())
+}
+
+func LcoreIsEnabled(lcore_id uint) bool {
+	return C.rte_lcore_is_enabled(C.unsigned(lcore_id)) != 0
 }
 
 func GetMasterLcore() uint {

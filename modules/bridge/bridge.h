@@ -23,23 +23,47 @@
 #include <rte_hash.h>
 
 #include "packet.h"
+#include "runtime.h"
 
-struct bridge_launch_param {
-	char *name;			// Name of this bridge backend
-	void *request;			// Control requests - from Go to C (bridge_request)
-	void *used;			// Incoming MAC - from C to Go (bridge_learn)
-	void *free;			// Returned buffer - from Go to C (bridge_learn)
-	struct rte_hash *bridge_hash;	// Bridge domain Hash to use
+#define MAX_BRIDGE_DOMAINS 1024
+#define MAX_BRIDGE_MBUFS 1024
+#define MAX_BRIDGE_VIFS 32
+#define MAX_BRIDGE_RIFS 32
+
+//
+// Bridge Instances (== Bridge Domain)
+//
+struct bridge_mac_entry {
+	struct ether_addr mac;		// Destination MAC
+	struct rte_ring	  *ring;	// Output ring for the MAC
 };
 
-typedef enum {
-	BRIDGE_CMD_DOMAIN_ADD,		// Add bridge domain
-	BRIDGE_CMD_DOMAIN_DELETE,	// Delete brdige domain
-	BRIDGE_CMD_DOMAIN_ENABLE,	// Enable the domain (Processing starts)
-	BRIDGE_CMD_DOMAIN_DISABLE,	// Disable the domain (Processing stops)
-	BRIDGE_CMD_DOMAIN_CONFIG,	// Update Domain Config
+struct bridge_vif {
+	vifindex_t 	index;		// VIF Index
+	struct rte_ring	*ring;		// Output ring for the VIF
+};
 
-	BRIDGE_CMD_CONFIG_RING,		// Configure input/output rings
+struct bridge_instance {
+	struct lagopus_instance base;
+	uint32_t		domain_id;
+
+	// Filled by backend
+	int			mtu;
+	struct bridge_mac_entry rifs[MAX_BRIDGE_RIFS];
+	int 			rif_count;
+	struct bridge_vif	vifs[MAX_BRIDGE_VIFS];
+	int 			vif_count;
+	struct rte_hash		*mac_hash;	// MAC Hash returns DPDK Ring
+	int			max_mac_entries;
+	struct rte_ring		*mat;
+};
+
+//
+// Bridge Control
+//
+typedef enum {
+	BRIDGE_CMD_RIF_ADD,		// Add RIF to the bridge domain
+	BRIDGE_CMD_RIF_DELETE,		// Delete RIF from the bridge domain
 
 	BRIDGE_CMD_VIF_ADD,		// Add VIF to the bridge domain
 	BRIDGE_CMD_VIF_DELETE,		// Delete VIF from the bridge domain
@@ -47,52 +71,28 @@ typedef enum {
 	BRIDGE_CMD_MAC_ADD,		// Add MAC entry to the bridge domain
 	BRIDGE_CMD_MAC_DELETE,		// Delete MAC entry from the bridge domain
 
-	BRIDGE_CMD_QUIT,
+	BRIDGE_CMD_SET_MAX_ENTRIES,	// Set Max MAC Entries
+
+	BRIDGE_CMD_SET_MAT,		// Set ring for MAT
 
 	BRIDGE_CMD_END
 } bridge_cmd_t;
 
-struct bridge_ring {
-	struct rte_ring *input;		// default input
-	struct rte_ring *vif_input;	// input from VIF
-	struct rte_ring *output;	// default output
-	struct rte_ring *tap;		// output for TAP
-};
-
-struct bridge_domain {
-	char		   *name;	// Name of the bridge domain (limit: <= 24 chars)
-	struct bridge_ring r;
-
-	bool		   active;	// True if activated
-	struct rte_hash    *vif_hash;	// VIF Hash returns DPDK Ring
-	struct rte_hash    *mac_hash;	// MAC Hash returns DPDK Ring
-};
-
-struct bridge_config {
-	uint32_t	max_mac_entry;	// Max MAC entries
-};
-
-struct bridge_vif {
-	vifindex_t 	index;		// VIF Index
-	hash_sig_t	hsig;		// TODO: Calculate Hash in Go
-	struct rte_ring	*ring;		// Output ring for the VIF
-};
-
-struct bridge_mac_entry {
-	struct ether_addr mac;		// Destination MAC (must be freed by the receiver)
-	hash_sig_t	  hsig;		// TODO: Calculate Hash in Go
-	struct rte_ring	  *ring;	// Output ring for the MAC
-};
-
-struct bridge_request {
+struct bridge_control_param {
 	bridge_cmd_t		cmd;
-	uint32_t		domain_id;
-	hash_sig_t		domain_hsig;
-	struct bridge_domain	*domain;
-	struct bridge_config	config;
-	struct bridge_ring	ring;
-	struct bridge_vif	vif;
-	struct bridge_mac_entry mac;
+	struct ether_addr 	mac;			// Destination MAC
+	vifindex_t 		index;			// VIF Index
+	struct rte_ring	  	*ring;			// Output ring for the MAC or MAT
+	int			mtu;			// New MTU
+	int			max_mac_entries;	// Max MAC Entries
+};
+
+//
+// Bridge Runtime
+//
+struct bridge_runtime_param {
+	struct rte_ring *learn;	// Incoming MAC - from C to Go (struct bridge_learn)
+	struct rte_ring *free;	// Returned buffer - from Go to C (struct bridge_learn)
 };
 
 struct bridge_learn {
@@ -101,17 +101,6 @@ struct bridge_learn {
 	struct ether_addr mac;		// Observed MAC
 };
 
-#define MAX_BRIDGE_DOMAINS 1024
-#define MAX_BRIDGE_MBUFS 1024
-#define MAX_BRIDGE_REQUESTS 256
-#define MAX_BRIDGE_VIFS 32
-
-// Directions of rings
-#define	INBOUND 0
-#define	OUTBOUND 1
-
-extern uint32_t bridge_domain_hash_func(const void *key, uint32_t length, uint32_t initval);
-extern uint32_t mac_entry_hash_func(const void *key, uint32_t length, uint32_t initval);
-extern int bridge_task(void *arg);
+extern struct lagopus_runtime_ops bridge_runtime_ops;
 
 #endif /* _LAGOPUS_MODULES_BRIDGE_H */

@@ -16,125 +16,103 @@
 
 package vswitch
 
-/*
-#include "rule.h"
-#include <string.h>
-#include <stdio.h>
-
-static void dump(struct vsw_rule **r, int n) {
-	for (int i = 0; i < n; i++) {
-		if (r[i]->param != NULL) {
-			printf("%2d: match=%d, param=%lu, ring=%p\n", i, r[i]->match, r[i]->param[0], r[i]->ring);
-		} else {
-			printf("%2d: match=%d, ring=%p\n", i, r[i]->match, r[i]->ring);
-		}
-	}
-}
-*/
-import "C"
-
 import (
+	"errors"
+	"fmt"
+	"net"
+	"reflect"
+	"sync"
+
 	"github.com/lagopus/vsw/dpdk"
-	"github.com/lagopus/vsw/utils/carray"
-	"unsafe"
+	"github.com/lagopus/vsw/utils/notifier"
 )
 
-// R is a bridge to struct vsw_rule for C.
-type R C.struct_vsw_rule
-
 // VswMatch is a matching rule.
-type VswMatch C.vsw_match_t
+type VswMatch int
 
 const (
-	MATCH_ANY           VswMatch = C.VSW_MATCH_ANY           // Default destination
-	MATCH_IN_VIF                 = C.VSW_MATCH_IN_VIF        // Incoming VIF matched
-	MATCH_OUT_VIF                = C.VSW_MATCH_OUT_VIF       // Outgoing VIF matched
-	MATCH_BRIDGE_ID              = C.VSW_MATCH_BRIDGE_ID     // Bridge ID matched
-	MATCH_ETH_DST                = C.VSW_MATCH_ETH_DST       // Destination MAC address matched
-	MATCH_ETH_DST_SELF           = C.VSW_MATCH_ETH_DST_SELF  // Packet heading to the router itself
-	MATCH_ETH_DST_MC             = C.VSW_MATCH_ETH_DST_MC    // Multicast
-	MATCH_ETH_SRC                = C.VSW_MATCH_ETH_SRC       // Source MAC address matched
-	MATCH_ETH_TYPE_IPV4          = C.VSW_MATCH_ETH_TYPE_IPV4 // IPv4 packet type
-	MATCH_ETH_TYPE_IPV6          = C.VSW_MATCH_ETH_TYPE_IPV6 // IPv6 packet type
-	MATCH_ETH_TYPE_ARP           = C.VSW_MATCH_ETH_TYPE_ARP  // ARP packet type
-	MATCH_ETH_TYPE               = C.VSW_MATCH_ETH_TYPE      // Ether packet type matched
-	MATCH_VLAN_ID                = C.VSW_MATCH_VLAN_ID       // VLAN ID matched
-	MATCH_IPV4_PROTO             = C.VSW_MATCH_IPV4_PROTO    // IPv4 protocol type matched
-	MATCH_IPV4_SRC               = C.VSW_MATCH_IPV4_SRC      // Source IPv4 address matched
-	MATCH_IPV4_SRC_NET           = C.VSW_MATCH_IPV4_SRC_NET  // Source IPv4 network address matched
-	MATCH_IPV4_DST               = C.VSW_MATCH_IPV4_DST      // Destination IPv4 address matched
-	MATCH_IPV4_DST_NET           = C.VSW_MATCH_IPV4_DST_NET  // Destination IPv4 network address matched
-	MATCH_IPV4_DST_SELF          = C.VSW_MATCH_IPV4_DST_SELF // IPv4 packet sent to the router itself
-	MATCH_TP_SRC                 = C.VSW_MATCH_TP_SRC
-	MATCH_TP_DST                 = C.VSW_MATCH_TP_DST
+	MATCH_NONE          VswMatch = iota // No rule
+	MATCH_ANY                           // Default destination (arg: none)
+	MATCH_IN_VIF                        // Incoming VIF matched (arg: *VIF)
+	MATCH_OUT_VIF                       // Outgoing VIF matched (arg: *VIF)
+	MATCH_ETH_DST                       // Destination MAC address matched (arg: net.HardwareAddr)
+	MATCH_ETH_DST_SELF                  // Packet heading to the router itself (arg: none)
+	MATCH_ETH_DST_MC                    // Multicast (arg: none)
+	MATCH_ETH_DST_BC                    // Broadcast (arg: none)
+	MATCH_ETH_SRC                       // Source MAC address matched (arg: net.HardwareAddr)
+	MATCH_ETH_TYPE_IPV4                 // IPv4 packet type (arg: none)
+	MATCH_ETH_TYPE_IPV6                 // IPv6 packet type (arg: none)
+	MATCH_ETH_TYPE_ARP                  // ARP packet type (arg: none)
+	MATCH_ETH_TYPE                      // Ether packet type matched (arg: dpdk.EtherType)
+	MATCH_VLAN_ID                       // VLAN ID matched (arg: VID)
+	MATCH_IPV4_PROTO                    // IPv4 protocol type matched (arg: IPProto)
+	MATCH_IPV4_SRC                      // Source IPv4 address matched (arg: net.IP)
+	MATCH_IPV4_SRC_NET                  // Source IPv4 network address matched (arg: IPAddr)
+	MATCH_IPV4_DST                      // Destination IPv4 address matched (arg: net.IP)
+	MATCH_IPV4_DST_NET                  // Destination IPv4 network address matched (arg: IPAddr)
+	MATCH_IPV4_DST_SELF                 // IPv4 packet sent to the router itself (none)
 )
 
 var vswMatchStrings = map[VswMatch]string{
-	MATCH_ANY:           "Default destination",
-	MATCH_IN_VIF:        "Incoming VIF matched",
-	MATCH_OUT_VIF:       "Outgoing VIF matched",
-	MATCH_BRIDGE_ID:     "Bridge ID matched",
-	MATCH_ETH_DST:       "Destination MAC address matched",
-	MATCH_ETH_DST_SELF:  "Destination MAC is self",
-	MATCH_ETH_DST_MC:    "Destinatino MAC is Multicast",
-	MATCH_ETH_SRC:       "Source MAC address matched",
-	MATCH_ETH_TYPE_IPV4: "IPv4 packet type",
-	MATCH_ETH_TYPE_IPV6: "IPv6 packet type",
-	MATCH_ETH_TYPE_ARP:  "ARP packet type",
-	MATCH_ETH_TYPE:      "Ether packet type matched",
-	MATCH_VLAN_ID:       "VLAN ID matched",
-	MATCH_IPV4_PROTO:    "IPv4 protocol type matched",
-	MATCH_IPV4_SRC:      "Source IPv4 address matched",
-	MATCH_IPV4_SRC_NET:  "Source IPv4 network address matched",
-	MATCH_IPV4_DST:      "Destination IPv4 address matched",
-	MATCH_IPV4_DST_NET:  "Destination IPv4 network address matched",
-	MATCH_IPV4_DST_SELF: "IPv4 packet sent to the router itself",
-	MATCH_TP_SRC:        "TP Source",
-	MATCH_TP_DST:        "TP Destination",
+	MATCH_ANY:           "MATCH_ANY",
+	MATCH_IN_VIF:        "MATCH_IN_VIF",
+	MATCH_OUT_VIF:       "MATCH_OUT_VIF",
+	MATCH_ETH_DST:       "MATCH_ETH_DST",
+	MATCH_ETH_DST_SELF:  "MATCH_ETH_DST_SELF",
+	MATCH_ETH_DST_MC:    "MATCH_ETH_DST_MC",
+	MATCH_ETH_DST_BC:    "MATCH_ETH_DST_BC",
+	MATCH_ETH_SRC:       "MATCH_ETH_SRC",
+	MATCH_ETH_TYPE_IPV4: "MATCH_ETH_TYPE_IPV4",
+	MATCH_ETH_TYPE_IPV6: "MATCH_ETH_TYPE_IPV6",
+	MATCH_ETH_TYPE_ARP:  "MATCH_ETH_TYPE_ARP",
+	MATCH_ETH_TYPE:      "MATCH_ETH_TYPE",
+	MATCH_VLAN_ID:       "MATCH_VLAN_ID",
+	MATCH_IPV4_PROTO:    "MATCH_IPV4_PROTO",
+	MATCH_IPV4_SRC:      "MATCH_IPV4_SRC",
+	MATCH_IPV4_SRC_NET:  "MATCH_IPV4_SRC_NET",
+	MATCH_IPV4_DST:      "MATCH_IPV4_DST",
+	MATCH_IPV4_DST_NET:  "MATCH_IPV4_DST_NET",
+	MATCH_IPV4_DST_SELF: "MATCH_IPV4_DST_SELF",
 }
 
 func (vm VswMatch) String() string { return vswMatchStrings[vm] }
 
-var hasParam = map[VswMatch]bool{
-	MATCH_ANY:           false,
-	MATCH_IN_VIF:        true,
-	MATCH_OUT_VIF:       true,
-	MATCH_BRIDGE_ID:     true,
-	MATCH_ETH_DST:       true,
-	MATCH_ETH_DST_SELF:  false,
-	MATCH_ETH_DST_MC:    false,
-	MATCH_ETH_SRC:       true,
-	MATCH_ETH_TYPE_IPV4: false,
-	MATCH_ETH_TYPE_IPV6: false,
-	MATCH_ETH_TYPE_ARP:  false,
-	MATCH_ETH_TYPE:      true,
-	MATCH_VLAN_ID:       true,
-	MATCH_IPV4_PROTO:    true,
-	MATCH_IPV4_SRC:      true,
-	MATCH_IPV4_SRC_NET:  true,
-	MATCH_IPV4_DST:      true,
-	MATCH_IPV4_DST_NET:  true,
-	MATCH_IPV4_DST_SELF: false,
-	MATCH_TP_SRC:        true,
-	MATCH_TP_DST:        true,
+var paramTypes = map[VswMatch]reflect.Type{
+	MATCH_ANY:           nil,
+	MATCH_IN_VIF:        reflect.TypeOf((*VIF)(nil)),
+	MATCH_OUT_VIF:       reflect.TypeOf((*VIF)(nil)),
+	MATCH_ETH_DST:       reflect.TypeOf((*net.HardwareAddr)(nil)),
+	MATCH_ETH_DST_SELF:  nil,
+	MATCH_ETH_DST_MC:    nil,
+	MATCH_ETH_DST_BC:    nil,
+	MATCH_ETH_SRC:       reflect.TypeOf((*net.HardwareAddr)(nil)),
+	MATCH_ETH_TYPE_IPV4: nil,
+	MATCH_ETH_TYPE_IPV6: nil,
+	MATCH_ETH_TYPE_ARP:  nil,
+	MATCH_ETH_TYPE:      reflect.TypeOf(dpdk.EtherType(0)),
+	MATCH_VLAN_ID:       reflect.TypeOf(VID(0)),
+	MATCH_IPV4_PROTO:    reflect.TypeOf(IPProto(0)),
+	MATCH_IPV4_SRC:      reflect.TypeOf((*net.IP)(nil)),
+	MATCH_IPV4_SRC_NET:  reflect.TypeOf((*IPAddr)(nil)),
+	MATCH_IPV4_DST:      reflect.TypeOf((*net.IP)(nil)),
+	MATCH_IPV4_DST_NET:  reflect.TypeOf((*IPAddr)(nil)),
+	MATCH_IPV4_DST_SELF: nil,
 }
+
+const ruleNotificationBuffer = 10
 
 // Rule specifies the packet dispatch rule
 type Rule struct {
-	Match VswMatch   // Match rule
-	Param []uint64   // Parameters for the match rule
-	Ring  *dpdk.Ring // Input ring of the next module
+	Match VswMatch    // Match rule
+	Param interface{} // Parameters for the match rule
+	Ring  *dpdk.Ring  // Input ring of the next module
 }
 
 // Rules is a collection of Rule
 type Rules struct {
-	rules   map[VswMatch]([]Rule)
-	watcher Watcher
-}
-
-// Watcher is to monitor the changes of the rule on the fly
-type Watcher interface {
-	Updated(r *Rules) // Called when rule is updated.
+	rules map[VswMatch]([]Rule)
+	noti  *notifier.Notifier
+	once  sync.Once
 }
 
 // ByMatch implements sort.Interface for []Rule based on the Match field.
@@ -148,57 +126,89 @@ func newRules() *Rules {
 	return &Rules{rules: make(map[VswMatch]([]Rule))}
 }
 
-// Watch enables to monitor changes on rule.
-// Pass a pointer to the interface that implements Watcher interface.
-// Pass nil to disable.
-func (r *Rules) Watch(w interface{}) bool {
-	if w == nil {
-		r.watcher = nil
-		return true
-	}
-
-	if watcher, ok := w.(Watcher); ok {
-		r.watcher = watcher
-		return true
-	}
-
-	return false
+// Notifier returns notifier for the rule set.
+//
+// The following notifications will be sent out:
+//
+// 1. Rule is added:
+//	Type: Notifier.Add
+//	Target: *Rules
+//	Value: Rule
+//
+// 2. Rule is deleted:
+//	Type: Notifier.Delete
+//	Target: *Rules
+//	Value: Rule
+//
+func (r *Rules) Notifier() *notifier.Notifier {
+	r.once.Do(func() {
+		r.noti = notifier.NewNotifier(ruleNotificationBuffer)
+	})
+	return r.noti
 }
 
-func (r *Rules) notify() {
-	if r.watcher != nil {
-		r.watcher.Updated(r)
+func (r *Rules) notify(op notifier.Type, rule Rule) {
+	if r.noti != nil {
+		r.noti.Notify(op, r, rule)
 	}
 }
 
-func (r *Rules) add(match VswMatch, param []uint64, ring *dpdk.Ring) {
-	e := Rule{
-		Match: match,
-		Param: param,
-		Ring:  ring,
+func (r *Rules) add(match VswMatch, param interface{}, ring *dpdk.Ring) error {
+	var rule Rule
+
+	if ring == nil {
+		return errors.New("Input ring not set")
 	}
 
-	if !hasParam[match] {
-		if r.rules[match] == nil {
-			r.rules[match] = make([]Rule, 1, 1)
+	t := paramTypes[match]
+	if t != nil {
+		if t != reflect.TypeOf(param) {
+			return fmt.Errorf("Type %v is expected for %v", t, match)
 		}
-		e.Param = nil
-		r.rules[match][0] = e
-	} else {
-		r.rules[match] = append(r.rules[match], e)
+		rule.Param = param
 	}
 
-	r.notify()
+	rule.Match = match
+	rule.Ring = ring
+
+	if t == nil {
+		r.rules[match] = make([]Rule, 1, 1)
+		r.rules[match][0] = rule
+	} else {
+		r.rules[match] = append(r.rules[match], rule)
+	}
+
+	r.notify(notifier.Add, rule)
+
+	return nil
 }
 
-func (r *Rules) remove(match VswMatch) {
-	r.rules[match] = nil
-	r.notify()
+func (r *Rules) remove(match VswMatch, param interface{}) error {
+	rules := r.rules[match]
+
+	for i, rule := range rules {
+		if rule.Param == param {
+			l := len(rules) - 1
+			rules[i] = rules[l]
+			rules[l] = Rule{}
+
+			r.rules[match] = rules[:l]
+			r.notify(notifier.Delete, rule)
+
+			return nil
+		}
+	}
+
+	return fmt.Errorf("No match to %v (param=%v)", match, param)
 }
 
 func (r *Rules) removeAll() {
+	for _, rules := range r.rules {
+		for _, rule := range rules {
+			r.notify(notifier.Delete, rule)
+		}
+	}
 	r.rules = make(map[VswMatch]([]Rule))
-	r.notify()
 }
 
 func (r *Rules) rulesCount() int {
@@ -238,38 +248,4 @@ func (r *Rules) Output(match VswMatch) *dpdk.Ring {
 		return nil
 	}
 	return r.rules[match][0].Ring
-}
-
-// CArray creates an array of pointrs to struct vsw_rule, copies
-// entire rule, and returns a pointer to array and a number of elements.
-// Returned array and structs shall be freed by caller.
-// Params in the structs are also pointers to an array of uint64_t.
-func (r *Rules) CArray() (**C.struct_vsw_rule, int) {
-	count := r.rulesCount()
-	rules := make([]*C.struct_vsw_rule, count)
-	n := 0
-	for _, entries := range r.rules {
-		for _, e := range entries {
-			rules[n] = (*C.struct_vsw_rule)(C.malloc(C.sizeof_struct_vsw_rule))
-			rules[n].match = C.vsw_match_t(e.Match)
-			rules[n].ring = (*C.struct_rte_ring)(unsafe.Pointer(e.Ring))
-
-			length := C.sizeof_uint64_t * len(e.Param)
-			if length > 0 {
-				rules[n].param = (*C.uint64_t)(carray.Dup(unsafe.Pointer(&e.Param[0]), length))
-			} else {
-				rules[n].param = nil
-			}
-
-			n++
-		}
-	}
-
-	carray := carray.DupPointers(unsafe.Pointer(&rules[0]), count)
-
-	if false {
-		C.dump((**C.struct_vsw_rule)(carray), C.int(count))
-	}
-
-	return (**C.struct_vsw_rule)(carray), count
 }

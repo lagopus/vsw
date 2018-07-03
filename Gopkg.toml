@@ -1,0 +1,36 @@
+
+[[constraint]]
+  name = "github.com/lagopus/toml"
+  revision = "aada73342eb6c45740b2b24e6d3bc8d0f762f16c"
+
+[[constraint]]
+  name = "github.com/coreswitch/openconfigd"
+  version = "0.8.0"
+
+[[constraint]]
+  name = "github.com/davecgh/go-spew"
+  version = "1.1.0"
+
+[[constraint]]
+  branch = "master"
+  name = "github.com/golang/protobuf"
+
+[[constraint]]
+  name = "github.com/stretchr/testify"
+  version = "1.2.0"
+
+[[constraint]]
+  branch = "master"
+  name = "github.com/vishvananda/netlink"
+
+[[constraint]]
+  branch = "master"
+  name = "github.com/vishvananda/netns"
+
+[[constraint]]
+  branch = "master"
+  name = "golang.org/x/net"
+
+[[constraint]]
+  name = "google.golang.org/grpc"
+  version = "1.9.1"

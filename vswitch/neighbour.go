@@ -19,9 +19,10 @@ package vswitch
 import (
 	"bytes"
 	"fmt"
-	"github.com/lagopus/vsw/utils/notifier"
 	"net"
 	"sync"
+
+	"github.com/lagopus/vsw/utils/notifier"
 )
 
 type NudState int

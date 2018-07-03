@@ -17,11 +17,12 @@
 package vswitch
 
 import (
-	"github.com/lagopus/vsw/utils/notifier"
 	"net"
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/lagopus/vsw/utils/notifier"
 )
 
 type testClass struct {
@@ -50,11 +51,36 @@ func listener(t *testing.T, ch chan notifier.Notification) {
 	}
 }
 
+type testIP struct {
+	expect bool
+	addr   IPAddr
+}
+
+func TestIPAddr(t *testing.T) {
+	ip := IPAddr{net.IPv4(192, 168, 1, 1), net.CIDRMask(24, 32)}
+	target := []testIP{
+		{true, IPAddr{net.IPv4(192, 168, 1, 1), net.CIDRMask(24, 32)}},
+		{false, IPAddr{net.IPv4(192, 168, 1, 1), net.CIDRMask(32, 32)}},
+		{false, IPAddr{net.IPv4(192, 168, 1, 2), net.CIDRMask(32, 32)}},
+		{false, IPAddr{net.IPv4(192, 168, 1, 2), net.CIDRMask(30, 32)}},
+	}
+
+	for _, test := range target {
+		if ip.Equal(test.addr) == test.expect {
+			t.Logf("%v == %v: %v: ok\n", ip, test.addr, test.expect)
+		} else {
+			t.Errorf("Should return %v for %v == %v\n", test.expect, ip, test.addr)
+		}
+	}
+}
+
 func TestIPAddrs(t *testing.T) {
 	c := &testClass{name: "test"}
 	c.IPAddrs = newIPAddrs(c)
 
 	ch := GetNotifier().Listen()
+	defer GetNotifier().Close(ch)
+
 	//	go listener(t, ch)
 
 	ipa := IPAddr{net.IPv4(192, 168, 1, 1), net.CIDRMask(24, 32)}
@@ -105,5 +131,4 @@ func TestIPAddrs(t *testing.T) {
 	} else {
 		t.Log("Notificaiton ok.")
 	}
-
 }

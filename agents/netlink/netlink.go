@@ -25,7 +25,6 @@ import (
 	"io/ioutil"
 	"net"
 	"os"
-	"sync"
 	"syscall"
 	"unsafe"
 )
@@ -46,16 +45,14 @@ var stateToNudState = map[int]vswitch.NudState{
 }
 
 type NetlinkAgent struct {
-	vswch      chan notifier.Notification
-	ruch       chan netlink.RouteUpdate
-	ndch       chan NeighUpdate
-	nldone     chan struct{}
-	vrfs       map[string]*netlink.Vrf
-	taps       map[string]*netlink.Tuntap
-	links      map[int]*vswitch.VifInfo
-	tables     map[int]*vswitch.VrfInfo
-	files      map[vswitch.VifIndex]*os.File
-	filesMutex sync.RWMutex
+	vswch  chan notifier.Notification
+	ruch   chan netlink.RouteUpdate
+	ndch   chan NeighUpdate
+	nldone chan struct{}
+	vrfs   map[string]*netlink.Vrf
+	taps   map[string]*netlink.Tuntap
+	links  map[int]*vswitch.VIF
+	tables map[int]*vswitch.VRF
 }
 
 const rulePref = 1000
@@ -69,7 +66,7 @@ func enableIpForwarding(link string) error {
 	return err
 }
 
-func (n *NetlinkAgent) addVRF(vrf *vswitch.VrfInfo) {
+func (n *NetlinkAgent) addVRF(vrf *vswitch.VRF) {
 	log.Printf("Netlink Agent: Adding VRF for %v", vrf.Name())
 
 	var tableID int
@@ -142,8 +139,8 @@ func (n *NetlinkAgent) deleteRule(vrfName string) {
 	}
 }
 
-func (n *NetlinkAgent) deleteVRF(vrf *vswitch.VrfInfo) {
-	if link, ok := n.vrfs[vrf.String()]; ok {
+func (n *NetlinkAgent) deleteVRF(vrf *vswitch.VRF) {
+	if link, ok := n.vrfs[vrf.Name()]; ok {
 		netlink.LinkDel(link)
 		n.deleteRule(link.LinkAttrs.Name)
 	}
@@ -156,7 +153,7 @@ func (n *NetlinkAgent) deleteAllVRF() {
 	}
 }
 
-func (n *NetlinkAgent) handleVRFNoti(t notifier.Type, vrf *vswitch.VrfInfo) {
+func (n *NetlinkAgent) handleVRFNoti(t notifier.Type, vrf *vswitch.VRF) {
 	switch t {
 	case notifier.Add:
 		n.addVRF(vrf)
@@ -179,13 +176,13 @@ type ifReq struct {
 	pad   [sizeOfIfReq - IFNAMSIZ - 2]byte
 }
 
-func (n *NetlinkAgent) addTap(vrf *vswitch.VrfInfo, vif *vswitch.VifInfo) {
+func (n *NetlinkAgent) addTap(vrf *vswitch.VRF, vif *vswitch.VIF) {
 	log.Printf("Netlink Agent: Adding Tap for %v", vif)
 
 	// Create a Tap
 	nt := &netlink.Tuntap{
 		LinkAttrs: netlink.LinkAttrs{
-			Name:   vif.String(),
+			Name:   vif.Name(),
 			TxQLen: 1000,
 		},
 		Mode:  netlink.TUNTAP_MODE_TAP,
@@ -195,6 +192,11 @@ func (n *NetlinkAgent) addTap(vrf *vswitch.VrfInfo, vif *vswitch.VifInfo) {
 	if err := netlink.LinkAdd(nt); err != nil {
 		log.Fatalf("Netlink Agent: Adding TAP %v failed: %v", vif, err)
 		return
+	}
+
+	// Config MAC Address
+	if err := netlink.LinkSetHardwareAddr(nt, vif.MACAddress()); err != nil {
+		log.Fatalf("Netlink Agent: Setting TAP %v's MAC to %s failed: %v", vif, vif.MACAddress(), err)
 	}
 
 	// Set Master
@@ -213,7 +215,7 @@ func (n *NetlinkAgent) addTap(vrf *vswitch.VrfInfo, vif *vswitch.VifInfo) {
 	}
 
 	// Enable forwarding
-	if err := enableIpForwarding(vif.String()); err != nil {
+	if err := enableIpForwarding(vif.Name()); err != nil {
 		netlink.LinkDel(nt)
 		return
 	}
@@ -232,7 +234,7 @@ func (n *NetlinkAgent) addTap(vrf *vswitch.VrfInfo, vif *vswitch.VifInfo) {
 
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, file.Fd(), uintptr(syscall.TUNSETIFF), uintptr(unsafe.Pointer(&req)))
 	if errno != 0 {
-		log.Printf("Netlink Agent: Getting TAP %v failed: %v", vif.String(), errno)
+		log.Printf("Netlink Agent: Getting TAP %v failed: %v", vif.Name(), errno)
 		file.Close()
 		//	netlink.LinkDel(nt)
 		return
@@ -241,24 +243,29 @@ func (n *NetlinkAgent) addTap(vrf *vswitch.VrfInfo, vif *vswitch.VifInfo) {
 	n.links[nt.Index] = vif
 	n.taps[nt.LinkAttrs.Name] = nt
 
-	n.filesMutex.Lock()
-	n.files[vif.VifIndex()] = file
-	n.filesMutex.Unlock()
+	n.configTapMTU(vif, vif.MTU())
+	n.configTapLinkStatus(vif, vif.IsEnabled())
+
+	for _, ipaddr := range vif.ListIPAddrs() {
+		n.handleIPAddr(notifier.Add, vif, ipaddr)
+	}
+
+	if err := vif.SetTAP(file); err != nil {
+		log.Printf("Netlink Agent: Setting TAP to VIF failed: %v", err)
+	}
 }
 
-func (n *NetlinkAgent) deleteTap(vif *vswitch.VifInfo) {
+func (n *NetlinkAgent) deleteTap(vif *vswitch.VIF) {
 	log.Printf("Netlink Agent: Deleting %v", vif)
 
-	if tap, ok := n.taps[vif.String()]; ok {
+	if tap, ok := n.taps[vif.Name()]; ok {
+		vif.TAP().Close()
 		netlink.LinkDel(tap)
-		delete(n.taps, vif.String())
+		delete(n.taps, vif.Name())
 		delete(n.links, tap.Index)
 	}
 
-	if file, ok := n.files[vif.VifIndex()]; ok {
-		file.Close()
-		delete(n.files, vif.VifIndex())
-	}
+	vif.SetTAP(nil)
 }
 
 func (n *NetlinkAgent) deleteAllTap() {
@@ -267,45 +274,41 @@ func (n *NetlinkAgent) deleteAllTap() {
 	}
 }
 
-func (n *NetlinkAgent) configTapHardwareAddr(vif *vswitch.VifInfo, ha net.HardwareAddr) {
-	if tap, ok := n.taps[vif.String()]; ok {
-		log.Printf("Netlink Agent: Configure MAC for %v to %v", vif, ha)
-		// Set Hardware Addr
-		if err := netlink.LinkSetHardwareAddr(tap, ha); err != nil {
-			log.Fatalf("Netlink Agent: Setting TAP %v's MAC to %s failed: %v", vif, ha, err)
-		}
-	}
-}
-
-func (n *NetlinkAgent) configTapMTU(vif *vswitch.VifInfo, mtu vswitch.MTU) {
-	if tap, ok := n.taps[vif.String()]; ok {
+func (n *NetlinkAgent) configTapMTU(vif *vswitch.VIF, mtu vswitch.MTU) {
+	if tap, ok := n.taps[vif.Name()]; ok {
+		// MTU in the VSW is L2 MTU. We must subtract ether header size.
+		mtu -= 14
 		log.Printf("Netlink Agent: Configure MTU for %v to %d", vif, mtu)
-		// Set Hardware Addr
 		if err := netlink.LinkSetMTU(tap, int(mtu)); err != nil {
 			log.Fatalf("Netlink Agent: Setting TAP %v's MTU to %d failed: %v", vif, mtu, err)
 		}
 	}
 }
 
-func (n *NetlinkAgent) configTapLinkStatus(vif *vswitch.VifInfo, stat vswitch.LinkStatus) {
-	if tap, ok := n.taps[vif.String()]; ok {
-		log.Printf("Netlink Agent: Change link state of %v to %v", vif, stat)
-		switch stat {
-		case vswitch.LinkUp:
+func (n *NetlinkAgent) configTapLinkStatus(vif *vswitch.VIF, enabled bool) {
+	if tap, ok := n.taps[vif.Name()]; ok {
+		log.Printf("Netlink Agent: Change link state of %v to %v", vif, enabled)
+		if enabled {
 			if err := netlink.LinkSetUp(tap); err != nil {
 				log.Fatalf("Netlink Agent: Bringing up Tap %s failed: %v", vif, err)
 			}
-		case vswitch.LinkDown:
+		} else {
 			if err := netlink.LinkSetDown(tap); err != nil {
 				log.Fatalf("Netlink Agent: Bringing down Tap %s failed: %v", vif, err)
 			}
 		}
-	} else {
-		log.Fatalf("Netlink Agent: Can't change link state of TAP %v", vif)
 	}
 }
 
-func (n *NetlinkAgent) handleVIFNoti(t notifier.Type, vrf *vswitch.VrfInfo, vif *vswitch.VifInfo) {
+func (n *NetlinkAgent) configTapMAC(vif *vswitch.VIF, mac net.HardwareAddr) {
+	if tap, ok := n.taps[vif.Name()]; ok {
+		if err := netlink.LinkSetHardwareAddr(tap, vif.MACAddress()); err != nil {
+			log.Fatalf("Netlink Agent: Setting TAP %v's MAC to %s failed: %v", vif, vif.MACAddress(), err)
+		}
+	}
+}
+
+func (n *NetlinkAgent) handleVIFNoti(t notifier.Type, vrf *vswitch.VRF, vif *vswitch.VIF) {
 	switch t {
 	case notifier.Add:
 		n.addTap(vrf, vif)
@@ -316,8 +319,8 @@ func (n *NetlinkAgent) handleVIFNoti(t notifier.Type, vrf *vswitch.VrfInfo, vif 
 	}
 }
 
-func (n *NetlinkAgent) handleIPAddr(t notifier.Type, vif *vswitch.VifInfo, ip vswitch.IPAddr) {
-	if tap, ok := n.taps[vif.String()]; ok {
+func (n *NetlinkAgent) handleIPAddr(t notifier.Type, vif *vswitch.VIF, ip vswitch.IPAddr) {
+	if tap, ok := n.taps[vif.Name()]; ok {
 		addr := &netlink.Addr{IPNet: &net.IPNet{ip.IP, ip.Mask}}
 
 		log.Printf("Netlink Agent: %s IP Address %s to TAP %s", t, ip, vif)
@@ -332,8 +335,6 @@ func (n *NetlinkAgent) handleIPAddr(t notifier.Type, vif *vswitch.VifInfo, ip vs
 				log.Fatalf("Netlink Agent: Deleting IP Address %s to TAP %s failed: %v", ip, vif, err)
 			}
 		}
-	} else {
-		log.Fatalf("Netlink Agent: Can't set IP Address of TAP %v", vif)
 	}
 }
 
@@ -353,7 +354,7 @@ func (n *NetlinkAgent) handleRouteUpdate(ru netlink.RouteUpdate) {
 		Src:      ru.Src,
 		Gw:       ru.Gw,
 		Metrics:  ru.Priority,
-		VifIndex: vif.VifIndex(),
+		VIFIndex: vif.Index(),
 		Scope:    vswitch.RouteScope(ru.Scope),
 	}
 	if ru.Type == syscall.RTM_NEWROUTE {
@@ -404,15 +405,10 @@ func (n *NetlinkAgent) listen() {
 			}
 			log.Printf("Netlink Agent: VSW: %v\n", noti)
 
-			if vif, ok := noti.Target.(*vswitch.VifInfo); ok {
+			if vif, ok := noti.Target.(*vswitch.VIF); ok {
 				switch value := noti.Value.(type) {
 				case nil:
 					n.handleVIFNoti(noti.Type, nil, vif)
-
-				case net.HardwareAddr:
-					if noti.Type == notifier.Update {
-						n.configTapHardwareAddr(vif, value)
-					}
 
 				case vswitch.MTU:
 					if noti.Type == notifier.Update {
@@ -422,7 +418,7 @@ func (n *NetlinkAgent) listen() {
 				case vswitch.IPAddr:
 					n.handleIPAddr(noti.Type, vif, value)
 
-				case vswitch.LinkStatus:
+				case bool:
 					if noti.Type == notifier.Update {
 						n.configTapLinkStatus(vif, value)
 					}
@@ -430,16 +426,21 @@ func (n *NetlinkAgent) listen() {
 				case vswitch.Neighbour:
 					// Don't care. Came from me.
 
+				case net.HardwareAddr:
+					if noti.Type == notifier.Update {
+						n.configTapMAC(vif, value)
+					}
+
 				default:
 					log.Printf("Netlink Agent: Unexpectd value: %v\n", vif)
 				}
 
-			} else if vrf, ok := noti.Target.(*vswitch.VrfInfo); ok {
+			} else if vrf, ok := noti.Target.(*vswitch.VRF); ok {
 				switch vif := noti.Value.(type) {
 				case nil:
 					n.handleVRFNoti(noti.Type, vrf)
 
-				case *vswitch.VifInfo:
+				case *vswitch.VIF:
 					n.handleVIFNoti(noti.Type, vrf, vif)
 
 				case vswitch.Route:
@@ -469,35 +470,26 @@ func (n *NetlinkAgent) listen() {
 	}
 }
 
-func GetTapFile(vifidx vswitch.VifIndex) (*os.File, bool) {
-	netlinkInstance.filesMutex.RLock()
-	defer netlinkInstance.filesMutex.RUnlock()
-	file, ok := netlinkInstance.files[vifidx]
-	return file, ok
-}
-
-func (n *NetlinkAgent) Start() bool {
+func (n *NetlinkAgent) Enable() error {
 	// Listen to changes on VIF/VRF
 	n.vswch = vswitch.GetNotifier().Listen()
 
 	if err := netlink.RouteSubscribe(n.ruch, n.nldone); err != nil {
-		log.Printf("Netlink Agent: Can't receive route update: %v", err)
-		return false
+		return fmt.Errorf("Netlink Agent: Can't receive route update: %v", err)
 	}
 
 	if err := NeighSubscribe(n.ndch, n.nldone); err != nil {
-		log.Printf("Netlink Agent: Can't receive neighbour update: %v", err)
-		return false
+		return fmt.Errorf("Netlink Agent: Can't receive neighbour update: %v", err)
 	}
 
 	go func() {
 		n.listen()
 	}()
 
-	return true
+	return nil
 }
 
-func (n *NetlinkAgent) Stop() {
+func (n *NetlinkAgent) Disable() {
 	n.deleteAllVRF()
 	n.deleteAllTap()
 	vswitch.GetNotifier().Close(n.vswch)
@@ -515,9 +507,8 @@ func init() {
 		nldone: make(chan struct{}),
 		vrfs:   make(map[string]*netlink.Vrf),
 		taps:   make(map[string]*netlink.Tuntap),
-		links:  make(map[int]*vswitch.VifInfo),
-		tables: make(map[int]*vswitch.VrfInfo),
-		files:  make(map[vswitch.VifIndex]*os.File),
+		links:  make(map[int]*vswitch.VIF),
+		tables: make(map[int]*vswitch.VRF),
 	}
 	vswitch.RegisterAgent(netlinkInstance)
 }

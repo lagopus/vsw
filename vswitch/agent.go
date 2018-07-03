@@ -20,11 +20,12 @@ import "fmt"
 
 // Agent defines the interafaces that an agent shall implement.
 type Agent interface {
-	// Start starts the agent.
-	Start() bool
+	// Enable the agent.
+	// Should return nil on succeess. Error otherwise.
+	Enable() error
 
-	// Stop the agent.
-	Stop()
+	// Disable the agent.
+	Disable()
 
 	fmt.Stringer
 }
@@ -32,18 +33,15 @@ type Agent interface {
 var agents = make(map[string]Agent)
 
 // RegisterAgent registers an agent.
-// Returns true on success, false on failure.
-func RegisterAgent(agent Agent) bool {
+// Returns nil on success, error on failure.
+func RegisterAgent(agent Agent) error {
 	name := agent.String()
-	_, exists := agents[name]
-	if exists {
-		Logger.Printf("Agent '%s' already exists.\n", name)
-		return false
+	if _, exists := agents[name]; exists {
+		return fmt.Errorf("Agent '%s' already exists.\n", name)
 	}
 
 	agents[name] = agent
-	Logger.Printf("Agent '%s' registered.\n", name)
-	return true
+	return nil
 }
 
 // GetAgent returns an instance of agent with the given name.
@@ -55,13 +53,13 @@ func GetAgent(name string) (Agent, error) {
 	return agent, nil
 }
 
-// StartNamedAgents starts agents listed in names.
+// EnableAgents enables agents listed in names.
 // Returns a slice of Agent successively started.
-func StartNamedAgents(names ...string) []Agent {
+func EnableAgents(names ...string) []Agent {
 	var startedAgents []Agent
 	for _, name := range names {
 		if agent, ok := agents[name]; ok {
-			if agent.Start() {
+			if agent.Enable() == nil {
 				startedAgents = append(startedAgents, agent)
 			}
 		}

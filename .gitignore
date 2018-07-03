@@ -63,3 +63,5 @@ vsw
 glide.yaml
 glide.lock
 vendor/
+
+coverage.out

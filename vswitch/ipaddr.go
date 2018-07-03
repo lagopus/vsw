@@ -18,11 +18,29 @@ package vswitch
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
-	"github.com/lagopus/vsw/utils/notifier"
 	"net"
 	"sync"
+
+	"github.com/lagopus/vsw/utils/notifier"
 )
+
+// AddressFamily represents address family of network address
+type AddressFamily int
+
+const (
+	AF_IPv4 AddressFamily = iota
+	AF_IPv6
+)
+
+func (af AddressFamily) String() string {
+	s := map[AddressFamily]string{
+		AF_IPv4: "IPv4",
+		AF_IPv6: "IPv6",
+	}
+	return s[af]
+}
 
 // IPAddrs manages IP Addresses of the device.
 type IPAddrs struct {
@@ -42,39 +60,48 @@ func (ip IPAddr) String() string {
 	return fmt.Sprintf("%v/%d", ip.IP, prefix)
 }
 
+// Equal reports whether ip and x are the same IP address with
+// the same network prefix length.
+func (ip IPAddr) Equal(x IPAddr) bool {
+	return ip.IP.Equal(x.IP) && bytes.Equal(ip.Mask, x.Mask)
+}
+
 func newIPAddrs(container interface{}) *IPAddrs {
 	return &IPAddrs{container: container}
 }
 
 // ListIPAddrs returns a slice IPAddr currently set.
 func (i *IPAddrs) ListIPAddrs() []IPAddr {
-	return i.ipaddrs
+	addrs := make([]IPAddr, len(i.ipaddrs))
+	copy(addrs, i.ipaddrs)
+	return addrs
 }
 
 // AddCIDR adds IP Address represented in CIDR format.
 // See AddIPAddr for more detail.
-func (i *IPAddrs) AddCIDR(cidr string) bool {
+func (i *IPAddrs) AddCIDR(cidr string) error {
 	if ip, mask, err := net.ParseCIDR(cidr); err == nil {
 		return i.AddIPAddr(IPAddr{ip, mask.Mask})
+	} else {
+		return err
 	}
-	return false
 }
 
 // AddIPAddr adds IP Address.
 // If IP Address is added, it sends Add notification.
 // If IP Address already existed, and prefix has changed,
 // it sends out Update notification.
-// Returns true for success, false otherwise.
-func (i *IPAddrs) AddIPAddr(ip IPAddr) bool {
+// Returns error if failed.
+func (i *IPAddrs) AddIPAddr(ip IPAddr) error {
 	i.mutex.Lock()
 	defer i.mutex.Unlock()
 
 	nt := notifier.Add
 	for n, ipaddr := range i.ipaddrs {
 		if ipaddr.IP.Equal(ip.IP) {
-			if bytes.Compare(ipaddr.Mask, ip.Mask) == 0 {
+			if bytes.Equal(ipaddr.Mask, ip.Mask) {
 				// Nothing to update
-				return true
+				return errors.New("Duplicated IP Address found")
 			}
 			i.ipaddrs[n].Mask = ip.Mask
 			nt = notifier.Update
@@ -87,13 +114,13 @@ func (i *IPAddrs) AddIPAddr(ip IPAddr) bool {
 
 Notify:
 	noti.Notify(nt, i.container, ip)
-	return true
+	return nil
 }
 
 // DeleteIPAddr deletes IP Address.
 // If IP Address is deleted, it sends out Delete notification.
-// Returns true for success, false otherwise.
-func (i *IPAddrs) DeleteIPAddr(ip IPAddr) bool {
+// Returns error if failed.
+func (i *IPAddrs) DeleteIPAddr(ip IPAddr) error {
 	i.mutex.Lock()
 	defer i.mutex.Unlock()
 
@@ -102,8 +129,8 @@ func (i *IPAddrs) DeleteIPAddr(ip IPAddr) bool {
 			i.ipaddrs[n] = i.ipaddrs[len(i.ipaddrs)-1]
 			i.ipaddrs = i.ipaddrs[:len(i.ipaddrs)-1]
 			noti.Notify(notifier.Delete, i.container, ip)
-			return true
+			return nil
 		}
 	}
-	return false
+	return errors.New("No such IP Address")
 }

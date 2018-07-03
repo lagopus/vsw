@@ -17,6 +17,7 @@
 #ifndef LAGOPUS_PACKET_H_
 #define LAGOPUS_PACKET_H_
 
+#include <stdbool.h>
 #include <rte_mbuf.h>
 #include <rte_hash.h>
 #include <rte_jhash.h>
@@ -25,7 +26,8 @@
 extern "C" {
 #endif
 
-typedef uint32_t vifindex_t;
+typedef uint16_t vifindex_t;
+typedef uint16_t vrfindex_t;
 
 #define VIF_INVALID_INDEX	0
 #define VIF_MAX_INDEX		4095	   // Valid VIF index is from 1 to VIF_MAX_INDEX
@@ -36,37 +38,28 @@ typedef uint32_t vifindex_t;
 #define BRIDGE_INVALID_ID	0
 #define BRIDGE_MAX_ID		1023	   // Valid Bridge ID is from 1 to BRIDGE_MAX_ID
 
-#define MAX_PACKET_SZ 2048
-#define PACKET_METADATA_SIZE (RTE_MBUF_PRIV_ALIGN << 4)	// Shall be a multiple of RTE_MBUF_PRIV_ALIGN
+#define MAX_PACKET_SZ 4096
+#define PACKET_METADATA_SIZE (RTE_MBUF_PRIV_ALIGN << 6)	// Shall be a multiple of RTE_MBUF_PRIV_ALIGN
 
 #define LAGOPUS_MBUF_METADATA(mbuf) (struct lagopus_packet_metadata*)((void*)(mbuf) + sizeof(struct rte_mbuf))
 
-/*
- * Hash function for VRF RD
- *
- * This hash function shall be used through out lagopus to share the
- * pre-calculated hash key.
- */
-extern uint32_t lagopus_vrf_hash_func(const void *key, uint32_t length, uint32_t initval);
-
 typedef enum {
 	// The packet is sent to the router itself.
-	LAGOPUS_MD_SELF			= (1 <<  0),
+	LAGOPUS_MD_SELF			= (1 << 0),
 
-	// Hash Sig is valid for VRF.
-	LAGOPUS_MD_VALID_VRF_HASHSIG	= (1 <<  2),
+	// The packet should be processed by MAT. Used by bridge module only.
+	LAGOPUS_MD_MAT			= (1 << 1),
 } lagopus_md_flag_t;
 
 struct lagopus_packet_metadata {
 	struct vif_metadata {
-		uint64_t vrf;
-		uint64_t tunnel_id;
+		uint64_t vrf;			// DEPRECATED. WILL BE REMOVED.
 		vifindex_t in_vif;
 		vifindex_t out_vif;
 
 		lagopus_md_flag_t flags;	// Or'd LAGOPUS_MD_*
-		uint32_t bridge_id;		// Bridge domain ID
-		hash_sig_t vrf_hash_sig; 	// pre-calculated hash signature of the VRF
+
+		bool local;			// True if the packet is originated locally. False otherwise.
 	} md_vif;
 	uint8_t udata[PACKET_METADATA_SIZE - sizeof(struct vif_metadata)];
 };

@@ -60,7 +60,7 @@ var serial = 0
 //
 // where N in the Prefix is a serial number.
 //
-// Rings are only good for a single consumer and producers use case.
+// Created rings are good for a single consumer/producer use case only.
 //
 // Returns RingPair on success, otherwise nil.
 func Create(c *Config) *RingPair {

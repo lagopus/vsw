@@ -27,3 +27,22 @@ func TestLcore(t *testing.T) {
 
 	t.Logf("Count = %d", LcoreCount())
 }
+
+func TestEnumLcore(t *testing.T) {
+	master := GetMasterLcore()
+	sockets := make(map[uint]struct{})
+	n := uint(0)
+	for n < MaxLcore {
+		if n != master && LcoreIsEnabled(n) {
+			t.Logf("slave lcore %d is enabled.\n", n)
+			sockets[LcoreToSocketId(n)] = struct{}{}
+		}
+		n++
+	}
+
+	// sockets
+	t.Logf("Found sockets:\n")
+	for sid := range sockets {
+		t.Logf("socket %d\n", sid)
+	}
+}

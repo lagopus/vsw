@@ -19,33 +19,38 @@ package testvif
 import (
 	"bytes"
 	"errors"
-	"fmt"
+	"net"
+
 	"github.com/lagopus/vsw/dpdk"
 	"github.com/lagopus/vsw/vswitch"
-	"net"
 )
 
-const ouiPrefix = uint32(0x12345678)
-
 var log = vswitch.Logger
-var serial = 1
 
 // Statistics
-type TestVifStats struct {
-	Tx_count   int // Packets Sent
-	Rx_count   int // Packets Received
-	Tx_dropped int // Packets Couldn't Sent
-	Rx_dropped int // Packets Couldn't Recv'd
+type TestIFStats struct {
+	RxCount    int // Packets Received
+	RxDropped  int // Packets Couldn't Recv'd
+	TxCount    int // Packets Sent (Outbound)
+	TxDropped  int // Packets Couldn't Sent
+	AuxCount   int // Packets Sent (Inbound)
+	AuxDropped int // Packets Couldn't Sent
 }
 
-type TestVifModule struct {
-	vswitch.ModuleService
+type TestIF struct {
+	base     *vswitch.BaseInstance
+	rx_chan  chan *dpdk.Mbuf // VIF.Output()  : chan -> testvif -> other module
+	tx_chan  chan *dpdk.Mbuf // VIF.Outbound(): other module -> testvif -> chan
+	aux_chan chan *dpdk.Mbuf // VIF.Inbound() : other module -> testvif -> chan
+	stats    TestIFStats
+	mtu      vswitch.MTU
+	done     chan int
+}
+
+type TestVIF struct {
+	testif  *TestIF
+	vif     *vswitch.VIF
 	running bool
-	tx_chan chan *dpdk.Mbuf
-	rx_chan chan *dpdk.Mbuf
-	stats   TestVifStats
-	mac     net.HardwareAddr
-	done    chan int
 }
 
 /*
@@ -56,141 +61,181 @@ type TestVifConfig struct {
 
 const QueueLength = 32
 
+func newTestIF(base *vswitch.BaseInstance) *TestIF {
+	return &TestIF{
+		base:    base,
+		rx_chan: make(chan *dpdk.Mbuf),
+		tx_chan: make(chan *dpdk.Mbuf, QueueLength),
+		done:    make(chan int),
+		mtu:     vswitch.DefaultMTU,
+	}
+}
+
 // Test VIF factory
-func createTestVif(p *vswitch.ModuleParam) (vswitch.Module, error) {
-	hastr := fmt.Sprintf("%04x.%04x.%04x",
-		(ouiPrefix>>16)&0xffff, (ouiPrefix & 0xffff),
-		serial)
-	ha, err := net.ParseMAC(hastr)
-	if err != nil {
-		log.Printf("TestVif: Couldn' parse: '%s'\n", hastr)
-		return nil, errors.New("Can't create module - bad MAC address.")
-	}
-	serial++
-	module := &TestVifModule{
-		ModuleService: vswitch.NewModuleService(p),
-		running:       true,
-		tx_chan:       make(chan *dpdk.Mbuf),
-		rx_chan:       make(chan *dpdk.Mbuf, QueueLength),
-		done:          make(chan int),
-		mac:           ha,
-	}
-	return module, nil
+func newTestVIF(base *vswitch.BaseInstance, priv interface{}) (vswitch.Instance, error) {
+	return newTestIF(base), nil
 }
 
-func (tm *TestVifModule) Link() vswitch.LinkStatus {
-	return vswitch.LinkUp
+func newTestVIF2(base *vswitch.BaseInstance, priv interface{}) (vswitch.Instance, error) {
+	ti := newTestIF(base)
+	ti.aux_chan = make(chan *dpdk.Mbuf, QueueLength)
+	return ti, nil
 }
 
-func (tm *TestVifModule) SetLink(ls vswitch.LinkStatus) bool {
-	return vswitch.LinkUp == ls
+func (ti *TestIF) Free() {
 }
 
-func (tm *TestVifModule) Control(cmd string, v interface{}) interface{} {
-	log.Printf("%s requestd", cmd)
-	switch cmd {
-	case "GET_TX_CHAN": // Mbufs to Test VIF output ring
-		return tm.tx_chan
-
-	case "GET_RX_CHAN": // Mbufs from Test VIF input ring
-		return tm.rx_chan
-
-	case "RESET_COUNTER":
-		tm.stats = TestVifStats{}
-		return true
-
-	case "GET_STATS":
-		return tm.stats
-
-	case "SET_MAC_ADDRESS":
-		ha, ok := v.(net.HardwareAddr)
-		if !ok {
-			log.Printf("%s: Invalid argument: %v (expected net.HardwareAddr)\n", tm.Name(), v)
-			return false
-		}
-		tm.mac = ha
-
-	case "GET_MAC_ADDRESS":
-		return tm.mac
-
-	default:
-		log.Printf("unknown control: %s\n", cmd)
-	}
-
-	return false
+func (ti *TestIF) Enable() error {
+	return nil
 }
 
-func (tm *TestVifModule) Start() bool {
-	log.Printf("%s: Start()", tm.Name())
+func (ti *TestIF) Disable() {
+}
 
-	if !tm.running {
-		log.Printf("%s: Terminated before start", tm.Name())
-		close(tm.done)
-		return false
+func (ti *TestIF) SetMACAddress(mac net.HardwareAddr) error {
+	return nil
+}
+
+func (ti *TestIF) MACAddress() net.HardwareAddr {
+	return nil
+}
+
+func (ti *TestIF) MTU() vswitch.MTU {
+	return ti.mtu
+}
+
+func (ti *TestIF) SetMTU(mtu vswitch.MTU) error {
+	ti.mtu = mtu
+	return nil
+}
+
+func (ti *TestIF) InterfaceMode() vswitch.VLANMode {
+	return vswitch.AccessMode
+}
+
+func (ti *TestIF) SetInterfaceMode(mode vswitch.VLANMode) error {
+	if mode != vswitch.AccessMode {
+		return errors.New("Supports ACCESS mode only")
 	}
+	return nil
+}
 
-	log.Printf("%s: Registering Mac Address: %s", tm.Name(), tm.mac)
-	tm.Vif().SetMacAddress(tm.mac)
+func (ti *TestIF) AddVID(vid vswitch.VID) error {
+	return nil
+}
 
-	vifidx := tm.Vif().VifIndex()
+func (ti *TestIF) DeleteVID(vid vswitch.VID) error {
+	return nil
+}
 
-	oring := tm.Rules().Output(vswitch.MATCH_ANY)
-	if oring == nil {
-		log.Printf("%s: Output ring is not specified.", tm.Name())
-		close(tm.done)
-		return false
-	}
+func (ti *TestIF) SetNativeVID(vid vswitch.VID) error {
+	return nil
+}
 
-	iring := tm.Input()
+func (ti *TestIF) NewVIF(vif *vswitch.VIF) (vswitch.VIFInstance, error) {
+	return &TestVIF{ti, vif, false}, nil
+}
+
+func (ti *TestIF) TxChan() chan *dpdk.Mbuf {
+	return ti.tx_chan
+}
+
+func (ti *TestIF) RxChan() chan *dpdk.Mbuf {
+	return ti.rx_chan
+}
+
+func (ti *TestIF) ResetStats() {
+	ti.stats = TestIFStats{}
+}
+
+func (ti *TestIF) Stats() TestIFStats {
+	return ti.stats
+}
+
+func (tv *TestVIF) Free() {
+}
+
+func (tv *TestVIF) SetVRF(vrf *vswitch.VRF) {
+}
+
+func (tv *TestVIF) dequeueMbufs(r *dpdk.Ring, ch chan *dpdk.Mbuf) int {
 	mbufs := make([]*dpdk.Mbuf, QueueLength)
+	vid := uint16(tv.vif.VID())
+
+	txc := int(r.DequeueBurstMbufs(&mbufs))
+	for i := 0; i < txc; i++ {
+		if v := mbufs[i].VlanTCI(); v != vid {
+			log.Printf("%s: Incorrect VID %d found. (Must be %d)", tv.vif.Name(), v, vid)
+		}
+		ch <- mbufs[i]
+	}
+	return txc
+}
+
+func (tv *TestVIF) Enable() error {
+	log.Printf("%s: Enable()", tv.vif.Name())
+
+	if tv.running {
+		log.Printf("%s: already runnnig", tv.vif.Name())
+		return nil
+	}
+	tv.running = true
 
 	go func() {
-		for tm.running {
+		oring := tv.vif.Output()
+		if oring == nil {
+			log.Printf("%s: Output ring is not specified.", tv.vif.Name())
+			return
+		}
+
+		index := tv.vif.Index()
+		mac := tv.vif.MACAddress()
+		vid := uint16(tv.vif.VID())
+
+		for tv.running {
 			select {
-			case mbuf := <-tm.tx_chan:
+			case mbuf := <-tv.testif.rx_chan:
+				mbuf.SetVlanTCI(vid)
 				md := (*vswitch.Metadata)(mbuf.Metadata())
-				md.SetInVIF(vifidx)
+				md.SetInVIF(index)
 				md.SetOutVIF(0)
 
-				if bytes.Compare(tm.mac, mbuf.EtherHdr().DstAddr()) == 0 {
+				if bytes.Compare(mac, mbuf.EtherHdr().DstAddr()) == 0 {
 					md.SetSelf(true)
 				}
 
 				if oring.EnqueueMbuf(mbuf) == 0 {
-					tm.stats.Tx_count++
-					log.Printf("%s: tx=1\n", tm.Name())
+					tv.testif.stats.RxCount++
+					log.Printf("%s: rx=1\n", tv.vif.Name())
 				} else {
-					log.Printf("%s: enquee failed.\n", tm.Name())
-					tm.stats.Tx_dropped++
+					log.Printf("%s: enquee failed.\n", tv.vif.Name())
+					tv.testif.stats.RxDropped++
+					mbuf.Free()
 				}
 
 			default:
-				rxc := int(iring.DequeueBurstMbufs(&mbufs))
-				for i := 0; i < rxc; i++ {
-					tm.rx_chan <- mbufs[i]
+				if tv.testif.aux_chan != nil {
+					if cnt := tv.dequeueMbufs(tv.vif.Inbound(), tv.testif.tx_chan); cnt > 0 {
+						log.Printf("%s: Inbound(): %d packet(s)", tv.vif.Name(), cnt)
+						tv.testif.stats.AuxCount += cnt
+					}
 				}
-				if rxc > 0 {
-					tm.stats.Rx_count += rxc
-					log.Printf("%s: rx=%d\n", tm.Name(), rxc)
+				if cnt := tv.dequeueMbufs(tv.vif.Outbound(), tv.testif.tx_chan); cnt > 0 {
+					log.Printf("%s: Outbound(): %d packet(s)", tv.vif.Name(), cnt)
+					tv.testif.stats.TxCount += cnt
 				}
 			}
 		}
-		close(tm.done)
-		close(tm.tx_chan)
-		close(tm.rx_chan)
+		tv.testif.done <- 0
 	}()
 
-	return true
+	return nil
 }
 
-func (tm *TestVifModule) Stop() {
-	log.Printf("%s: Stop()", tm.Name())
-	tm.running = false
-}
-
-func (tm *TestVifModule) Wait() {
-	log.Printf("%s: Wait()", tm.Name())
-	<-tm.done
+func (tv *TestVIF) Disable() {
+	log.Printf("%s: Disable()", tv.vif.Name())
+	tv.running = false
+	<-tv.testif.done
 }
 
 /*
@@ -198,12 +243,17 @@ func (tm *TestVifModule) Wait() {
  */
 func init() {
 	rp := &vswitch.RingParam{
-		Count:    QueueLength,
-		SocketId: dpdk.SOCKET_ID_ANY,
-		Flags:    0,
+		Count:          QueueLength,
+		SocketId:       dpdk.SOCKET_ID_ANY,
+		SecondaryInput: false,
 	}
 
-	if !vswitch.RegisterModule("testvif", createTestVif, rp, vswitch.TypeVif) {
-		log.Fatalf("Failed to register Test VIF class.")
+	if err := vswitch.RegisterModule("testvif", newTestVIF, rp, vswitch.TypeInterface); err != nil {
+		log.Fatalf("Failed to register Test VIF class: %v", err)
+	}
+
+	rp.SecondaryInput = true
+	if err := vswitch.RegisterModule("testvif2", newTestVIF2, rp, vswitch.TypeInterface); err != nil {
+		log.Fatalf("Failed to register Test VIF 2 class: %v", err)
 	}
 }

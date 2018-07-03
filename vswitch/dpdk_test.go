@@ -17,15 +17,29 @@
 package vswitch
 
 import (
-	"github.com/lagopus/vsw/dpdk"
 	"testing"
+	"time"
+
+	"github.com/lagopus/vsw/dpdk"
 )
 
 func getSc(dr *DpdkResource, ch chan uint) {
-	sc, _ := dr.AllocLcore()
+	sc, _ := dr.AllocLcore("test")
 	ch <- sc
-	if sc == 0 {
-		close(ch)
+}
+
+func waitAll(t *testing.T, ch chan uint) []uint {
+	var sc []uint
+
+	timeout := time.After(time.Second)
+	for {
+		select {
+		case c := <-ch:
+			t.Logf("Got core %d.\n", c)
+			sc = append(sc, c)
+		case <-timeout:
+			return sc
+		}
 	}
 }
 
@@ -34,10 +48,10 @@ func TestLcore(t *testing.T) {
 
 	dr := GetDpdkResource()
 
-	// Should success Lcore - 1 times
+	// Should success Lcore - 1st time
 	var sc []uint
 	for i := 0; i < count; i++ {
-		c, err := dr.AllocLcore()
+		c, err := dr.AllocLcore("test")
 		t.Logf("Got core %d. err=%v\n", c, err)
 		if err == nil {
 			sc = append(sc, c)
@@ -56,7 +70,12 @@ func TestLcore(t *testing.T) {
 		go getSc(dr, rc)
 	}
 
-	for v := range rc {
-		t.Logf("Got core %d.\n", v)
+	sc = waitAll(t, rc)
+	t.Logf("Got %d cores: %v", len(sc), sc)
+
+	for _, c := range sc {
+		dr.FreeLcore(c)
 	}
+
+	t.Logf("Returned all lcore")
 }

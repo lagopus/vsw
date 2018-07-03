@@ -18,10 +18,12 @@ package ringpair
 
 import (
 	"flag"
-	"github.com/lagopus/vsw/dpdk"
+	"fmt"
 	"os"
 	"testing"
 	"unsafe"
+
+	"github.com/lagopus/vsw/dpdk"
 )
 
 var pool *dpdk.MemPool
@@ -79,8 +81,10 @@ func TestMain(m *testing.M) {
 	args := []string{"test", "-v", "-c", "0xff", "-n", "2"}
 	dpdk.EalInit(args)
 
-	pool = dpdk.PktMbufPoolCreate("pool", 128, 0, 0, dpdk.RTE_PKTMBUF_HEADROOM, dpdk.SOCKET_ID_ANY)
-	if pool == nil {
+	var err error
+	pool, err = dpdk.PktMbufPoolCreate("pool", 128, 0, 0, dpdk.RTE_PKTMBUF_HEADROOM, dpdk.SOCKET_ID_ANY)
+	if err != nil {
+		fmt.Errorf("Can't create pktpool: %v\n", err)
 		os.Exit(1)
 	}
 

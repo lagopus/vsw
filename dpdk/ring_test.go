@@ -37,8 +37,8 @@ func createRingAndPool() (*Ring, *MemPool) {
 		return nil, nil
 	}
 
-	pool := PktMbufPoolCreate("pool", 128, 0, 0, RTE_PKTMBUF_HEADROOM, SOCKET_ID_ANY)
-	if pool == nil {
+	pool, err := PktMbufPoolCreate("pool", 128, 0, 0, RTE_PKTMBUF_HEADROOM, SOCKET_ID_ANY)
+	if err != nil {
 		ring.Free()
 		return nil, nil
 	}

@@ -17,8 +17,14 @@
 package vswitch
 
 import (
+	"fmt"
+	"net"
 	"sort"
 	"testing"
+	"time"
+
+	"github.com/lagopus/vsw/dpdk"
+	"github.com/lagopus/vsw/utils/notifier"
 )
 
 func checkCount(t *testing.T, r *Rules, e int) {
@@ -28,33 +34,10 @@ func checkCount(t *testing.T, r *Rules, e int) {
 	}
 }
 
-func compareSlices(a, b []uint64) bool {
-
-	if a == nil && b == nil {
-		return true
-	}
-
-	if a == nil || b == nil {
-		return false
-	}
-
-	if len(a) != len(b) {
-		return false
-	}
-
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-
-	return true
-}
-
 func checkRule(t *testing.T, r *Rules, index int, rule Rule) {
 	rules := r.Rules()
 	if rules[index].Match != rule.Match ||
-		rules[index].Ring != rule.Ring || !compareSlices(rules[index].Param, rule.Param) {
+		rules[index].Ring != rule.Ring || rules[index].Param != rule.Param {
 		t.Fatalf("Rule is not correct (%v). (should be %v)\n", rules[index], rule)
 	}
 }
@@ -76,71 +59,91 @@ const (
 	num_vifs      = 5
 )
 
-// For Watcher test
-type TestWatcher struct{ updated bool }
-
-func (w *TestWatcher) Updated(r *Rules) {
-	w.updated = true
+var testParams = map[VswMatch]interface{}{
+	MATCH_ANY:           nil,
+	MATCH_IN_VIF:        &VIF{index: 1},
+	MATCH_OUT_VIF:       &VIF{index: 2},
+	MATCH_ETH_DST:       &net.HardwareAddr{},
+	MATCH_ETH_DST_SELF:  nil,
+	MATCH_ETH_DST_MC:    nil,
+	MATCH_ETH_SRC:       &net.HardwareAddr{},
+	MATCH_ETH_TYPE_IPV4: nil,
+	MATCH_ETH_TYPE_IPV6: nil,
+	MATCH_ETH_TYPE_ARP:  nil,
+	MATCH_ETH_TYPE:      dpdk.EtherType(0),
+	MATCH_VLAN_ID:       VID(0),
+	MATCH_IPV4_PROTO:    IPP_ESP,
+	MATCH_IPV4_SRC:      &net.IP{},
+	MATCH_IPV4_SRC_NET:  &IPAddr{},
+	MATCH_IPV4_DST:      &net.IP{},
+	MATCH_IPV4_DST_NET:  &IPAddr{},
+	MATCH_IPV4_DST_SELF: nil,
 }
 
-func checkWatcher(t *testing.T, w *TestWatcher, e bool) {
-	t.Logf("Expected: %v, got %v", e, w.updated)
-	if w.updated != e {
-		t.Fatal("Unexpected watcher state")
-	}
-	w.updated = false
-}
+// A place holder for a dummy ring used through out the tests
+var ruleRing *dpdk.Ring
 
 func TestRule(t *testing.T) {
+	ruleRing = dpdk.RingCreate("ring4rule", 1, dpdk.SOCKET_ID_ANY, 0)
+
 	t.Logf("Creating a new Rules\n")
 	r := newRules()
 
 	// add a rule
 	t.Logf("Adding one entry\n")
-	r.add(target_match, []uint64{0}, nil)
+	if err := r.add(target_match, nil, ruleRing); err != nil {
+		t.Fatalf("r.add failed: %v", err)
+	}
 	checkCount(t, r, 1)
 
 	// override a rule
 	t.Logf("Overriding a rule\n")
-	r.add(target_match, []uint64{1}, nil)
+	if err := r.add(target_match, nil, ruleRing); err != nil {
+		t.Fatalf("r.add failed: %v", err)
+	}
 	checkCount(t, r, 1)
-	checkRule(t, r, 0, Rule{target_match, nil, nil})
+	checkRule(t, r, 0, Rule{target_match, nil, ruleRing})
 
 	// remove non-existing rule
 	t.Logf("Remove non-existing rule")
-	r.remove(invalid_match)
+	if err := r.remove(invalid_match, nil); err == nil {
+		t.Fatalf("r.remove should have failed")
+	} else {
+		t.Logf("remove failed. ok: %v", err)
+	}
 	checkCount(t, r, 1)
-	checkRule(t, r, 0, Rule{target_match, nil, nil})
+	checkRule(t, r, 0, Rule{target_match, nil, ruleRing})
 
 	// remove the current one
 	t.Logf("Remove existing rule")
-	r.remove(target_match)
+	if err := r.remove(target_match, nil); err != nil {
+		t.Fatalf("r.remove failed: %v", err)
+	}
 	checkCount(t, r, 0)
 
 	// add all
 	t.Logf("Add all rules")
-	for k, _ := range hasParam {
-		r.add(k, []uint64{1}, nil)
+	for k, v := range testParams {
+		if err := r.add(k, v, ruleRing); err != nil {
+			t.Fatalf("r.add failed: %v", err)
+		}
 	}
-	checkCount(t, r, len(hasParam))
+	checkCount(t, r, len(testParams))
 	showRules(t, r)
 
 	// add twice
 	t.Logf("Add all rules twice")
 	twice := 0
-	for k, v := range hasParam {
-		r.add(k, []uint64{2, 3}, nil)
-		if v {
+	for k, v := range testParams {
+		if err := r.add(k, v, ruleRing); err != nil {
+			t.Fatalf("r.add failed: %v", err)
+		}
+		if v != nil {
 			twice++
 		}
 	}
-	checkCount(t, r, len(hasParam)+twice)
+	checkCount(t, r, len(testParams)+twice)
 	showRules(t, r)
-
-	// check CArray
-	t.Logf("Get carray")
-	ca, n := r.CArray()
-	t.Logf("carray (%d entries)> %v\n", n, ca)
 
 	// remove all
 	t.Logf("Remove all rules")
@@ -148,28 +151,45 @@ func TestRule(t *testing.T) {
 	checkCount(t, r, 0)
 }
 
-func TestRuleWatcher(t *testing.T) {
+func checkNotification(ch chan notifier.Notification, t notifier.Type, target *Rules, expect Rule) error {
+	timer := time.NewTimer(3 * time.Second)
+
+	select {
+	case n := <-ch:
+		timer.Stop()
+		if t != n.Type || target != n.Target || expect != n.Value {
+			return fmt.Errorf("Expected: %v(%v, %v), Actual: %v(%v, %v)",
+				t, target, expect, n.Type, n.Target, n.Value)
+		}
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("Timed out. No notification.")
+	}
+}
+
+func TestRuleNotify(t *testing.T) {
 	r := newRules()
 
-	// watcher test
-	t.Logf("Watcher test. installing watcher")
-	w := &TestWatcher{updated: false}
-	if !r.Watch(w) {
-		t.Fatal("Installing watcher failed.")
-	}
-	t.Logf("watch add")
-	r.add(target_match, nil, nil)
-	checkWatcher(t, w, true)
-	t.Logf("watch remove")
-	r.remove(target_match)
-	checkWatcher(t, w, true)
+	t.Logf("Notify test. installing observer")
+	ch := r.Notifier().Listen()
 
-	if !r.Watch(nil) {
-		t.Fatal("Uninstalling watcher failed.")
+	t.Logf("Check add notification")
+	r.add(target_match, nil, ruleRing)
+	if err := checkNotification(ch, notifier.Add, r, Rule{target_match, nil, ruleRing}); err != nil {
+		t.Fatalf("Add notification failed: %v", err)
 	}
-	t.Logf("watch add after uninstalling watcher")
-	r.add(target_match, nil, nil)
-	checkWatcher(t, w, false)
+
+	t.Logf("Check remove notification")
+	r.remove(target_match, nil)
+	if err := checkNotification(ch, notifier.Delete, r, Rule{target_match, nil, ruleRing}); err != nil {
+		t.Fatalf("Delete notification failed: %v", err)
+	}
+
+	t.Logf("Check add after uninstalling watcher")
+	r.add(target_match, nil, ruleRing)
+	if err := checkNotification(ch, notifier.Add, r, Rule{target_match, nil, ruleRing}); err != nil {
+		t.Fatalf("Add notification failed: %v", err)
+	}
 }
 
 func TestSubRule(t *testing.T) {
@@ -177,7 +197,7 @@ func TestSubRule(t *testing.T) {
 
 	t.Logf("Sub rules extraction test. Adding %d entries\n", num_vifs)
 	for i := 0; i < num_vifs; i++ {
-		r.add(vif_match, []uint64{uint64(i)}, nil)
+		r.add(vif_match, &VIF{index: VIFIndex(i)}, ruleRing)
 	}
 
 	t.Log("extract sub rule")
@@ -188,17 +208,18 @@ func TestSubRule(t *testing.T) {
 	t.Logf("Subrule: %v", sr)
 
 	t.Log("mark entries found")
-	check := make(map[uint64]bool)
+	check := make(map[VIFIndex]bool)
 	for _, r := range sr {
-		if r.Param == nil {
+		if vif, ok := r.Param.(*VIF); ok {
+			check[vif.index] = true
+		} else {
 			t.Fatalf("Unexpected entry: %v", r)
 		}
-		check[r.Param[0]] = true
 	}
 
 	t.Log("check if all entry exists")
 	for i := 0; i < num_vifs; i++ {
-		if !check[uint64(i)] {
+		if !check[VIFIndex(i)] {
 			t.Fatalf("Couldn't find %d!", i)
 		}
 	}

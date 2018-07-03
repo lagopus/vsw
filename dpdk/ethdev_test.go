@@ -24,6 +24,7 @@ func TestEthDevEnumerate(t *testing.T) {
 	count := int(EthDevCount())
 	t.Logf("Found %d devices", count)
 
+	t.Logf("Testing EthDevGetNameByPort()")
 	names := make([]string, count)
 	for i := 0; i < count; i++ {
 		names[i], err = EthDevGetNameByPort(uint(i))
@@ -34,6 +35,7 @@ func TestEthDevEnumerate(t *testing.T) {
 		t.Logf("Port %d: %s", i, names[i])
 	}
 
+	t.Logf("Testing EthDevGetPortByName()")
 	for port, name := range names {
 		p, err := EthDevGetPortByName(name)
 		if err != nil {
@@ -43,6 +45,29 @@ func TestEthDevEnumerate(t *testing.T) {
 		t.Logf("%s: port %d", name, p)
 		if int(p) != port {
 			t.Errorf("Port doesn't match for %s (%d != %d)", name, p, port)
+		}
+	}
+
+	t.Logf("Testing EthDevOpenByName()")
+	for _, name := range names {
+		dev, err := EthDevOpenByName(name)
+		if err == nil {
+			t.Logf("%v: %v", name, dev.PortID())
+		} else {
+			t.Fatalf("Device %v: %v", name, err)
+		}
+	}
+
+}
+
+func TestEthDevSocketID(t *testing.T) {
+	count := int(EthDevCount())
+	for i := 0; i < count; i++ {
+		dev, err := EthDevOpen(uint(i))
+		if err == nil {
+			t.Logf("Port %v (%v): Socket %v", i, dev.PortID(), dev.SocketID())
+		} else {
+			t.Fatalf("Port %v: %v", i, err)
 		}
 	}
 }

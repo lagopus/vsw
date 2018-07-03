@@ -24,21 +24,33 @@ import (
 	"testing"
 )
 
-func searchPmdLibrary(path string) []string {
+func searchDrivers(path string) []string {
+	prefixes := []string{
+		"librte_pmd_",
+		"librte_mempool_",
+	}
+
 	files, _ := ioutil.ReadDir(path)
-	var pmds []string
+	var drivers []string
 	path += "/"
 	for _, f := range files {
-		if strings.HasPrefix(f.Name(), "librte_pmd_") && strings.HasSuffix(f.Name(), ".so") {
-			pmds = append(pmds, "-d", path+f.Name())
+		if !strings.HasSuffix(f.Name(), ".so") {
+			continue
+		}
+
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(f.Name(), prefix) {
+				drivers = append(drivers, "-d", path+f.Name())
+				break
+			}
 		}
 	}
-	return pmds
+	return drivers
 }
 
 func TestMain(m *testing.M) {
 	args := []string{"test", "-v", "-c", "0xff", "-n", "4"}
-	args = append(args, searchPmdLibrary("/usr/local/lib")...)
+	args = append(args, searchDrivers("/usr/local/lib")...)
 	EalInit(args)
 
 	flag.Parse()

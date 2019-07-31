@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -36,13 +36,21 @@ func newIface(vifIndex vswitch.VIFIndex) *iface {
 	}
 }
 
-func (i *iface) setVRFIndex(vrfIndex vswitch.VRFIndex) {
+func (i *iface) setVRFIndex(vrfIndex *vswitch.VRFIndex) {
 	i.VRFIndex = vrfIndex
+}
+
+func (i *iface) unsetVRFIndex() {
+	i.VRFIndex = nil
+}
+
+func (i *iface) vrfIndex() *vswitch.VRFIndex {
+	return i.VRFIndex
 }
 
 func (i *iface) setRings(direction ipsec.DirectionType, rings *ipsec.Rings) {
 	i.Input = rings.Input(direction)
-	i.Output = rings.Output()
+	i.Output = rings.Output(direction)
 }
 
 func (i *iface) unsetRings() {

@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,9 @@
 package ipsec
 
 // #include <linux/ipsec.h>
+// #include <linux/udp.h>
 // #include <netinet/ip.h>
+// #include <netinet/in.h>
 // #include "ipsec.h"
 import "C"
 
@@ -166,4 +168,24 @@ const (
 	MaxVRFEntries = C.VRF_MAX_ENTRY
 	// MaxVIFEntries Maximum entry number of VIF.
 	MaxVIFEntries = C.VIF_MAX_ENTRY
+)
+
+// EncapType Encap.
+type EncapType uint8
+
+const (
+	// UDPEncapESPinUDPNoneIKE UDP_ENCAP_ESPINUDP_NON_IKE.
+	UDPEncapESPinUDPNoneIKE EncapType = C.UDP_ENCAP_ESPINUDP_NON_IKE
+	// UDPEncapESPinUDP UDP_ENCAP_ESPINUDP.
+	UDPEncapESPinUDP EncapType = C.UDP_ENCAP_ESPINUDP
+)
+
+// EncapProtoType Encap.
+type EncapProtoType uint8
+
+const (
+	// EncapProtoNone None, not encap.
+	EncapProtoNone EncapProtoType = 0
+	// EncapProtoUDP protocol.
+	EncapProtoUDP EncapProtoType = C.IPPROTO_UDP
 )

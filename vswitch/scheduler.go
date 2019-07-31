@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@
 package vswitch
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../include -I/usr/local/include/dpdk -m64 -pthread -O3 -msse4.2
-#cgo LDFLAGS: -Wl,-unresolved-symbols=ignore-all -L/usr/local/lib -ldpdk
+#cgo CFLAGS: -I${SRCDIR}/../../include -m64 -pthread -O3 -msse4.2
+#cgo LDFLAGS: -Wl,-unresolved-symbols=ignore-all
 
 #include "runtime.h"
 #include "scheduler.h"
@@ -56,8 +56,8 @@ type request struct {
 	cmd     C.sched_cmd_t
 	rid     int
 	name    *C.char
-	ops     *C.struct_lagopus_runtime_ops
-	ins     *C.struct_lagopus_instance
+	ops     *C.struct_vsw_runtime_ops
+	ins     *C.struct_vsw_instance
 	param   unsafe.Pointer
 	enabled bool
 	rc      chan bool
@@ -119,7 +119,7 @@ func getScheduler(coreid uint) (*scheduler, error) {
 		goto Error
 	}
 
-	p = (*C.struct_sched_arg)(C.malloc(C.sizeof_struct_sched_arg))
+	p = (*C.struct_sched_arg)(C.calloc(1, C.sizeof_struct_sched_arg))
 	p.request = (*C.struct_rte_ring)(unsafe.Pointer(reqRp.Rings[RING_USED]))
 	p.request_free = (*C.struct_rte_ring)(unsafe.Pointer(reqRp.Rings[RING_FREE]))
 	p.result = (*C.struct_rte_ring)(unsafe.Pointer(resRp.Rings[RING_USED]))
@@ -177,7 +177,7 @@ func (s *scheduler) sender() {
 			for {
 				select {
 				case <-t.C:
-					Logger.Fatalf("Can't get free request buffer. Scheduler maybe dead.")
+					logger.Fatalf("Can't get free request buffer. Scheduler maybe dead.")
 				default:
 					if freeRing.Dequeue((*unsafe.Pointer)(unsafe.Pointer(&req))) == 0 {
 						if !t.Stop() {
@@ -201,7 +201,7 @@ func (s *scheduler) sender() {
 		req.enabled = C.bool(r.enabled)
 
 		if usedRing.Enqueue(unsafe.Pointer(req)) != 0 {
-			Logger.Printf("Can't send request buffer.")
+			logger.Printf("Can't send request buffer.")
 			continue
 		}
 
@@ -234,7 +234,7 @@ func (s *scheduler) receiver() {
 			s.resMutex.Unlock()
 		}
 		if !freeRing.EnqueueBulk((*unsafe.Pointer)(unsafe.Pointer(&req[0])), count) {
-			Logger.Printf("Can't free result buffers.")
+			logger.Printf("Can't free result buffers.")
 		}
 		runtime.Gosched()
 	}
@@ -269,7 +269,7 @@ func (s *scheduler) addRuntime(r *Runtime, ops LagopusRuntimeOps, param unsafe.P
 		cmd:   C.SCHED_CMD_ADD_RUNTIME,
 		rid:   rid,
 		name:  name,
-		ops:   (*C.struct_lagopus_runtime_ops)(ops),
+		ops:   (*C.struct_vsw_runtime_ops)(ops),
 		param: param,
 	}) {
 		return fmt.Errorf("Adding new runtime failed in the scheduler.")
@@ -356,12 +356,12 @@ type Runtime struct {
 	mutex   sync.Mutex
 }
 
-type LagopusRuntimeOps *C.struct_lagopus_runtime_ops
+type LagopusRuntimeOps *C.struct_vsw_runtime_ops
 
 // NewRuntime creates a runtime on the specified lcore for a module.
 // Name is a unique name that describes runtime. The name shall be unique
 // per core, i.e. scheduler.
-// Ops is a pointer to an instance of struct lagopus_runtime_ops.
+// Ops is a pointer to an instance of struct vsw_runtime_ops.
 // Param is an argument passed to init() function of the runtime
 // during the startup of the runtime.
 func NewRuntime(coreid uint, name string, ops LagopusRuntimeOps, param unsafe.Pointer) (*Runtime, error) {
@@ -497,7 +497,7 @@ func (r *Runtime) controlRuntimeInstance(i *RuntimeInstance, p unsafe.Pointer) (
 type RuntimeInstance struct {
 	id      uint64
 	runtime *Runtime
-	entity  *C.struct_lagopus_instance
+	entity  *C.struct_vsw_instance
 	enabled bool
 	mutex   sync.Mutex
 }
@@ -505,11 +505,11 @@ type RuntimeInstance struct {
 var instanceMutex sync.Mutex
 var instanceID uint64
 
-type LagopusInstance *C.struct_lagopus_instance
+type LagopusInstance *C.struct_vsw_instance
 
 // NewRuntimeInstance creates an RuntimeInstance.
-// Instance is a pointer to an instance of struct lagopus_instnace.
-// XXX: Decide whom to free the struct lagopus_instance.
+// Instance is a pointer to an instance of struct vsw_instnace.
+// XXX: Decide whom to free the struct vsw_instance.
 func NewRuntimeInstance(instance LagopusInstance) (*RuntimeInstance, error) {
 	if instance == nil {
 		return nil, errors.New("Invalid instance passed")

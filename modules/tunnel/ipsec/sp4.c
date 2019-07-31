@@ -1,3 +1,19 @@
+/*
+ * Copyright 2019 Nippon Telegraph and Telephone Corporation.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*-
  *   BSD LICENSE
  *
@@ -96,7 +112,7 @@ struct spd4_attr {
 
 struct spd4 {
   struct spd4_attr *db[2];
-  struct spd_stat stats[IPSEC_SP_MAX_ENTRIES];
+  struct spd_stats stats[IPSEC_SP_MAX_ENTRIES];
   rte_atomic64_t seq;
   uint64_t current;
 };
@@ -129,7 +145,7 @@ spd4_alloc_spd_attr(uint32_t socketid,
     *attr = (struct spd4_attr *) calloc(1, sizeof(struct spd4_attr));
     if (*attr == NULL) {
       ret = LAGOPUS_RESULT_NO_MEMORY;
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
       goto done;
     }
 
@@ -139,7 +155,7 @@ spd4_alloc_spd_attr(uint32_t socketid,
     (*attr)->in = spd4_alloc_acl_ctx(name, socketid);
     if ((*attr)->in == NULL) {
       ret = LAGOPUS_RESULT_NO_MEMORY;
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
       goto done;
     }
 
@@ -147,13 +163,13 @@ spd4_alloc_spd_attr(uint32_t socketid,
     (*attr)->out = spd4_alloc_acl_ctx(name, socketid);
     if ((*attr)->out == NULL) {
       ret = LAGOPUS_RESULT_NO_MEMORY;
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
       goto done;
     }
     ret = LAGOPUS_RESULT_OK;
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
 done:
@@ -194,7 +210,7 @@ spd4_alloc(struct spd4 **spd4, uint32_t socketid) {
     *spd4 = (struct spd4 *) calloc(1, sizeof(struct spd4));
     if (*spd4 == NULL) {
       ret = LAGOPUS_RESULT_NO_MEMORY;
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
       goto done;
     }
 
@@ -202,18 +218,18 @@ spd4_alloc(struct spd4 **spd4, uint32_t socketid) {
 
     if ((ret = spd4_alloc_spd_attr(socketid, &SPD_MODIFIED(*spd4))) !=
         LAGOPUS_RESULT_OK) {
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
       goto done;
     }
 
     if ((ret = spd4_alloc_spd_attr(socketid, &SPD_CURRENT(*spd4))) !=
         LAGOPUS_RESULT_OK) {
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
       goto done;
     }
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
 done:
@@ -246,7 +262,7 @@ spd4_pre_process(struct spd4 *spd4) {
     ret = LAGOPUS_RESULT_OK;
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
@@ -262,7 +278,7 @@ spd4_post_process(struct spd4 *spd4) {
     ret = LAGOPUS_RESULT_OK;
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
@@ -279,26 +295,25 @@ print_one_ip4_rule(int32_t i,
   uint32_t_to_char(rule->field[DST_FIELD_IPV4].value.u32,
                    &a2, &b2, &c2, &d2);
 
-  lagopus_msg_debug(1,
-                    "%d:"
-                    "%hhu.%hhu.%hhu.%hhu/%u "
-                    "%hhu.%hhu.%hhu.%hhu/%u "
-                    "%hu : %hu %hu : %hu 0x%hhx/0x%hhx "
-                    "0x%x-0x%x-0x%x\n",
-                    i,
-                    a1, b1, c1, d1,
-                    rule->field[SRC_FIELD_IPV4].mask_range.u32,
-                    a2, b2, c2, d2,
-                    rule->field[DST_FIELD_IPV4].mask_range.u32,
-                    rule->field[SRCP_FIELD_IPV4].value.u16,
-                    rule->field[SRCP_FIELD_IPV4].mask_range.u16,
-                    rule->field[DSTP_FIELD_IPV4].value.u16,
-                    rule->field[DSTP_FIELD_IPV4].mask_range.u16,
-                    rule->field[PROTO_FIELD_IPV4].value.u8,
-                    rule->field[PROTO_FIELD_IPV4].mask_range.u8,
-                    rule->data.category_mask,
-                    rule->data.priority,
-                    rule->data.userdata);
+  TUNNEL_DEBUG("%d:"
+               "%hhu.%hhu.%hhu.%hhu/%u "
+               "%hhu.%hhu.%hhu.%hhu/%u "
+               "%hu : %hu %hu : %hu 0x%hhx/0x%hhx "
+               "0x%x-0x%x-0x%x",
+               i,
+               a1, b1, c1, d1,
+               rule->field[SRC_FIELD_IPV4].mask_range.u32,
+               a2, b2, c2, d2,
+               rule->field[DST_FIELD_IPV4].mask_range.u32,
+               rule->field[SRCP_FIELD_IPV4].value.u16,
+               rule->field[SRCP_FIELD_IPV4].mask_range.u16,
+               rule->field[DSTP_FIELD_IPV4].value.u16,
+               rule->field[DSTP_FIELD_IPV4].mask_range.u16,
+               rule->field[PROTO_FIELD_IPV4].value.u8,
+               rule->field[PROTO_FIELD_IPV4].mask_range.u8,
+               rule->data.category_mask,
+               rule->data.priority,
+               rule->data.userdata);
 }
 
 static inline void
@@ -307,7 +322,7 @@ spd4_dump_rules(const struct acl4_rules *rule,
   int32_t i;
 
   if (rule != NULL) {
-    lagopus_msg_debug(1, "dump ip4 rules :\n");
+    TUNNEL_DEBUG("dump ip4 rules :");
     for (i = 0; i < num; i++, rule++) {
       print_one_ip4_rule(i, rule);
     }
@@ -332,11 +347,11 @@ spd4_add_acl_rules(struct rte_acl_ctx *ctx, const struct acl4_rules *rules,
       } else {
         ret = LAGOPUS_RESULT_ANY_FAILURES;
       }
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
     }
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
@@ -364,14 +379,14 @@ spd4_build_acl(struct rte_acl_ctx *ctx) {
       } else {
         ret = LAGOPUS_RESULT_ANY_FAILURES;
       }
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
       goto done;
     }
 
     ret = LAGOPUS_RESULT_OK;
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
 done:
@@ -392,11 +407,11 @@ spd4_classify_spd(const struct rte_acl_ctx *ctx,
       ret = LAGOPUS_RESULT_OK;
     } else {
       ret = LAGOPUS_RESULT_INVALID_ARGS;
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
     }
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
@@ -441,7 +456,7 @@ sp4_set_rule(size_t index,
         break;
       default:
         ret = LAGOPUS_RESULT_INVALID_ARGS;
-        lagopus_perror(ret);
+        TUNNEL_PERROR(ret);
         goto done;
     }
 
@@ -474,7 +489,7 @@ sp4_set_rule(size_t index,
     ret = LAGOPUS_RESULT_OK;
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
 done:
@@ -497,7 +512,7 @@ sp4_pre_process(struct spd4 *spd4) {
     ret = spd4_pre_process(spd4);
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
@@ -511,7 +526,7 @@ sp4_post_process(struct spd4 *spd4) {
     ret = spd4_post_process(spd4);
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
@@ -546,14 +561,15 @@ sp4_make_spd(struct spd4 *spd4,
        */
       reserved_rules.data.userdata = RESERVED;
       reserved_rules.data.category_mask = 1;
+      reserved_rules.data.priority = RTE_ACL_MIN_PRIORITY;
       if ((ret = spd4_add_acl_rules(in, &reserved_rules, 1)) !=
           LAGOPUS_RESULT_OK) {
-        lagopus_perror(ret);
+        TUNNEL_PERROR(ret);
         goto done;
       }
       if ((ret = spd4_add_acl_rules(out, &reserved_rules, 1)) !=
           LAGOPUS_RESULT_OK) {
-        lagopus_perror(ret);
+        TUNNEL_PERROR(ret);
         goto done;
       }
 
@@ -565,14 +581,14 @@ sp4_make_spd(struct spd4 *spd4,
       if (in_rules != NULL && in_rules_nb != 0) {
         if ((ret = spd4_add_acl_rules(in, in_rules, in_rules_nb)) !=
             LAGOPUS_RESULT_OK) {
-          lagopus_perror(ret);
+          TUNNEL_PERROR(ret);
           goto done;
         }
       }
       if (out_rules != NULL && out_rules_nb != 0) {
         if ((ret = spd4_add_acl_rules(out, out_rules, out_rules_nb)) !=
             LAGOPUS_RESULT_OK) {
-          lagopus_perror(ret);
+          TUNNEL_PERROR(ret);
           goto done;
         }
       }
@@ -580,12 +596,12 @@ sp4_make_spd(struct spd4 *spd4,
       /* build ACL. */
       if ((ret = spd4_build_acl(in)) !=
           LAGOPUS_RESULT_OK) {
-        lagopus_perror(ret);
+        TUNNEL_PERROR(ret);
         goto done;
       }
       if ((ret = spd4_build_acl(out)) !=
           LAGOPUS_RESULT_OK) {
-        lagopus_perror(ret);
+        TUNNEL_PERROR(ret);
         goto done;
       }
 
@@ -595,14 +611,14 @@ sp4_make_spd(struct spd4 *spd4,
         /* dump rules (dynamic). */
         sp4_dump_rules(in_rules, (int32_t) in_rules_nb);
         /* dump acls. */
-        lagopus_msg_info("sp4 in(modified) :\n");
+        TUNNEL_INFO("sp4 in(modified) :");
         rte_acl_dump(in);
       }
       if (out_rules != NULL) {
         /* dump rules (dynamic). */
         sp4_dump_rules(out_rules, (int32_t) out_rules_nb);
         /* dump acls. */
-        lagopus_msg_info("sp4 out(modified) :\n");
+        TUNNEL_INFO("sp4 out(modified) :");
         rte_acl_dump(out);
       }
     } else {
@@ -610,7 +626,7 @@ sp4_make_spd(struct spd4 *spd4,
     }
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
 done:
@@ -625,18 +641,18 @@ sp4_classify_spd_in(void *spd,
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
   struct spd4 *spd4 = (struct spd4 *) spd;
 
-  lagopus_msg_debug(1, "call sp4_classify_spd_in.\n");
+  TUNNEL_DEBUG("call sp4_classify_spd_in.");
 
   if (likely(IS_VALID_SPD(spd4) == true && data != NULL && *data != NULL &&
              results != NULL && num != 0)) {
     if (unlikely((ret = spd4_classify_spd(
                           SPD_CURRENT(spd4)->in, data,
                           results, num)) != LAGOPUS_RESULT_OK)) {
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
     }
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
@@ -650,18 +666,18 @@ sp4_classify_spd_out(void *spd,
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
   struct spd4 *spd4 = (struct spd4 *) spd;
 
-  lagopus_msg_debug(1, "call sp4_classify_spd_out.\n");
+  TUNNEL_DEBUG("call sp4_classify_spd_out.");
 
   if (likely(IS_VALID_SPD(spd4) == true && data != NULL && *data != NULL &&
              results != NULL && num != 0)) {
     if (unlikely((ret = spd4_classify_spd(
                           SPD_CURRENT(spd4)->out, data,
                           results, num)) != LAGOPUS_RESULT_OK)) {
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
     }
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
@@ -681,24 +697,7 @@ sp4_set_lifetime_current(void *spd,
     ret = LAGOPUS_RESULT_OK;
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
-  }
-
-  return ret;
-}
-
-lagopus_result_t
-sp4_get_stat(struct spd4 *spd4,
-             struct spd_stat *stat,
-             uint32_t spi) {
-  lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
-
-  if (spd4->stats != NULL && stat != NULL) {
-    *stat = spd4->stats[SPI2IDX(spi)];
-    ret = LAGOPUS_RESULT_OK;
-  } else {
-    ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
@@ -706,7 +705,24 @@ sp4_get_stat(struct spd4 *spd4,
 
 lagopus_result_t
 sp4_get_stats(struct spd4 *spd4,
-              struct spd_stat **stats) {
+              struct spd_stats *stats,
+              uint32_t spi) {
+  lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
+
+  if (spd4->stats != NULL && stats != NULL) {
+    *stats = spd4->stats[SPI2IDX(spi)];
+    ret = LAGOPUS_RESULT_OK;
+  } else {
+    ret = LAGOPUS_RESULT_INVALID_ARGS;
+    TUNNEL_PERROR(ret);
+  }
+
+  return ret;
+}
+
+lagopus_result_t
+sp4_get_stats_array(struct spd4 *spd4,
+                    struct spd_stats **stats) {
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
 
   if (spd4->stats != NULL && stats != NULL) {
@@ -714,13 +730,13 @@ sp4_get_stats(struct spd4 *spd4,
     ret = LAGOPUS_RESULT_OK;
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
 }
 
-void
+lagopus_result_t
 sp4_initialize(struct spd4 **spd4,
                uint32_t socket_id) {
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
@@ -729,19 +745,21 @@ sp4_initialize(struct spd4 **spd4,
     rte_srand(rte_rdtsc());
 
     if ((ret = spd4_alloc(spd4, socket_id)) != LAGOPUS_RESULT_OK) {
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
       spd4_finalize(spd4);
-      rte_exit(EXIT_FAILURE, "Can't initialize SPD4.\n");
+      return ret;
     }
 
     /* add/build reserved rules. */
     if ((ret = sp4_make_spd(*spd4, NULL, 0, NULL, 0))
         != LAGOPUS_RESULT_OK) {
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
       spd4_finalize(spd4);
-      rte_exit(EXIT_FAILURE, "Can't add reserved rules.\n");
+      return ret;
     }
   }
+
+  return LAGOPUS_RESULT_OK;
 }
 
 void

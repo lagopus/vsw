@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,25 +17,28 @@
 package tunnel
 
 /*
-#cgo CFLAGS: -I ${SRCDIR}/.. -I${SRCDIR}/../../include -I/usr/local/include/dpdk -m64 -pthread -O3 -msse4.2
-#cgo LDFLAGS: -Wl,-unresolved-symbols=ignore-all -L/usr/local/lib -ldpdk
-
 #include "tunnel.h"
 */
 import "C"
 
 import (
+	"github.com/lagopus/vsw/dpdk"
 	"github.com/lagopus/vsw/vswitch"
 )
 
 const (
-	// ModuleName Name of Tunnel module.
-	ModuleName = C.TUNNEL_MODULE_NAME
-	// MaxPktBurst Maximum packet burst size.
-	MaxPktBurst = C.MAX_PKT_BURST
-
-	defaultInboundCore  = 2
-	defaultOutboundCore = 3
+	moduleName              = C.TUNNEL_MODULE_NAME
+	maxPktBurst             = C.MAX_PKT_BURST
+	maxTunnels              = C.MAX_TUNNELS
+	maxMmbufs               = C.MAX_PKT_BURST
+	defaultCoreBind         = true
+	defaultInboundCore      = 2
+	defaultOutboundCore     = 3
+	defaultInboundCoreMask  = 0x0
+	defaultOutboundCoreMask = 0x0
+	defaultHopLimit         = C.DEFAULT_TTL
+	defaultTos              = C.DEFAULT_TOS
+	defaultRuleFile         = ""
 )
 
 // ProtocolType ProtocolType is the type of the tunnel protocol.
@@ -50,6 +53,8 @@ const (
 	IPIP
 	// GRE GRE.
 	GRE
+	// L2GRE L2GRE.
+	L2GRE
 	// VXLAN VXLAN.
 	VXLAN
 )
@@ -66,15 +71,15 @@ func (p ProtocolType) String() string {
 		str = "ipip"
 	case GRE:
 		str = "gre"
+	case L2GRE:
+		str = "l2gre"
 	case VXLAN:
 		str = "vxlan"
 	}
 	return str
 }
 
-// ConcreteIFFactory ConcreteIF factory.
-type ConcreteIFFactory func(*vswitch.BaseInstance,
-	interface{}, *ModuleConfig) (ConcreteIF, error)
+type concreteIFFactory func(accessor ifParamAccessor) (concreteIF, error)
 
 type interfaceState uint8
 
@@ -84,3 +89,86 @@ const (
 	disabled
 	freed
 )
+
+type moduleData struct {
+	protocol    ProtocolType
+	factory     concreteIFFactory
+	inboundOps  vswitch.LagopusRuntimeOps
+	outboundOps vswitch.LagopusRuntimeOps
+}
+
+type ifParamAccessor interface {
+	protocol() ProtocolType
+	name() string
+	outbound() *dpdk.Ring
+	inbound() *dpdk.Ring
+	rules() *vswitch.Rules
+	interfaceMode() vswitch.VLANMode
+	moduleConfig() *ModuleConfig
+	l2tunnelConfig() *vswitch.L2Tunnel
+	counter() *vswitch.Counter
+}
+
+type ifParam struct {
+	proto        ProtocolType
+	base         *vswitch.BaseInstance
+	priv         interface{}
+	mode         vswitch.VLANMode
+	moduleConf   *ModuleConfig
+	l2tunnelConf *vswitch.L2Tunnel
+}
+
+func newIfParam(protocol ProtocolType, iface *tunnelIF) *ifParam {
+	var l2tunnelConf *vswitch.L2Tunnel
+	switch protocol {
+	case L2GRE, VXLAN:
+		l2tunnelConf, _ = iface.priv.(*vswitch.L2Tunnel)
+	default:
+		l2tunnelConf = nil
+	}
+
+	return &ifParam{
+		proto:        protocol,
+		base:         iface.base,
+		priv:         iface.priv,
+		mode:         iface.mode,
+		moduleConf:   iface.moduleConf,
+		l2tunnelConf: l2tunnelConf,
+	}
+}
+
+func (i *ifParam) protocol() ProtocolType {
+	return i.proto
+}
+
+func (i *ifParam) name() string {
+	return i.base.Name()
+}
+
+func (i *ifParam) outbound() *dpdk.Ring {
+	return i.base.Input()
+}
+
+func (i *ifParam) inbound() *dpdk.Ring {
+	return i.base.SecondaryInput()
+}
+
+func (i *ifParam) rules() *vswitch.Rules {
+	return i.base.Rules()
+}
+
+func (i *ifParam) interfaceMode() vswitch.VLANMode {
+	return i.mode
+}
+
+func (i *ifParam) moduleConfig() *ModuleConfig {
+	return i.moduleConf
+}
+
+func (i *ifParam) l2tunnelConfig() *vswitch.L2Tunnel {
+	return i.l2tunnelConf
+}
+
+func (i *ifParam) counter() *vswitch.Counter {
+	return i.base.Counter()
+}

@@ -1,3 +1,19 @@
+/*
+ * Copyright 2019 Nippon Telegraph and Telephone Corporation.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*-
  *   BSD LICENSE
  *
@@ -42,7 +58,7 @@
 #include "ipsec.h"
 #include "hash.h"
 
-#define MAX_KEY_SIZE (20)
+#define MAX_KEY_SIZE (32)
 
 #define IV_OFFSET ((sizeof(struct rte_crypto_op) +      \
                     sizeof(struct rte_crypto_sym_op)))
@@ -52,6 +68,35 @@
 
 #define UNKNOWN_ALGORITHM (0)
 
+#define SA_IS_NAT_T(sa) ((sa)->encap_proto != 0 ? true : false)
+
+enum cipher_algo_type {
+  CIPHER_ALGO_UNKNOWN = 0,
+  CIPHER_ALGO_NULL,
+  CIPHER_ALGO_AES_256_CBC,
+  CIPHER_ALGO_AES_128_CBC,
+  CIPHER_ALGO_AES_128_CTR,
+  CIPHER_ALGO_3DES_CBC,
+
+  CIPHER_ALGO_MAX
+};
+
+enum aead_algo_type {
+  AEAD_ALGO_UNKNOWN = 0,
+  AEAD_ALGO_AES_128_GCM,
+
+  AEAD_ALGO_MAX
+};
+
+enum auth_algo_type {
+  AUTH_ALGO_UNKNOWN = 0,
+  AUTH_ALGO_NULL,
+  AUTH_ALGO_SHA1_HMAC,
+  AUTH_ALGO_SHA256_HMAC,
+
+  AUTH_ALGO_MAX
+};
+
 struct ipsecvsw_session_gc_ctx_record;
 typedef struct ipsecvsw_session_gc_ctx_record *ipsecvsw_session_gc_ctx_t;
 
@@ -60,7 +105,8 @@ typedef struct ipsecvsw_session_gc_ctx_record *ipsecvsw_session_gc_ctx_t;
  */
 struct supported_cipher_algo {
   const char *keyword;                   /*< name */
-  enum rte_crypto_cipher_algorithm algo; /*< identifier */
+  enum rte_crypto_cipher_algorithm algo; /*< algo */
+  enum cipher_algo_type atype;
   uint16_t iv_len;
   uint16_t block_size;
   uint16_t key_len;
@@ -81,7 +127,8 @@ get_supported_cipher_algos(size_t *len);
  */
 struct supported_auth_algo {
   const char *keyword;                 /*< name */
-  enum rte_crypto_auth_algorithm algo; /*< identifier */
+  enum rte_crypto_auth_algorithm algo; /*< algo */
+  enum auth_algo_type atype;
   uint16_t digest_len;
   uint16_t key_len;
   uint8_t key_not_req;
@@ -105,6 +152,7 @@ get_supported_auth_algos(size_t *len);
 struct supported_aead_algo {
   const char *keyword;
   enum rte_crypto_aead_algorithm algo;
+  enum aead_algo_type atype;
   uint16_t iv_len;
   uint16_t block_size;
   uint16_t digest_len;
@@ -149,6 +197,9 @@ struct ipsec_sa {
   // TBD: address mask
   struct ip_addr src;
   struct ip_addr dst;
+  uint8_t encap_proto;    /*< For NAT-T */
+  uint16_t encap_src_port; /*< For NAT-T */
+  uint16_t encap_dst_port; /*< For NAT-T */
   uint8_t cipher_key[MAX_KEY_SIZE];
   uint16_t cipher_key_len;
   uint8_t auth_key[MAX_KEY_SIZE];

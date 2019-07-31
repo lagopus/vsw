@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Nippon Telegraph and Telephone Corporation.
+// Copyright 2018-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -59,24 +59,24 @@ func (t *TestInstance) Connect(dst *dpdk.Ring, m VswMatch, p interface{}) error 
 }
 
 // AddVIF adds VIF to the instance.
-// Internally, a rule MATCH_OUT_VIF to the VIF is added to the instance,
+// Internally, a rule MatchOutVIF to the VIF is added to the instance,
 // and the VIF's default output is set to the instance.
-// Also a rule MATCH_IN_VIF is added, if dedicated VIF.Inbound() is found.
+// Also a rule MatchInVIF is added, if dedicated VIF.Inbound() is found.
 // Returns non-nil error on failure.
 func (t *TestInstance) AddVIF(vif *VIF) error {
 	b := (*BaseInstance)(t)
-	if err := b.connect(vif.Outbound(), MATCH_OUT_VIF, vif); err != nil {
+	if err := b.connect(vif.Outbound(), MatchOutVIF, vif); err != nil {
 		return err
 	}
 	if vif.Inbound() != vif.Outbound() {
-		if err := b.connect(vif.Inbound(), MATCH_IN_VIF, vif); err != nil {
-			b.disconnect(MATCH_OUT_VIF, vif)
+		if err := b.connect(vif.Inbound(), MatchInVIF, vif); err != nil {
+			b.disconnect(MatchOutVIF, vif)
 			return err
 		}
 	}
 	if err := vif.setOutput(b.input); err != nil {
-		b.disconnect(MATCH_OUT_VIF, vif)
-		b.disconnect(MATCH_IN_VIF, vif)
+		b.disconnect(MatchOutVIF, vif)
+		b.disconnect(MatchInVIF, vif)
 		return err
 	}
 

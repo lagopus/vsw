@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2018-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 #include "dpdk_apis.h"
 
 #include "sa.h"
+#include "ifaces.h"
 
 
 
@@ -36,19 +37,20 @@
 #define RTE_LOG(lvl, id, ...) {                             \
     do {                                                    \
       if (RTE_LOG_ ## lvl == RTE_LOG_ERR) {                 \
-        lagopus_msg_error(__VA_ARGS__);                     \
+        TUNNEL_ERROR(__VA_ARGS__);                          \
       } else if (RTE_LOG_ ## lvl == RTE_LOG_DEBUG) {        \
-        lagopus_msg_debug(1, __VA_ARGS__);                  \
+        TUNNEL_DEBUG(__VA_ARGS__);                          \
       } else if (RTE_LOG_ ## lvl == RTE_LOG_WARNING) {      \
-        lagopus_msg_warning(__VA_ARGS__);                   \
+        TUNNEL_WARNING(__VA_ARGS__);                        \
       } else {                                              \
-        lagopus_msg_info(__VA_ARGS__);                      \
+        TUNNEL_INFO(__VA_ARGS__);                           \
       }                                                     \
     } while (0);                                            \
   }
 
 #define is_ipsecvsw_supported_cipher(x)                 \
   (((x == RTE_CRYPTO_CIPHER_NULL ||                     \
+     x == RTE_CRYPTO_CIPHER_3DES_CBC ||                 \
      x == RTE_CRYPTO_CIPHER_AES_CBC ||                  \
      x == RTE_CRYPTO_CIPHER_AES_CTR)) ? true : false)
 
@@ -70,7 +72,6 @@
  */
 #define CDEV_MP_NB_OBJS		2048
 #define CDEV_MP_CACHE_SZ	64
-
 
 
 
@@ -290,6 +291,7 @@ ipsecvsw_dispose_session_ctx(pthread_t tid,
  *	@param[in]	pkts	Packets.
  *	@param[in]	sctxs	Session contexts.
  *	@param[in]	n_pkts	A # of packets, SAs and session contexts.
+ *	@param[in]	stats	Stats for interface.
  *
  *	@retval	>=0	A # of packets successfully enqueued.
  *	@retval LAGOPUS_RESULT_INVALID_ARGS	Failed, invalid args.
@@ -305,7 +307,8 @@ ipsecvsw_cdevq_put(pthread_t tid,
                    ipsecvsw_xform_proc_t pre_xform_proc,
                    rte_mbuf_t const pkts[],
                    ipsecvsw_session_ctx_t sctxs[],
-                   size_t n_pkts);
+                   size_t n_pkts,
+                   iface_stats_t *stats);
 
 
 /**
@@ -316,6 +319,7 @@ ipsecvsw_cdevq_put(pthread_t tid,
  *	@param[in]	post_xform_proc	A per-packet, post-packet-transform function.
  *	@param[out]	pkts	Packets dequeued.
  *	@param[in]	max_pkts	A # of maximum packets the \b pkts can hold.
+ *	@param[in]	stats	Stats for interface.
  *
  *	@retval	>=0	A # of packets successfully dequeued.
  *	@retval LAGOPUS_RESULT_INVALID_ARGS	Failed, invalid args.
@@ -327,7 +331,8 @@ ipsecvsw_cdevq_get(pthread_t tid,
                    ipsecvsw_queue_role_t role,
                    ipsecvsw_xform_proc_t post_xform_proc,
                    rte_mbuf_t pkts[],
-                   size_t max_pkts);
+                   size_t max_pkts,
+                   iface_stats_t *stats);
 
 
 

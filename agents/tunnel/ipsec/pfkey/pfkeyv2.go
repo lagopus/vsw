@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,10 +20,11 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
-	"log"
 	"net"
 	"syscall"
 	"unsafe"
+
+	"github.com/lagopus/vsw/modules/tunnel/log"
 )
 
 // Serializer is the interface that wraps the Serialize method.
@@ -99,7 +100,7 @@ func (s *SadbMsgTransport) Serialize(w io.Writer) error {
 	}
 	mBuf.Write(buf.Bytes())
 	n, err := w.Write(mBuf.Bytes())
-	log.Printf("sadbMsgReply: %d bytes write\n", n)
+	log.Logger.Info("sadbMsgReply: %d bytes write", n)
 	return err
 }
 
@@ -744,16 +745,45 @@ func (s *SadbXIpsecrequest) Serialize(w io.Writer) error {
 
 // SadbXNatTType represents the type of nat traversal.
 type SadbXNatTType struct {
-	SadbXNatTTypeLen      uint16
-	SadbXNatTTypeExttype  uint16
 	SadbXNatTTypeType     uint8
 	SadbXNatTTypeReserved [3]uint8
 }
 
+// Deserialize deserializes SadbXNatTType.
+func (s *SadbXNatTType) Deserialize(r io.Reader) error {
+	err := binary.Read(r, HostByteOrder, s)
+	return err
+}
+
+// Serialize serializes SadbXNatTType.
+func (s *SadbXNatTType) Serialize(w io.Writer) error {
+	err := binary.Write(w, HostByteOrder, s)
+	return err
+}
+
 // SadbXNatTPort represents the port of nat traversal.
 type SadbXNatTPort struct {
-	SadbXNatTPortLen      uint16
-	SadbXNatTPortExttype  uint16
 	SadbXNatTPortPort     uint16 //big endian
 	SadbXNatTPortReserved uint16
+}
+
+// Deserialize deserializes SadbXNatTPort.
+func (s *SadbXNatTPort) Deserialize(r io.Reader) error {
+	err := binary.Read(r, HostByteOrder, s)
+	if err != nil {
+		return err
+	}
+	b := make([]byte, binary.MaxVarintLen16)
+	binary.BigEndian.PutUint16(b, s.SadbXNatTPortPort)
+	s.SadbXNatTPortPort = HostByteOrder.Uint16(b)
+	return nil
+}
+
+// Serialize serializes SadbXNatTPort.
+func (s *SadbXNatTPort) Serialize(w io.Writer) error {
+	b := make([]byte, binary.MaxVarintLen16)
+	binary.BigEndian.PutUint16(b, s.SadbXNatTPortPort)
+	s.SadbXNatTPortPort = HostByteOrder.Uint16(b)
+	err := binary.Write(w, HostByteOrder, s)
+	return err
 }

@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 package spd
 
 import (
+	"fmt"
 	"net"
 	"time"
 
@@ -30,7 +31,7 @@ type SPSelector struct {
 }
 
 // Modified Is Modified.
-func (s SPSelector) Modified(newS SPSelector) bool {
+func (s *SPSelector) Modified(newS SPSelector) bool {
 	return s.CSPSelector.Modified(newS.CSPSelector) ||
 		(s.Direction != newS.Direction)
 }
@@ -41,13 +42,15 @@ type SPStats struct {
 	LifeTimeByteCurrent uint64    // Lifetime - current (byte count), Unuse in SP (zero)
 }
 
-func newSPStats(cLifeTime int64) *SPStats {
-	sec := cLifeTime / int64(time.Second)
-	nsec := cLifeTime - (sec * int64(time.Second))
+func newSPStats(stats *ipsec.CSPDStats) *SPStats {
 	s := &SPStats{
-		LifeTimeCurrent: time.Unix(sec, nsec),
+		LifeTimeCurrent: stats.LifeTimeCurrent(),
 	}
 	return s
+}
+
+func (s *SPStats) String() string {
+	return fmt.Sprintf("LifeTimeCurrent: %v", s.LifeTimeCurrent)
 }
 
 // SPValue Values for SP .

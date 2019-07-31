@@ -1,3 +1,19 @@
+/*
+ * Copyright 2019 Nippon Telegraph and Telephone Corporation.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*-
  *   BSD LICENSE
  *
@@ -34,66 +50,54 @@
 #ifndef IPIP_H
 #define IPIP_H
 
-#include "l3.h"
+#include "tunnel.h"
 
 /* outbound. */
 
 static inline lagopus_result_t
-ipip_outbound(struct rte_mbuf *m, uint32_t offset, bool is_ipv4,
-              struct ip_addr *src, struct ip_addr *dst,
-              uint8_t hop_limit, int8_t tos, void **outip) {
+ipip_outbound(struct rte_mbuf *m, uint32_t offset, uint8_t proto, bool is_ipv4,
+              struct ip *inip4, struct ip_addr *src, struct ip_addr *dst,
+              uint8_t hop_limit, int8_t tos) {
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
-  struct ip *inip4;
   uint8_t new_tos;
 
-  if (likely((ret = set_meta_local(m)) ==
-             LAGOPUS_RESULT_OK)) {
-    /* inner. */
-    inip4 = rte_pktmbuf_mtod(m, struct ip *);
+  set_meta_local(m);
 
-    /* get TOS/TTL in packet or default vals. */
-    new_tos = convert_ip_tos(inip4, tos);
-    hop_limit = convert_ip_ttl(inip4, hop_limit);
+  /* get TOS/TTL in packet or default vals. */
+  new_tos = convert_ip_tos(inip4, tos);
+  hop_limit = convert_ip_ttl(inip4, hop_limit);
 
-    if (is_ipv4) {
-      /* IPv4. */
-      ret = encap_ip4(m, offset, IPPROTO_ESP, src, dst, new_tos,
-                      inip4->ip_off, hop_limit, false);
-    } else {
-      /* IPv6. */
-      ret = encap_ip6(m, offset, IPPROTO_ESP, src, dst, new_tos,
-                      hop_limit);
-    }
-
-    if (unlikely(ret != LAGOPUS_RESULT_OK)) {
-      lagopus_perror(ret);
-      return ret;
-    }
+  if (is_ipv4) {
+    /* IPv4. */
+    ret = encap_ip4(m, offset, proto, src, dst, new_tos,
+                    inip4->ip_off, hop_limit, false);
   } else {
-    lagopus_perror(ret);
-    return ret;
+    /* IPv6. */
+    ret = encap_ip6(m, offset, proto, src, dst, new_tos,
+                    hop_limit);
   }
 
-  /* outer. */
-  *outip = rte_pktmbuf_mtod(m, void *);
+  if (unlikely(ret != LAGOPUS_RESULT_OK)) {
+    TUNNEL_PERROR(ret);
+  }
 
-  return LAGOPUS_RESULT_OK;
+  return ret;
 }
 
 static inline lagopus_result_t
-ip4ip_outbound(struct rte_mbuf *m, uint32_t offset,
-               struct ip_addr *src, struct ip_addr *dst,
-               uint8_t hop_limit, int8_t tos, struct ip **outip) {
-  return ipip_outbound(m, offset, true, src, dst,
-                       hop_limit, tos, (void **) outip);
+ip4ip_outbound(struct rte_mbuf *m, uint32_t offset, uint8_t proto,
+               struct ip *inip, struct ip_addr *src, struct ip_addr *dst,
+               uint8_t hop_limit, int8_t tos) {
+  return ipip_outbound(m, offset, proto, true, inip, src, dst,
+                       hop_limit, tos);
 }
 
 static inline lagopus_result_t
-ip6ip_outbound(struct rte_mbuf *m, uint32_t offset,
-               struct ip_addr *src, struct ip_addr *dst,
-               uint8_t hop_limit, int8_t tos, struct ip6_hdr **outip) {
-  return ipip_outbound(m, offset, false, src, dst,
-                       hop_limit, tos, (void **) outip);
+ip6ip_outbound(struct rte_mbuf *m, uint32_t offset, uint8_t proto,
+               struct ip *inip, struct ip_addr *src, struct ip_addr *dst,
+               uint8_t hop_limit, int8_t tos) {
+  return ipip_outbound(m, offset, proto, false, inip, src, dst,
+                       hop_limit, tos);
 }
 
 /* inbound. */
@@ -114,71 +118,80 @@ ip6_ecn_setup(struct ip6_hdr *ip6) {
 }
 
 static inline lagopus_result_t
-ipip_inbound(struct rte_mbuf *m, uint32_t offset) {
+ipip_inbound_outer(struct rte_mbuf *m, uint32_t offset,
+                   uint32_t *set_ecn,
+                   uint32_t *ip_len,
+                   uint8_t *upper_proto) {
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
-  struct ip *outip4, *inip4;
-  struct ip6_hdr *outip6, *inip6;
-  uint32_t set_ecn, ip_len;
+  struct ip *outip4;
+  struct ip6_hdr *outip6;
 
-  if (likely((ret = set_meta_local(m)) ==
-             LAGOPUS_RESULT_OK)) {
-    /* outer. */
-    outip4 = rte_pktmbuf_mtod(m, struct ip *);
+  set_meta_local(m);
 
-    if (outip4->ip_v == IPVERSION) {
-      /* IPv4. */
-      set_ecn = ((outip4->ip_tos & IPTOS_ECN_CE) == IPTOS_ECN_CE);
-      ip_len = sizeof(struct ip);
+  /* outer. */
+  outip4 = rte_pktmbuf_mtod(m, struct ip *);
 
-      if (unlikely((ret = decap_ip4(m, offset, NULL)) !=
-                   LAGOPUS_RESULT_OK)) {
-        lagopus_perror(ret);
-        return ret;
-      }
-    } else {
-      /* IPv6. */
-      outip6 = (struct ip6_hdr *) outip4;
-      ip_len = sizeof(struct ip6_hdr);
-      set_ecn = ntohl(outip6->ip6_flow) >> 20;
-      set_ecn = ((set_ecn & IPTOS_ECN_CE) == IPTOS_ECN_CE);
+  if (outip4->ip_v == IPVERSION) {
+    /* IPv4. */
+    *set_ecn = ((outip4->ip_tos & IPTOS_ECN_CE) == IPTOS_ECN_CE);
+    *ip_len = sizeof(struct ip);
+    *upper_proto = outip4->ip_p;
 
-      if (unlikely((ret = decap_ip6(m, offset, NULL)) !=
-                   LAGOPUS_RESULT_OK)) {
-        lagopus_perror(ret);
-        return ret;
-      }
-    }
-
-    /* inner. */
-    inip4 = rte_pktmbuf_mtod(m, struct ip *);
-
-    /* Check packet is still bigger than IP header (inner) */
-    if (unlikely(rte_pktmbuf_pkt_len(m) <= ip_len)) {
-      lagopus_msg_error("Bad packet length.\n");
-      return LAGOPUS_RESULT_TOO_SHORT;
-    }
-
-    /* Check IP version. */
-    if (unlikely(inip4->ip_v != IPVERSION && inip4->ip_v != IP6_VERSION)) {
-      lagopus_msg_error("Bad IP version in packet.\n");
-      return LAGOPUS_RESULT_OUT_OF_RANGE;
-    }
-
-    /* RFC4301 5.1.2.1 Note 6 */
-    /* checksum recalculation is done in post process. */
-    if (inip4->ip_v == IPVERSION) {
-      if (set_ecn) {
-        ip4_ecn_setup(inip4);
-      }
-    } else {
-      if (set_ecn) {
-        inip6 = (struct ip6_hdr *) inip4;
-        ip6_ecn_setup(inip6);
-      }
+    if (unlikely((ret = decap_ip4(m, offset, NULL)) !=
+                 LAGOPUS_RESULT_OK)) {
+      TUNNEL_PERROR(ret);
+      return ret;
     }
   } else {
-    lagopus_perror(ret);
-    return ret;
+    /* IPv6. */
+    outip6 = (struct ip6_hdr *) outip4;
+    *ip_len = sizeof(struct ip6_hdr);
+    *set_ecn = ntohl(outip6->ip6_flow) >> 20;
+    *set_ecn = (((*set_ecn) & IPTOS_ECN_CE) == IPTOS_ECN_CE);
+    *upper_proto = outip6->ip6_nxt;
+
+    if (unlikely((ret = decap_ip6(m, offset, NULL)) !=
+                 LAGOPUS_RESULT_OK)) {
+      TUNNEL_PERROR(ret);
+      return ret;
+    }
+  }
+
+  return LAGOPUS_RESULT_OK;
+}
+
+static inline lagopus_result_t
+ipip_inbound_inner(struct rte_mbuf *m,
+                   uint32_t set_ecn, uint32_t ip_len) {
+  struct ip *inip4;
+  struct ip6_hdr *inip6;
+
+  /* inner. */
+  inip4 = rte_pktmbuf_mtod(m, struct ip *);
+
+  /* Check packet is still bigger than IP header (inner) */
+  if (unlikely(rte_pktmbuf_pkt_len(m) <= ip_len)) {
+    TUNNEL_ERROR("Bad packet length.");
+    return LAGOPUS_RESULT_TOO_SHORT;
+  }
+
+  /* Check IP version. */
+  if (unlikely(inip4->ip_v != IPVERSION && inip4->ip_v != IP6_VERSION)) {
+    TUNNEL_ERROR("Bad IP version in packet.");
+    return LAGOPUS_RESULT_UNKNOWN_PROTO;
+  }
+
+  /* RFC4301 5.1.2.1 Note 6 */
+  /* checksum recalculation is done in post process. */
+  if (inip4->ip_v == IPVERSION) {
+    if (set_ecn) {
+      ip4_ecn_setup(inip4);
+    }
+  } else {
+    if (set_ecn) {
+      inip6 = (struct ip6_hdr *) inip4;
+      ip6_ecn_setup(inip6);
+    }
   }
 
   return LAGOPUS_RESULT_OK;

@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ import (
 	"regexp"
 	"sync"
 
+	"github.com/lagopus/vsw/dpdk"
 	"github.com/lagopus/vsw/utils/notifier"
 )
 
@@ -33,16 +34,18 @@ const (
 // VRF represents Virtual Routing & Forwarding instance.
 type VRF struct {
 	name     string
-	vifs     []*VIF
+	devs     map[VIFIndex]OutputDevice
 	router   *router
 	tap      *BaseInstance
 	hostif   *BaseInstance
 	enabled  bool
 	index    VRFIndex
+	vifIndex VIFIndex
 	rd       uint64 // XXX: Do we need this?
 	sadb     *SADatabases
 	sadbOnce sync.Once
 	*RoutingTable
+	*PBR
 }
 
 type vrfManager struct {
@@ -54,7 +57,11 @@ type vrfManager struct {
 	re        *regexp.Regexp
 }
 
-var vrfMgr *vrfManager
+var vrfMgr = &vrfManager{
+	byName: make(map[string]*VRF),
+	rds:    make(map[uint64]struct{}),
+	re:     regexp.MustCompile(`^vrf\d+$`),
+}
 
 // should be called via assignIndex only
 func (vm *vrfManager) findSlot(vrf *VRF, from, to int) bool {
@@ -106,6 +113,13 @@ func NewVRF(name string) (*VRF, error) {
 		return nil, fmt.Errorf("No space left for new VRF")
 	}
 
+	vifIndex, err := vifIdxMgr.allocVIFIndex(vrf)
+	if err != nil {
+		vrfMgr.releaseIndex(vrf)
+		return nil, fmt.Errorf("Can't assign VIFIndex: %v", err)
+	}
+	vrf.vifIndex = vifIndex
+
 	// Create an ICMP processor
 	var errMsg error
 	tapName := name + "-tap"
@@ -125,12 +139,14 @@ func NewVRF(name string) (*VRF, error) {
 	}
 
 	// Forward all IP packets to the ICMP processor
-	if err := vrf.router.connect(vrf.tap.Input(), MATCH_IPV4_DST_SELF, nil); err != nil {
+	if err := vrf.router.connect(vrf.tap.Input(), MatchIPv4DstSelf, nil); err != nil {
 		errMsg = errors.New("Can't connect a router and an tap modules")
 		goto error3
 	}
 
 	vrf.RoutingTable = newRoutingTable(vrf)
+	vrf.devs = make(map[VIFIndex]OutputDevice)
+	vrf.PBR = newPBR(vrf)
 	vrfMgr.byName[name] = vrf
 
 	noti.Notify(notifier.Add, vrf, nil)
@@ -150,16 +166,21 @@ func (v *VRF) Free() {
 	vrfMgr.mutex.Lock()
 	defer vrfMgr.mutex.Unlock()
 
-	vifs := append([]*VIF(nil), v.vifs...)
-	for _, vif := range vifs {
-		v.DeleteVIF(vif)
+	for _, dev := range v.devs {
+		if vif, ok := dev.(*VIF); ok {
+			v.DeleteVIF(vif)
+		}
 	}
 
-	v.router.disconnect(MATCH_IPV4_DST_SELF, nil)
+	v.router.disconnect(MatchIPv4DstSelf, nil)
 	v.tap.free()
 	v.router.free()
 	delete(vrfMgr.byName, v.name)
 	vrfMgr.releaseIndex(v)
+
+	if err := vifIdxMgr.freeVIFIndex(v.vifIndex); err != nil {
+		logger.Err("Freeing VIFIndex for %v failed: %v", v.name, err)
+	}
 
 	if v.rd != 0 {
 		delete(vrfMgr.rds, v.rd)
@@ -212,6 +233,18 @@ func (v *VRF) Index() VRFIndex {
 	return v.index
 }
 
+// VRFIndex returns a unique VIFIndex of the VRF.
+// VIFIndex is used for inter-VRF routing.
+func (v *VRF) VIFIndex() VIFIndex {
+	return v.vifIndex
+}
+
+// Input returns an input ring for the VRF
+// which is the input ring for the underlying interface.
+func (v *VRF) Input() *dpdk.Ring {
+	return v.router.base.Input()
+}
+
 // SetRD sets the route distinguisher of thr VRF.
 func (v *VRF) SetRD(rd uint64) error {
 	vrfMgr.mutex.Lock()
@@ -238,52 +271,69 @@ func (v *VRF) RD() uint64 {
 	return v.rd
 }
 
+// AddVIF adds VIF to the VRF.
+// If the same VIF is added more than once to the VRF,
+// it sliently ignores.
 func (v *VRF) AddVIF(vif *VIF) error {
 	var err error
+
+	if _, exists := v.devs[vif.VIFIndex()]; exists {
+		return nil
+	}
 
 	if err = vif.setVRF(v); err != nil {
 		return err
 	}
 
+	// router -> VIF
 	if err = v.router.addVIF(vif); err != nil {
 		goto error1
 	}
 
 	// ICMP -> VIF (If not Tunnel)
 	if vif.Tunnel() == nil {
-		if err = v.tap.connect(vif.Outbound(), MATCH_OUT_VIF, vif); err != nil {
+		if err = v.tap.connect(vif.Outbound(), MatchOutVIF, vif); err != nil {
 			goto error2
 		}
 	}
 
 	// VIF -> router (DST_SELF)
-	if err = vif.connect(v.router.input(), MATCH_ETH_DST_SELF, nil); err != nil {
+	if err = vif.connect(v.router.input(), MatchEthDstSelf, nil); err != nil {
 		goto error3
 	}
 
 	// VIF -> router (broadcast)
-	if err = vif.connect(v.router.input(), MATCH_ETH_DST_BC, nil); err != nil {
+	if err = vif.connect(v.router.input(), MatchEthDstBC, nil); err != nil {
 		goto error4
 	}
 
 	// VIF -> router (multicast)
-	if err = vif.connect(v.router.input(), MATCH_ETH_DST_MC, nil); err != nil {
+	if err = vif.connect(v.router.input(), MatchEthDstMC, nil); err != nil {
 		goto error5
 	}
 
-	v.vifs = append(v.vifs, vif)
+	// Enable NAPT if needed
+	if vif.isNAPTEnabled() {
+		if err = v.enableNAPT(vif); err != nil {
+			goto error6
+		}
+	}
+
+	v.devs[vif.VIFIndex()] = vif
 
 	// TUN/TAP for the VIF will be created
 	noti.Notify(notifier.Add, v, vif)
 
 	return nil
 
+error6:
+	vif.disconnect(MatchEthDstMC, nil)
 error5:
-	vif.disconnect(MATCH_ETH_DST_BC, vif)
+	vif.disconnect(MatchEthDstBC, nil)
 error4:
-	vif.disconnect(MATCH_ETH_DST_SELF, vif)
+	vif.disconnect(MatchEthDstSelf, nil)
 error3:
-	v.tap.disconnect(MATCH_OUT_VIF, vif)
+	v.tap.disconnect(MatchOutVIF, vif)
 error2:
 	v.router.deleteVIF(vif)
 error1:
@@ -292,41 +342,41 @@ error1:
 }
 
 func (v *VRF) DeleteVIF(vif *VIF) error {
-	for n, tv := range v.vifs {
-		if tv == vif {
-			v.tap.disconnect(MATCH_OUT_VIF, vif)
-			vif.disconnect(MATCH_ETH_DST_SELF, nil)
-			vif.disconnect(MATCH_ETH_DST_BC, nil)
-			vif.disconnect(MATCH_ETH_DST_MC, nil)
-			vif.setVRF(nil)
-			v.router.deleteVIF(vif)
-
-			l := len(v.vifs) - 1
-			v.vifs[n] = v.vifs[l]
-			v.vifs[l] = nil
-			v.vifs = v.vifs[:l]
-
-			//  TUN/TAP for the VIF will be deleted
-			noti.Notify(notifier.Delete, v, vif)
-
-			return nil
-		}
+	if _, ok := v.devs[vif.VIFIndex()]; !ok {
+		return fmt.Errorf("Can't find %v in the VRF.", vif)
 	}
-	return fmt.Errorf("Can't find %v in the VRF.", vif)
+
+	v.tap.disconnect(MatchOutVIF, vif)
+	vif.disconnect(MatchEthDstSelf, nil)
+	vif.disconnect(MatchEthDstBC, nil)
+	vif.disconnect(MatchEthDstMC, nil)
+	vif.setVRF(nil)
+	v.router.deleteVIF(vif)
+
+	delete(v.devs, vif.VIFIndex())
+
+	//  TUN/TAP for the VIF will be deleted
+	noti.Notify(notifier.Delete, v, vif)
+
+	return nil
 }
 
 // VIF returns a slice of Vif Indices in the VRF.
 func (v *VRF) VIF() []*VIF {
-	vifs := make([]*VIF, len(v.vifs))
-	copy(vifs, v.vifs)
+	var vifs []*VIF
+	for _, dev := range v.devs {
+		if vif, ok := dev.(*VIF); ok {
+			vifs = append(vifs, vif)
+		}
+	}
 	return vifs
 }
 
 // Dump returns descriptive information about the VRF
 func (v *VRF) Dump() string {
-	str := fmt.Sprintf("%s: RD=%d. %d VIF(s):", v.name, v.rd, len(v.vifs))
-	for _, vif := range v.vifs {
-		str += fmt.Sprintf(" %v", vif)
+	str := fmt.Sprintf("%s: RD=%d. %d DEV(s):", v.name, v.rd, len(v.devs))
+	for _, dev := range v.devs {
+		str += fmt.Sprintf(" %v", dev)
 	}
 	if v.sadb != nil {
 		sad := v.sadb.SAD()
@@ -350,6 +400,200 @@ func (v *VRF) SADatabases() *SADatabases {
 		v.sadb = newSADatabases(v)
 	})
 	return v.sadb
+}
+
+// HasSADatabases returns true if the VRF has associated SADatbases.
+// Returns false otherwise.
+func (v *VRF) HasSADatabases() bool {
+	return v.sadb != nil
+}
+
+func (v *VRF) addL3Tunnel(vif *VIF) error {
+	t := vif.Tunnel()
+	if t == nil {
+		return fmt.Errorf("%v is not tunnel.", vif)
+	}
+
+	ra := t.RemoteAddresses()
+	if len(ra) == 0 {
+		return fmt.Errorf("No remote address(es) specified: %v.", t)
+	}
+
+	if err := vif.connect(v.router.input(), MatchIPv4Dst, &ra[0]); err != nil {
+		return fmt.Errorf("Adding a rule to %v failed for L3 tunnel: %v", vif, err)
+	}
+
+	// Forward inbound packets to L3 Tunnel
+	local := t.LocalAddress()
+	for _, remote := range ra {
+		ft := NewFiveTuple()
+		ft.DstIP = CreateIPAddr(local)
+		ft.SrcIP = CreateIPAddr(remote)
+		ft.Proto = t.IPProto()
+
+		if err := v.router.connect(vif.Inbound(), Match5Tuple, ft); err != nil {
+			vif.disconnect(MatchIPv4Dst, remote)
+			return fmt.Errorf("Adding a rule to router for L3 tunnel failed: %v", err)
+		}
+
+		// Add a rule for NAT Traversal, if the tunnel is IPSec.
+		if t.Security() == SecurityIPSec {
+			nat := NewFiveTuple()
+			nat.SrcIP = ft.SrcIP
+			nat.DstIP = ft.DstIP
+			nat.DstPort = PortRange{Start: 4500}
+			nat.Proto = IPP_UDP
+
+			if err := v.router.connect(vif.Inbound(), Match5Tuple, nat); err != nil {
+				vif.disconnect(MatchIPv4Dst, remote)
+				v.router.disconnect(Match5Tuple, ft)
+				return fmt.Errorf("Adding a rule for IPSec NAT traversal failed: %v", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// TODO: Implement delete Tunnel
+func (v *VRF) deleteL3Tunnel(vif *VIF) {
+	logger.Warning("Deleting L3 Tunnel (%v) from VRF not supported", vif)
+}
+
+func (v *VRF) addL2Tunnel(i *Interface) error {
+	t := i.Tunnel()
+	if t == nil {
+		return fmt.Errorf("%v is not tunnel.", i)
+	}
+
+	ra := t.RemoteAddresses()
+	if len(ra) == 0 {
+		return fmt.Errorf("No remote address(es) specified: %v.", t)
+	}
+
+	if err := i.connect(v.router.input(), MatchIPv4Dst, &ra[0]); err != nil {
+		return fmt.Errorf("Adding a rule to %v failed for L2 tunnel: %v", i, err)
+	}
+
+	// Forward inbound packets to L2 Tunnel
+	switch e := t.EncapsMethod(); e {
+	case EncapsMethodGRE:
+		for _, remote := range ra {
+			ft := NewFiveTuple()
+			ft.SrcIP = CreateIPAddr(remote)
+			ft.DstIP = CreateIPAddr(t.LocalAddress())
+			ft.Proto = IPP_GRE
+
+			// TODO: We may want to roll back on error.
+			if err := v.router.connect(i.Inbound(), Match5Tuple, ft); err != nil {
+				logger.Fatalf("Can't connect L2 tunnel to the router: %v", err)
+			}
+		}
+
+	case EncapsMethodVxLAN:
+		for _, remote := range ra {
+			vxlan := &VxLAN{
+				Src:     remote,
+				Dst:     t.LocalAddress(),
+				DstPort: t.VxLANPort(),
+				VNI:     t.VNI(),
+			}
+
+			// TODO: We may want to roll back on error.
+			if err := v.router.connect(i.Inbound(), MatchVxLAN, vxlan); err != nil {
+				logger.Fatalf("Can't connect L2 tunnel to the router: %v", err)
+			}
+		}
+
+	default:
+		return fmt.Errorf("Unsupported L2 Tunnel encaps method: %v", e)
+	}
+
+	return nil
+}
+
+// TODO: Implement delete Tunnel
+func (v *VRF) deleteL2Tunnel(i *Interface) {
+	logger.Warning("Deleting L2 Tunnel (%v) from VRF not supported", i)
+}
+
+func (v *VRF) enableNAPT(vif *VIF) error {
+	return v.router.enableNAPT(vif)
+}
+
+func (v *VRF) disableNAPT(vif *VIF) error {
+	return v.router.disableNAPT(vif)
+}
+
+func (v *VRF) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + v.name + `"`), nil
+}
+
+func (v *VRF) registerOutputDevice(dev OutputDevice) error {
+	// If OutputDevice is already in devs, it means the OutputDevice
+	// is either VIF, or VRF that has already been added.
+	if _, exists := v.devs[dev.VIFIndex()]; exists {
+		return nil
+	}
+
+	// OutputDevice to be added shall be VRF.
+	// If OutputDevice is VIF, it should have been added via AddVIF already.
+	if _, ok := dev.(*VRF); !ok {
+		return fmt.Errorf("OutputDevice is not VRF: %v", dev)
+	}
+
+	// Add VRF to router instance
+	if err := v.router.addOutputDevice(dev); err != nil {
+		return fmt.Errorf("Adding OutputDevice %v failed.", dev)
+	}
+
+	v.devs[dev.VIFIndex()] = dev
+
+	return nil
+}
+
+func (v *VRF) routeEntryAdded(entry Route) {
+	// Check if all OutputDevice that appears in Route has already
+	// been registered to the router instance.
+	if len(entry.Nexthops) == 0 {
+		if err := v.registerOutputDevice(entry.Dev); err != nil {
+			logger.Err("%v", err)
+			return
+		}
+	} else {
+		for _, nh := range entry.Nexthops {
+			if err := v.registerOutputDevice(nh.Dev); err != nil {
+				logger.Err("%v", err)
+				return
+			}
+		}
+	}
+
+	noti.Notify(notifier.Add, v, entry)
+}
+
+func (v *VRF) routeEntryDeleted(entry Route) {
+	// TODO: Remove unused VRF from the router instance
+	noti.Notify(notifier.Delete, v, entry)
+}
+
+func (v *VRF) pbrEntryAdded(entry PBREntry) {
+	for _, nh := range entry.NextHops {
+		if nh.Dev == nil {
+			continue
+		}
+		if err := v.registerOutputDevice(nh.Dev); err != nil {
+			logger.Err("%v", err)
+			return
+		}
+	}
+
+	noti.Notify(notifier.Add, v, entry)
+}
+
+func (v *VRF) pbrEntryDeleted(entry PBREntry) {
+	// TODO: Remove unused VRF from the router instance
+	noti.Notify(notifier.Delete, v, entry)
 }
 
 // GetAllVRF returns a slice of available VRF.
@@ -380,12 +624,4 @@ func GetVRFByIndex(index VRFIndex) *VRF {
 	defer vrfMgr.mutex.Unlock()
 
 	return vrfMgr.byIndex[int(index)]
-}
-
-func init() {
-	vrfMgr = &vrfManager{
-		byName: make(map[string]*VRF),
-		rds:    make(map[uint64]struct{}),
-		re:     regexp.MustCompile(`^vrf\d+$`),
-	}
 }

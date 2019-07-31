@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,6 +21,11 @@ import (
 
 	"github.com/lagopus/vsw/dpdk"
 	"github.com/lagopus/vsw/vswitch"
+	vlog "github.com/lagopus/vsw/vswitch/log"
+)
+
+const (
+	moduleName = "dumb"
 )
 
 var log = vswitch.Logger
@@ -48,7 +53,7 @@ func (dm *DumbModule) Enable() error {
 		return errors.New("Terminated before start")
 	}
 
-	oring := dm.base.Rules().Output(vswitch.MATCH_OUT_VIF)
+	oring := dm.base.Rules().Output(vswitch.MatchOutVIF)
 	if oring == nil {
 		return errors.New("Output ring is not specified.")
 	}
@@ -82,6 +87,12 @@ func (dm *DumbModule) Disable() {
  * Do module registration here.
  */
 func init() {
+	if l, err := vlog.New(moduleName); err == nil {
+		log = l
+	} else {
+		log.Fatalf("Can't create logger: %s", moduleName)
+	}
+
 	if err := vswitch.RegisterModule("dumb", newDumbInstance, nil, vswitch.TypeOther); err != nil {
 		log.Fatalf("Failed to register the class: %v", err)
 	}

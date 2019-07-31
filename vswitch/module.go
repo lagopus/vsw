@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -48,14 +48,21 @@ var moduleTypeString = [...]string{
 
 func (mt ModuleType) String() string { return moduleTypeString[mt] }
 
+func (mt ModuleType) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + mt.String() + `"`), nil
+}
+
 // BaseInstance is a base class of the module instance
 type BaseInstance struct {
-	name     string
-	input    *dpdk.Ring // Default input ring.
-	input2   *dpdk.Ring // Optional input ring. If non-nil, used for Inbound mbufs by VIF.
-	rules    *Rules
-	instance Instance
-	enabled  bool
+	name        string
+	input       *dpdk.Ring // Default input ring.
+	input2      *dpdk.Ring // Optional input ring. If non-nil, used for Inbound mbufs by VIF.
+	rules       *Rules
+	instance    Instance
+	enabled     bool
+	subinstance bool
+	module      *Module
+	counter     *Counter
 }
 
 // RingParam defines a parameter for an input ring.
@@ -65,7 +72,7 @@ type RingParam struct {
 	SecondaryInput bool // Set true to separate inbound and outbound rings. For TypeInterface only.
 }
 
-var defaultRingParam = RingParam{
+var defaultRingParam = &RingParam{
 	Count:          32,
 	SocketId:       dpdk.SOCKET_ID_ANY,
 	SecondaryInput: false,
@@ -80,11 +87,19 @@ type Instance interface {
 	Free()         // Free the instance.
 }
 
-var instanceFactories = make(map[string]InstanceFactory)
-var ringParams = make(map[string]RingParam)
-var moduleTypes = make(map[string]ModuleType)
 var bridgeModuleName = ""
 var routerModuleName = ""
+
+type Module struct {
+	name        string
+	factory     InstanceFactory
+	ringParam   *RingParam
+	moduleType  ModuleType
+	instance    map[string]*BaseInstance
+	subinstance map[string][]*BaseInstance
+}
+
+var modules = make(map[string]*Module)
 
 // RegisterModule registers a module with the given name.
 // Factory returns a module comply to Module interface.
@@ -100,7 +115,7 @@ func RegisterModule(moduleName string, factory InstanceFactory, rp *RingParam, t
 		return errors.New("Only TypeInterface may enable SecondaryInput of RingParam")
 	}
 
-	if instanceFactories[moduleName] != nil {
+	if _, ok := modules[moduleName]; ok {
 		return fmt.Errorf("'%s' already exists. ignoring.", moduleName)
 	}
 
@@ -118,40 +133,57 @@ func RegisterModule(moduleName string, factory InstanceFactory, rp *RingParam, t
 	default:
 	}
 
-	instanceFactories[moduleName] = factory
-	if rp != nil {
-		ringParams[moduleName] = *rp
+	if rp == nil {
+		rp = defaultRingParam
+	} else {
+		rpCopy := rp
+		rp = &RingParam{}
+		*rp = *rpCopy
 	}
 
-	moduleTypes[moduleName] = t
+	modules[moduleName] = &Module{
+		name:       moduleName,
+		factory:    factory,
+		moduleType: t,
+		ringParam:  rp,
+		instance:   make(map[string]*BaseInstance),
+	}
+
 	return nil
+}
+
+func Modules() []*Module {
+	var mods []*Module
+	for _, m := range modules {
+		mods = append(mods, m)
+	}
+	return mods
 }
 
 // NewInstance creates a new instance of the moduleName.
 // The created instance is identified with the given name, and must be unique.
 // Priv is a module specific parameter passed to create an instance.
 func newInstance(moduleName, name string, priv interface{}) (*BaseInstance, error) {
-	factory, found := instanceFactories[moduleName]
+	m, found := modules[moduleName]
 	if !found {
-		return nil, fmt.Errorf("Module '%s' doesn't exist.\n", moduleName)
+		return nil, fmt.Errorf("No such module: %s", moduleName)
 	}
 
-	rp, ok := ringParams[moduleName]
-	if !ok {
-		rp = defaultRingParam
+	if _, exists := m.instance[name]; exists {
+		return nil, fmt.Errorf("%s already exists in %s", name, moduleName)
 	}
 
-	bi := &BaseInstance{name: name}
+	bi := &BaseInstance{name: name, module: m, subinstance: false}
 
 	ringName := fmt.Sprintf("input-%s", name)
-	bi.input = dpdk.RingCreate(ringName, rp.Count, rp.SocketId, dpdk.RING_F_SC_DEQ)
+	bi.input = dpdk.RingCreate(ringName, m.ringParam.Count, m.ringParam.SocketId, dpdk.RING_F_SC_DEQ)
 	if bi.input == nil {
 		return nil, fmt.Errorf("Input ring creation faild for %s.\n", name)
 	}
 
-	if rp.SecondaryInput {
+	if m.ringParam.SecondaryInput {
 		ringName := fmt.Sprintf("input2-%s", name)
-		bi.input2 = dpdk.RingCreate(ringName, rp.Count, rp.SocketId, dpdk.RING_F_SC_DEQ)
+		bi.input2 = dpdk.RingCreate(ringName, m.ringParam.Count, m.ringParam.SocketId, dpdk.RING_F_SC_DEQ)
 		if bi.input2 == nil {
 			return nil, fmt.Errorf("Second input ring creation failed for %s", name)
 		}
@@ -159,11 +191,22 @@ func newInstance(moduleName, name string, priv interface{}) (*BaseInstance, erro
 
 	bi.rules = newRules()
 
-	instance, err := factory(bi, priv)
+	if m.moduleType == TypeInterface {
+		bi.counter = NewCounter()
+	}
+
+	instance, err := m.factory(bi, priv)
 	if err != nil {
 		return nil, fmt.Errorf("Creating module '%s' with name '%s' failed: %v\n", moduleName, name, err)
 	}
 	bi.instance = instance
+
+	// Set rule observer, if the module complies to RulesNotify.
+	if rn, ok := instance.(RulesNotify); ok {
+		bi.rules.setRulesNotify(rn)
+	}
+
+	m.instance[name] = bi
 
 	return bi, nil
 }
@@ -171,14 +214,24 @@ func newInstance(moduleName, name string, priv interface{}) (*BaseInstance, erro
 // newSubInstance creates a new subinstance that inherits input ring from the parent.
 // This function is used to create a VIF from Interfaces.
 func newSubInstance(parent *BaseInstance, name string) *BaseInstance {
-	bi := &BaseInstance{
-		name:     name,
-		input:    parent.input,
-		input2:   parent.input2,
-		rules:    newRules(),
-		enabled:  false,
-		instance: parent.instance,
+	si := parent.module.subinstance
+	if si == nil {
+		si = make(map[string][]*BaseInstance)
+		parent.module.subinstance = si
 	}
+
+	bi := &BaseInstance{
+		name:        name,
+		input:       parent.input,
+		input2:      parent.input2,
+		rules:       newRules(),
+		enabled:     false,
+		subinstance: true,
+		instance:    parent.instance,
+		module:      parent.module,
+	}
+
+	si[parent.name] = append(si[parent.name], bi)
 	return bi
 }
 
@@ -209,9 +262,34 @@ func (bi *BaseInstance) SecondaryInput() *dpdk.Ring {
 	return bi.input2
 }
 
+// Outbound returns an input ring for outbounds packets, i.e. Lagopus to external.
+// Returned ring is same as the one returned by Input.
+// Used by TypeInterface Only.
+func (bi *BaseInstance) Outbound() *dpdk.Ring {
+	return bi.input
+}
+
+// Inbound returns an input ring for inbounds packets, i.e. external to Lagopus.
+// If the underlying interface supports secondary input, then secondary input ring is returned.
+// Otherwise, the ring same as Outbound is returned.
+// Used by TypeInterface Only.
+func (bi *BaseInstance) Inbound() *dpdk.Ring {
+	if bi.input2 != nil {
+		return bi.input2
+	}
+	return bi.input
+}
+
 // Rules returns output rule of the module.
 func (bi *BaseInstance) Rules() *Rules {
 	return bi.rules
+}
+
+// Counter returns an instance of Counter.
+// Only TypeInterface has the valid instance.
+// For other types, the value is always nil.
+func (bi *BaseInstance) Counter() *Counter {
+	return bi.counter
 }
 
 // Name returns the name of this module instance.
@@ -250,4 +328,39 @@ func (bi *BaseInstance) free() {
 	}
 	bi.instance.Free()
 	bi.input.Free()
+
+	delete(bi.module.instance, bi.name)
+}
+
+func (m *Module) Name() string {
+	return m.name
+}
+
+func (m *Module) Type() ModuleType {
+	return m.moduleType
+}
+
+func (m *Module) Instances() []string {
+	var instances []string
+	for name := range m.instance {
+		instances = append(instances, name)
+	}
+	return instances
+}
+
+func (m *Module) Subinstances(name string) []string {
+	if m.subinstance == nil {
+		return nil
+	}
+
+	si, ok := m.subinstance[name]
+	if !ok {
+		return nil
+	}
+
+	var subinstances []string
+	for _, s := range si {
+		subinstances = append(subinstances, s.name)
+	}
+	return subinstances
 }

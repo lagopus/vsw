@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -58,10 +58,8 @@ func (sad *CSADOutbound) PullAcquired() (err error) {
 				if uint32(acq.sp_entry_id) != 0 {
 					ver := int(acq.ip_ver)
 					entryID := uint32(acq.sp_entry_id)
-					src := ipAddr2ipNet(ver, acq.src, nil) // TBD: mask
-					dst := ipAddr2ipNet(ver, acq.dst, nil) // TBD: mask
-					//log.Printf("pull acquired: dir=%v, ver=%d, ID=%d,  src=%s, dst=%s\n",
-					//  sad.dir, ver, entryID, src, dst)
+					src := ipAddr2ipNet(ver, acq.src, nil) // mask is nil
+					dst := ipAddr2ipNet(ver, acq.dst, nil) // mask is nil
 					if sad.acquireFunc != nil {
 						ret := sad.acquireFunc(sad.vrfIndex, entryID, &src, &dst)
 						if ret == false {

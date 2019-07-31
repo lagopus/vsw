@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Nippon Telegraph and Telephone Corporation.
+// Copyright 2018-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/lagopus/vsw/dpdk"
 	"github.com/lagopus/vsw/utils/notifier"
@@ -65,13 +66,28 @@ type InterfaceInstance interface {
 	SetNativeVID(vid VID) error
 }
 
+type CounterUpdater interface {
+	// UpdateCounter updates Counter value.
+	UpdateCounter()
+}
+
+type LinkStatuser interface {
+	// LinkStatus returns the status of link.
+	// Returns true on UP, and false on DOWN.
+	LinkStatus() bool
+}
+
 type Interface struct {
-	name     string
-	vids     map[VID]*VIF
-	vifs     []*VIF
-	base     *BaseInstance
-	mac      macAddress
-	instance InterfaceInstance
+	name       string
+	driver     string
+	private    interface{}
+	vids       map[VID]*VIF
+	vifs       []*VIF
+	base       *BaseInstance
+	mac        macAddress
+	instance   InterfaceInstance
+	tunnel     *L2Tunnel
+	lastChange time.Time
 }
 
 type VLANMode int
@@ -88,15 +104,32 @@ func (v VLANMode) String() string {
 	return "TRUNK"
 }
 
-var interfaceMutex sync.Mutex
-var interfaces = make(map[string]*Interface)
+func (v VLANMode) MarshalJSON() ([]byte, error) {
+	if v == AccessMode {
+		return []byte(`"access"`), nil
+	}
+	return []byte(`"trunk"`), nil
+}
+
+type ifManager struct {
+	mutex sync.Mutex
+	ifs   map[string]*Interface
+}
+
+var ifMgr = &ifManager{ifs: make(map[string]*Interface)}
 
 func NewInterface(driver, name string, priv interface{}) (*Interface, error) {
-	interfaceMutex.Lock()
-	defer interfaceMutex.Unlock()
+	ifMgr.mutex.Lock()
+	defer ifMgr.mutex.Unlock()
 
-	if _, exists := interfaces[name]; exists {
+	if _, exists := ifMgr.ifs[name]; exists {
 		return nil, fmt.Errorf("Interface %v already exists", name)
+	}
+
+	// Check tunnel config first
+	tunnel, ok := priv.(*L2Tunnel)
+	if ok && tunnel.VRF() == nil {
+		return nil, fmt.Errorf("L2 tunnel %v is not associated with VRF", name)
 	}
 
 	base, err := newInstance(driver, name, priv)
@@ -111,11 +144,14 @@ func NewInterface(driver, name string, priv interface{}) (*Interface, error) {
 	}
 
 	iface := &Interface{
-		name:     name,
-		vids:     make(map[VID]*VIF),
-		base:     base,
-		mac:      macAddress(instance.MACAddress()),
-		instance: instance,
+		name:       name,
+		driver:     driver,
+		private:    priv,
+		vids:       make(map[VID]*VIF),
+		base:       base,
+		mac:        macAddress(instance.MACAddress()),
+		instance:   instance,
+		lastChange: time.Now(),
 	}
 
 	if iface.mac == nil {
@@ -132,7 +168,24 @@ func NewInterface(driver, name string, priv interface{}) (*Interface, error) {
 		}
 	}
 
-	interfaces[name] = iface
+	ifMgr.ifs[name] = iface
+
+	// Checks for L2 Tunnel
+	if tunnel != nil {
+		iface.tunnel = tunnel
+
+		if tn, ok := base.instance.(L2TunnelNotify); ok {
+			tunnel.setNotify(tn)
+		} else {
+			logger.Warning("%s should be L2 Tunnel. But doesn't support L2TunnelNotify.", name)
+		}
+
+		if err := tunnel.VRF().addL2Tunnel(iface); err != nil {
+			iface.mac.free()
+			base.free()
+			return nil, fmt.Errorf("Can't connect L2 tunnel to VRF: %v", err)
+		}
+	}
 
 	return iface, nil
 }
@@ -153,13 +206,25 @@ func (i *Interface) freeAllVIF() {
 }
 
 func (i *Interface) Free() {
-	interfaceMutex.Lock()
-	defer interfaceMutex.Unlock()
+	ifMgr.mutex.Lock()
+	defer ifMgr.mutex.Unlock()
 
 	i.freeAllVIF()
 	i.base.free()
 	i.mac.free()
-	delete(interfaces, i.name)
+	delete(ifMgr.ifs, i.name)
+}
+
+func (i *Interface) Driver() string {
+	return i.driver
+}
+
+func (i *Interface) Private() interface{} {
+	return i.private
+}
+
+func (i *Interface) LastChange() time.Time {
+	return i.lastChange
 }
 
 func (i *Interface) IsEnabled() bool {
@@ -167,10 +232,12 @@ func (i *Interface) IsEnabled() bool {
 }
 
 func (i *Interface) Enable() error {
+	i.lastChange = time.Now()
 	return i.base.enable()
 }
 
 func (i *Interface) Disable() {
+	i.lastChange = time.Now()
 	i.base.disable()
 }
 
@@ -213,9 +280,14 @@ func (i *Interface) NewVIF(index uint32) (*VIF, error) {
 	return vif, nil
 }
 
-// NewTunnel creates VIF for IP Tunnel wight the given index.
-// Tunnel shall not be nil.
-func (i *Interface) NewTunnel(index uint32, tunnel *Tunnel) (*VIF, error) {
+// NewTunnel creates VIF for L3 Tunnel wight the given index.
+// L3Tunnel shall not be nil.
+func (i *Interface) NewTunnel(index uint32, tunnel *L3Tunnel) (*VIF, error) {
+	// L2 Tunnel and L3 Tunnel doesn't coexist
+	if i.tunnel != nil {
+		return nil, errors.New("Interface is set up for L2 Tunnel")
+	}
+
 	if tunnel == nil {
 		return nil, errors.New("Tunnel details is not given")
 	}
@@ -226,6 +298,7 @@ func (i *Interface) NewTunnel(index uint32, tunnel *Tunnel) (*VIF, error) {
 	}
 
 	vif.setTunnel(tunnel)
+
 	if err := i.initVIF(vif); err != nil {
 		vif.Free()
 		return nil, err
@@ -246,9 +319,7 @@ func (i *Interface) deleteVIF(vif *VIF) {
 	}
 }
 func (i *Interface) VIF() []*VIF {
-	v := make([]*VIF, len(i.vifs))
-	copy(v, i.vifs)
-	return v
+	return append([]*VIF(nil), i.vifs...)
 }
 
 func (i *Interface) SetMACAddress(mac net.HardwareAddr) error {
@@ -264,6 +335,7 @@ func (i *Interface) SetMACAddress(mac net.HardwareAddr) error {
 	for _, v := range i.vifs {
 		noti.Notify(notifier.Update, v, mac)
 	}
+	i.lastChange = time.Now()
 	return nil
 }
 
@@ -284,8 +356,14 @@ func (i *Interface) SetMTU(mtu MTU) error {
 		return err
 	}
 	for _, v := range i.vifs {
+		if v.vsi != nil {
+			if err := v.vsi.UpdateMTU(v); err != nil {
+				logger.Err("Failed to update MTU.(vif: %v, mtu: %v)", v, mtu)
+			}
+		}
 		noti.Notify(notifier.Update, v, mtu)
 	}
+	i.lastChange = time.Now()
 	return nil
 }
 
@@ -303,13 +381,17 @@ func (i *Interface) SetInterfaceMode(mode VLANMode) error {
 	if mode == i.instance.InterfaceMode() {
 		return nil
 	}
+
 	i.freeAllVIF()
 	for vid := range i.vids {
 		if err := i.instance.DeleteVID(vid); err != nil {
+			// FIXME: We can't do anything here
 			return err
 		}
 		delete(i.vids, vid)
 	}
+
+	i.lastChange = time.Now()
 	return i.instance.SetInterfaceMode(mode)
 }
 
@@ -331,6 +413,7 @@ func (i *Interface) AddVID(vid VID) error {
 		return err
 	}
 	i.vids[vid] = nil
+	i.lastChange = time.Now()
 	return nil
 }
 
@@ -344,6 +427,7 @@ func (i *Interface) DeleteVID(vid VID) error {
 		return err
 	}
 	delete(i.vids, vid)
+	i.lastChange = time.Now()
 	return nil
 
 }
@@ -352,6 +436,7 @@ func (i *Interface) SetNativeVID(vid VID) error {
 	if i.instance.InterfaceMode() != TrunkMode {
 		return errors.New("Interface mode is not TRUNK")
 	}
+	i.lastChange = time.Now()
 	return i.instance.SetNativeVID(vid)
 }
 
@@ -371,4 +456,62 @@ func (i *Interface) freeVID(vid VID, vif *VIF) bool {
 
 	i.vids[vid] = nil
 	return true
+}
+
+func (i *Interface) Tunnel() *L2Tunnel {
+	return i.tunnel
+}
+
+// Inbound returns an input ring for inbounds packets, i.e. external to Lagopus.
+// If the underlying interface supports secondary input, then secondary input ring is returned.
+// Otherwise, the ring same as Outbound is returned.
+func (i *Interface) Inbound() *dpdk.Ring {
+	return i.base.Inbound()
+}
+
+func (i *Interface) connect(dst *dpdk.Ring, match VswMatch, param interface{}) error {
+	return i.base.connect(dst, match, param)
+}
+
+func (i *Interface) disconnect(match VswMatch, param interface{}) error {
+	return i.base.disconnect(match, param)
+}
+
+func (i *Interface) String() string {
+	return i.name
+}
+
+func (i *Interface) Counter() *Counter {
+	if cu, ok := i.instance.(CounterUpdater); ok {
+		cu.UpdateCounter()
+	}
+	return i.base.Counter()
+}
+
+func (i *Interface) LinkStatus() (bool, error) {
+	if ls, ok := i.instance.(LinkStatuser); ok {
+		return ls.LinkStatus(), nil
+	}
+	return false, errors.New("Link status unknown")
+}
+
+// Interfaces returns a slice of all registered Interface.
+func Interfaces() []*Interface {
+	ifMgr.mutex.Lock()
+	defer ifMgr.mutex.Unlock()
+
+	var ifs []*Interface
+	for _, i := range ifMgr.ifs {
+		ifs = append(ifs, i)
+	}
+	return ifs
+}
+
+// GetInterface returns an Interface with the given name.
+// Returns nil if no interface is found with the name.
+func GetInterface(name string) *Interface {
+	ifMgr.mutex.Lock()
+	defer ifMgr.mutex.Unlock()
+
+	return ifMgr.ifs[name]
 }

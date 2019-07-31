@@ -1,7 +1,7 @@
 // +build ignore
 
 /*
- * Copyright 2017 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,6 +34,7 @@ struct ifaces {
   struct ifaces_attr attr[2];
   rte_atomic64_t seq;
   uint64_t current;
+  iface_stats_t stats[VIF_MAX_ENTRY];
 };
 
 static struct iface default_iface = {
@@ -52,7 +53,7 @@ ifaces_alloc(struct ifaces **ifaces) {
     *ifaces = (struct ifaces *) calloc(1, sizeof(struct ifaces));
     if (*ifaces == NULL) {
       ret = LAGOPUS_RESULT_NO_MEMORY;
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
       goto done;
     }
 
@@ -67,7 +68,7 @@ ifaces_alloc(struct ifaces **ifaces) {
     ret = LAGOPUS_RESULT_OK;
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
 done:
@@ -95,7 +96,7 @@ ifaces_pre_process(struct ifaces *ifaces, struct iface_list **active_ifaces) {
     ret = LAGOPUS_RESULT_OK;
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
@@ -111,7 +112,7 @@ ifaces_post_process(struct ifaces *ifaces) {
     ret = LAGOPUS_RESULT_OK;
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
@@ -122,14 +123,16 @@ ifaces_finalize(struct ifaces **ifaces) {
   ifaces_free(ifaces);
 }
 
-static inline void
+static inline lagopus_result_t
 ifaces_initialize(struct ifaces **ifaces) {
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
   if ((ret = ifaces_alloc(ifaces)) != LAGOPUS_RESULT_OK) {
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
     ifaces_finalize(ifaces);
-    rte_exit(EXIT_FAILURE, "Can't initialize ifaces.\n");
+    return ret;
   }
+
+  return LAGOPUS_RESULT_OK;
 }
 
 /* public. */
@@ -141,7 +144,6 @@ ifaces_push_config(struct ifaces *ifaces,
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
   uint64_t next_modified;
   size_t i;
-  struct iface *iface;
   struct ifaces_attr *attr;
 
   if (ifaces != NULL && num_iface_array <= VIF_MAX_ENTRY) {
@@ -149,19 +151,21 @@ ifaces_push_config(struct ifaces *ifaces,
     if (rte_atomic16_read(&IFACES_GET_ATTR(ifaces, next_modified).refs) == 0) {
       attr = &IFACES_GET_ATTR(ifaces, next_modified);
 
+      /* clear list of iface. */
+      TAILQ_INIT(&attr->active_ifaces);
+
       /* copy array of iface. */
       memcpy(&attr->all_ifaces, iface_array, num_iface_array);
-
-      /* clear list of iface. */
-      while ((iface = TAILQ_FIRST(&attr->active_ifaces)) != NULL) {
-        TAILQ_REMOVE(&attr->active_ifaces, iface, entry);
-      }
 
       /* insert list of iface. */
       for (i = 0; i < num_iface_array; i++) {
         if (attr->all_ifaces[i].input != NULL &&
             attr->all_ifaces[i].output != NULL) {
           TAILQ_INSERT_TAIL(&attr->active_ifaces, &attr->all_ifaces[i], entry);
+        } else {
+          /* reset stats. */
+          memset(&ifaces->stats[i], 0,
+                 sizeof(iface_stats_t));
         }
       }
 
@@ -173,11 +177,32 @@ ifaces_push_config(struct ifaces *ifaces,
     }
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
 
+}
+
+static inline iface_stats_t *
+ifaces_get_stats_internal(struct ifaces *ifaces, vifindex_t vif_index) {
+  if (likely(ifaces != NULL)) {
+    return &ifaces->stats[vif_index];
+  }
+  return NULL;
+}
+
+lagopus_result_t
+ifaces_get_stats(struct ifaces *ifaces, vifindex_t vif_index,
+                 iface_stats_t **stats) {
+  iface_stats_t *s;
+
+  s = ifaces_get_stats_internal(ifaces, vif_index);
+  if (likely(s != NULL)) {
+    *stats = s;
+    return LAGOPUS_RESULT_OK;
+  }
+  return LAGOPUS_RESULT_INVALID_OBJECT;
 }
 
 struct iface *
@@ -201,10 +226,18 @@ ifaces_free_array(struct iface *iface_array) {
 
 /* iface. */
 
-static inline uint8_t
+static inline vrfindex_t
 iface_get_vrf_index(struct iface *iface) {
   if (likely(iface != NULL)) {
     return iface->vrf_index;
+  }
+  return 0;
+}
+
+static inline vifindex_t
+iface_get_vif_index(struct iface *iface) {
+  if (likely(iface != NULL)) {
+    return iface->vif_index;
   }
   return 0;
 }

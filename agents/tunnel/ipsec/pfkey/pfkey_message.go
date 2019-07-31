@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,8 +20,9 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"log"
 	"syscall"
+
+	"github.com/lagopus/vsw/modules/tunnel/log"
 )
 
 type msgMap map[uint16]interface{}
@@ -67,9 +68,20 @@ func (s *SadbBaseMsg) ParseSadbMsg(r io.Reader) error {
 			s, _ := msg[sadbExt.SadbExtType].(**Policy)
 			*s = &Policy{SadbXPolicyLen: sadbExt.SadbExtLen}
 			err = (*s).Deserialize(r)
+		case SADB_X_EXT_NAT_T_TYPE:
+			s, _ := msg[sadbExt.SadbExtType].(**SadbXNatTType)
+			*s = &SadbXNatTType{}
+			err = (*s).Deserialize(r)
+		case SADB_X_EXT_NAT_T_SPORT:
+			s, _ := msg[sadbExt.SadbExtType].(**SadbXNatTPort)
+			*s = &SadbXNatTPort{}
+			err = (*s).Deserialize(r)
+		case SADB_X_EXT_NAT_T_DPORT:
+			s, _ := msg[sadbExt.SadbExtType].(**SadbXNatTPort)
+			*s = &SadbXNatTPort{}
+			err = (*s).Deserialize(r)
 		default:
-			log.Printf("unknown type: ")
-			log.Println(sadbExt.SadbExtType)
+			log.Logger.Err("unknown type: %v", sadbExt.SadbExtType)
 			err = syscall.EINVAL
 		}
 		if err != nil {
@@ -96,6 +108,9 @@ type SadbBaseMsg struct {
 	SadbSPIRange    *SadbSPIRange
 	SadbXSa2        *SadbXSa2 /* optional */
 	Policy          *Policy
+	NatTType        *SadbXNatTType
+	NatTSrcPort     *SadbXNatTPort
+	NatTDstPort     *SadbXNatTPort
 }
 
 func (s *SadbBaseMsg) getMsgMap() msgMap {
@@ -115,6 +130,9 @@ func (s *SadbBaseMsg) getMsgMap() msgMap {
 		SADB_EXT_SPIRANGE:         &s.SadbSPIRange,
 		SADB_X_EXT_SA2:            &s.SadbXSa2,
 		SADB_X_EXT_POLICY:         &s.Policy,
+		SADB_X_EXT_NAT_T_TYPE:     &s.NatTType,
+		SADB_X_EXT_NAT_T_SPORT:    &s.NatTSrcPort,
+		SADB_X_EXT_NAT_T_DPORT:    &s.NatTDstPort,
 	}
 }
 
@@ -147,32 +165,32 @@ func HandlePfkey(r io.Reader, w io.Writer, msgMux MsgMux) (*SadbMsg, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("smsg: len: %d %#v.\n", l, b[:SadbMsgLen])
+	log.Logger.Info("smsg: len: %d %#v", l, b[:SadbMsgLen])
 	s := SadbMsg{}
 	err = s.Deserialize(bytes.NewBuffer(b[:SadbMsgLen]))
 	if err != nil {
-		log.Printf("err %#v.\n", err)
+		log.Logger.Err("err %#v", err)
 		return nil, err
 	}
 	// TODO: sadb msg checking.
 	buf := bytes.NewBuffer(b[SadbMsgLen:toByteLen(s.SadbMsgLen)])
-	log.Printf("received sadb msg: %s len: %d seq: %d pid: %d.\n",
+	log.Logger.Info("received sadb msg: %s len: %d seq: %d pid: %d",
 		SadbMsgTypes[s.SadbMsgType], toByteLen(s.SadbMsgLen), s.SadbMsgSeq, s.SadbMsgPid)
-	log.Println("sadb msg base:")
-	log.Printf("%#v\n", b[SadbMsgLen:toByteLen(s.SadbMsgLen)])
+	log.Logger.Info("sadb msg base:")
+	log.Logger.Info("%#v", b[SadbMsgLen:toByteLen(s.SadbMsgLen)])
 	smsg, ok := msgMux[s.SadbMsgType]
 	if !ok {
-		log.Printf("don't support type %d.\n", s.SadbMsgType)
+		log.Logger.Err("don't support type %d", s.SadbMsgType)
 		return nil, fmt.Errorf("don't support type %d", s.SadbMsgType)
 	}
 	err = smsg.Parse(buf)
 	if err != nil {
-		log.Printf("parse err: %v.\n", err)
+		log.Logger.Err("parse err: %v", err)
 		return nil, fmt.Errorf("parse err: %v", err)
 	}
 	err = smsg.Handle(w, &s)
 	if err != nil {
-		log.Printf("handle err: %v.\n", err)
+		log.Logger.Err("handle err: %v", err)
 		return nil, fmt.Errorf("handle err: %v", err)
 	}
 	return &s, err

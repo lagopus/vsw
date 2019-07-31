@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
  */
 
 #include "lagopus_apis.h"
-
+#include "tunnel.h"
 #include "module.h"
 
 static lagopus_hashmap_t moduleconf_hashmap = NULL;
@@ -31,7 +31,7 @@ moduleconf_register(struct moduleconf *conf) {
                                 LAGOPUS_HASHMAP_TYPE_STRING,
                                 NULL);
     if (rv != LAGOPUS_RESULT_OK) {
-      lagopus_perror(rv);
+      TUNNEL_PERROR(rv);
       return;
     }
     inited = true;
@@ -40,10 +40,10 @@ moduleconf_register(struct moduleconf *conf) {
   if ((rv = lagopus_hashmap_add(&moduleconf_hashmap,
                                 (void *)conf->name, &val, false)) !=
       LAGOPUS_RESULT_OK) {
-    lagopus_perror(rv);
+    TUNNEL_PERROR(rv);
     return;
   }
-  printf("module %s registered\n", conf->name);
+  TUNNEL_DEBUG("module %s registered", conf->name);
 }
 
 void
@@ -62,7 +62,7 @@ moduleconf_getconf(const char *name) {
   if ((rv = lagopus_hashmap_find(&moduleconf_hashmap,
                                  (void *) name, (void **)&conf)) !=
       LAGOPUS_RESULT_OK) {
-    lagopus_perror(rv);
+    TUNNEL_PERROR(rv);
     return NULL;
   }
   return conf;

@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 package dpdk
 
 /*
-#cgo CFLAGS: -I/usr/local/include/dpdk -m64 -pthread -O3 -msse4.2
-#cgo LDFLAGS: -L/usr/local/lib -ldpdk -ldl
+#cgo CFLAGS: -m64 -pthread -O3 -msse4.2
+#cgo LDFLAGS:
 */
 import "C"

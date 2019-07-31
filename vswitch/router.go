@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Nippon Telegraph and Telephone Corporation.
+// Copyright 2018-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,6 +26,10 @@ import (
 type RouterInstance interface {
 	AddVIF(*VIF) error
 	DeleteVIF(*VIF) error
+	AddOutputDevice(OutputDevice) error
+	DeleteOutputDevice(OutputDevice) error
+	EnableNAPT(*VIF) error
+	DisableNAPT(*VIF) error
 }
 
 type router struct {
@@ -81,7 +85,7 @@ func (r *router) disconnect(match VswMatch, param interface{}) error {
 }
 
 func (r *router) addVIF(vif *VIF) error {
-	// XXX: We may want to use MATCH_OUT_VIF rule.
+	// XXX: We may want to use MatchOutVIF rule.
 	if err := r.instance.AddVIF(vif); err != nil {
 		return err
 	}
@@ -89,16 +93,6 @@ func (r *router) addVIF(vif *VIF) error {
 	// XXX: We should use BaseInstance.connect() (same for bridge)
 	if vif.Output() == nil {
 		if err := vif.setOutput(r.base.input); err != nil {
-			r.instance.DeleteVIF(vif)
-			return err
-		}
-	}
-
-	// For IP Tunnel
-	if t := vif.Tunnel(); t != nil {
-		// Forward inbound packets to VIF
-		if err := r.base.connect(vif.Inbound(), MATCH_IPV4_PROTO, t.IPProto()); err != nil {
-			vif.setOutput(nil)
 			r.instance.DeleteVIF(vif)
 			return err
 		}
@@ -112,9 +106,25 @@ func (r *router) deleteVIF(vif *VIF) {
 
 	// For IP Tunnel
 	if t := vif.Tunnel(); t != nil {
-		r.disconnect(MATCH_IPV4_PROTO, t.IPProto())
-
-		// XXX: We should use BaseInstance.disconnect() (same for bridge)
-		vif.setOutput(nil)
+		r.disconnect(MatchIPv4Proto, t.IPProto())
 	}
+
+	// XXX: We should use BaseInstance.disconnect() (same for bridge)
+	vif.setOutput(nil)
+}
+
+func (r *router) addOutputDevice(dev OutputDevice) error {
+	return r.instance.AddOutputDevice(dev)
+}
+
+func (r *router) deleteOutputDevice(dev OutputDevice) error {
+	return r.instance.DeleteOutputDevice(dev)
+}
+
+func (r *router) enableNAPT(vif *VIF) error {
+	return r.instance.EnableNAPT(vif)
+}
+
+func (r *router) disableNAPT(vif *VIF) error {
+	return r.instance.DisableNAPT(vif)
 }

@@ -43,7 +43,6 @@ libtool
 config.*
 !config.go
 aclocal.m4
-Makefile
 ar-lib
 autom4te.cache/
 *.log

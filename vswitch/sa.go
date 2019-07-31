@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Nippon Telegraph and Telephone Corporation.
+// Copyright 2018-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -45,7 +45,9 @@ type SA struct {
 	AuthKey           string     // authentication key-str
 	Encrypt           ESPEncrypt // encryption
 	EncKey            string     // encryption key-str
-	VRF               *VRF       // Corresponding VRF
+	EncapProtocol     IPProto    // encap-protocol
+	EncapSrcPort      uint16     // encap-src-port
+	EncapDstPort      uint16     // encap-dst-port
 }
 
 // Security Policy Entry
@@ -61,13 +63,14 @@ type SP struct {
 	SecurityProtocol IPProto   // security-protocol
 	Priority         int32     // priority
 	Policy           Policy    // policy
-	VRF              *VRF      // Corresponding VRF
 }
 
 func (sa SA) String() string {
-	return fmt.Sprintf("SPI=%d Mode=%v LifeTimeInSeconds=%d LifeTimeInByte=%d LocalPeer=%v RemotePeer=%v Auth=%v(%s) Encrypt=%v(%s)",
-		sa.SPI, sa.Mode, sa.LifeTimeInSeconds, sa.LifeTimeInByte, sa.LocalPeer, sa.RemotePeer,
-		sa.Auth, sa.AuthKey, sa.Encrypt, sa.EncKey)
+	return fmt.Sprintf("SPI=%d Mode=%v LifeTimeInSeconds=%d LifeTimeInByte=%d "+
+		"LocalPeer=%v RemotePeer=%v Auth=%v(%s) Encrypt=%v(%s) Encap=%v(src: %d, dst: %d)",
+		sa.SPI, sa.Mode, sa.LifeTimeInSeconds, sa.LifeTimeInByte,
+		sa.LocalPeer, sa.RemotePeer, sa.Auth, sa.AuthKey, sa.Encrypt, sa.EncKey,
+		sa.EncapProtocol, sa.EncapSrcPort, sa.EncapDstPort)
 
 }
 
@@ -112,6 +115,10 @@ func (e SAMode) String() string {
 	return s[e]
 }
 
+func (e SAMode) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + e.String() + `"`), nil
+}
+
 // IPsec Authentication Algorithm
 type ESPAuth int
 
@@ -130,6 +137,10 @@ func (e ESPAuth) String() string {
 	return s[e]
 }
 
+func (e ESPAuth) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + e.String() + `"`), nil
+}
+
 // IPsec Encryption Algorithm
 type ESPEncrypt int
 
@@ -137,6 +148,7 @@ const (
 	EncryptUndefined ESPEncrypt = iota
 	EncryptNULL
 	EncryptAES
+	EncryptGCM
 )
 
 func (e ESPEncrypt) String() string {
@@ -144,8 +156,13 @@ func (e ESPEncrypt) String() string {
 		EncryptUndefined: "undefiend",
 		EncryptNULL:      "null",
 		EncryptAES:       "aes-128-cbc",
+		EncryptGCM:       "aes-128-gcm",
 	}
 	return s[e]
+}
+
+func (e ESPEncrypt) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + e.String() + `"`), nil
 }
 
 type Direction int
@@ -161,6 +178,10 @@ func (d Direction) String() string {
 		Outbound: "outbound",
 	}
 	return s[d]
+}
+
+func (d Direction) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + d.String() + `"`), nil
 }
 
 type Policy int
@@ -180,13 +201,18 @@ func (p Policy) String() string {
 	return s[p]
 }
 
+func (p Policy) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + p.String() + `"`), nil
+}
+
 // NewSA creates new SA entry for the given SPI.
 func NewSA(spi uint32) SA {
 	return SA{
-		SPI:     spi,
-		Mode:    ModeUndefined,
-		Auth:    AuthUndefined,
-		Encrypt: EncryptUndefined,
+		SPI:           spi,
+		Mode:          ModeUndefined,
+		Auth:          AuthUndefined,
+		Encrypt:       EncryptUndefined,
+		EncapProtocol: IPP_NONE,
 	}
 }
 

@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -45,8 +45,8 @@ func mkReqSA(sav *SAValue, stat internalState) *SAValue {
 	return &retv
 }
 
-func mkIPNet(str string) net.IPNet {
-	return net.IPNet{IP: net.ParseIP(str)}
+func mkIP(str string) net.IP {
+	return net.ParseIP(str)
 }
 
 func teardownTest() {

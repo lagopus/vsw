@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2018-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@
 #include "sa.h"
 #include "hash.h"
 #include "ipsecvsw.h"
+#include "dpdk_glue.h"
 
 
 
@@ -35,7 +36,7 @@ typedef struct ipsecvsw_q_record {
   size_t m_n_put_ref;	/* must be equivalent to a # of SAs to be
                          * handled in this Q. */
 
-  const char const m_dev_name[32];
+  const char m_dev_name[32];
   int m_numa_node;
   uint8_t m_dev_id;
   uint16_t m_q_id;
@@ -145,7 +146,7 @@ s_get_auth_enum_string(rte_crypto_auth_t a) {
 
 static inline const char *
 s_get_aead_enum_string(rte_crypto_aead_t a) {
-  if (UNKNOWN_ALGORITHM != a && a < RTE_CRYPTO_AUTH_LIST_END) {
+  if (UNKNOWN_ALGORITHM != a && a < RTE_CRYPTO_AEAD_LIST_END) {
     return rte_crypto_aead_algorithm_strings[a];
   } else {
     return "unknown";
@@ -156,12 +157,12 @@ s_get_aead_enum_string(rte_crypto_aead_t a) {
 static inline void
 s_dump_cdevq(ipsecvsw_cdevq_t q) {
   if (likely(q != NULL)) {
-    lagopus_msg_debug(2, "\tcdev id %u, q id %u, qlen " PFSZ(u)
-                      ", device \"%s\"\n",
-                      q->m_dev_id, q->m_q_id, q->m_n_max_entries,
-                      q->m_dev_name);
+    TUNNEL_DEBUG("\tcdev id %u, q id %u, qlen " PFSZ(u)
+                 ", device \"%s\"",
+                 q->m_dev_id, q->m_q_id, q->m_n_max_entries,
+                 q->m_dev_name);
   } else {
-    lagopus_msg_debug(1, "trying to dump NULL cdevq.\n");
+    TUNNEL_DEBUG("trying to dump NULL cdevq.");
   }
 }
 
@@ -174,7 +175,7 @@ s_dump_cdevq_array(ipsecvsw_cdevq_t *qs, size_t n_qs) {
       s_dump_cdevq(qs[i]);
     }
   } else {
-    lagopus_msg_debug(1, "trying to dump NULL cdevq array.\n");
+    TUNNEL_DEBUG("trying to dump NULL cdevq array.");
   }
 }
 
@@ -185,21 +186,21 @@ s_dump_cdevq_list(cdevq_list_t l) {
              l->m_qs != NULL && l->m_n_qs > 0)) {
     if (l->m_aead == UNKNOWN_ALGORITHM) {
       /* cipher/auth algos. */
-      lagopus_msg_debug(1, "cdevq list: cipher %s, auth %s, # of qs " PFSZ(u)
-                        " :\n",
-                        s_get_cipher_enum_string(l->m_cipher),
-                        s_get_auth_enum_string(l->m_auth),
-                        l->m_n_qs);
+      TUNNEL_DEBUG("cdevq list: cipher %s, auth %s, # of qs " PFSZ(u)
+                   " :",
+                   s_get_cipher_enum_string(l->m_cipher),
+                   s_get_auth_enum_string(l->m_auth),
+                   l->m_n_qs);
     } else {
       /* aead algos. */
-      lagopus_msg_debug(1, "cdevq list: aead %s, # of qs " PFSZ(u)
-                        " :\n",
-                        s_get_aead_enum_string(l->m_aead),
-                        l->m_n_qs);
+      TUNNEL_DEBUG("cdevq list: aead %s, # of qs " PFSZ(u)
+                   " :",
+                   s_get_aead_enum_string(l->m_aead),
+                   l->m_n_qs);
     }
     s_dump_cdevq_array(l->m_qs, l->m_n_qs);
   } else {
-    lagopus_msg_debug(1, "trying to dump NULL cdevq.\n");
+    TUNNEL_DEBUG("trying to dump NULL cdevq.");
   }
 }
 
@@ -466,7 +467,7 @@ s_create_cdevq(const char *name,
       char mp_name[RTE_MEMPOOL_NAMESIZE];
       uint32_t sess_sz;
 
-      sess_sz = rte_cryptodev_get_private_session_size(dev_id);
+      sess_sz = cryptodev_get_private_session_size(dev_id);
       snprintf(mp_name, RTE_MEMPOOL_NAMESIZE,
                "sess_mp_%u_%u_%u", numa_node, dev_id, q_id);
       ret->session_pool = rte_mempool_create(mp_name,
@@ -583,8 +584,9 @@ s_setup_cdev(uint8_t dev_id,
       }
     }
 
-    if (cipher_capa != 0ULL  &&
-        auth_capa != 0ULL) {
+    if ((cipher_capa != 0ULL &&
+        auth_capa != 0ULL) ||
+        aead_capa != 0ULL) {
       struct rte_cryptodev_config conf;
 
       conf.socket_id = rte_cryptodev_socket_id(dev_id);
@@ -619,13 +621,13 @@ s_setup_cdev(uint8_t dev_id,
 
         if (n_qs > 0) {
           if (rte_cryptodev_start(dev_id) == 0) {
-            lagopus_msg_info("cdev %u, total queue %u, driver %s.\n",
-                             dev_id, conf.nb_queue_pairs, driver_name);
+            TUNNEL_INFO("cdev %u, total queue %u, driver %s.",
+                        dev_id, conf.nb_queue_pairs, driver_name);
             ret = (lagopus_result_t)n_qs;
           } else {
             size_t j;
 
-            lagopus_msg_error("can't start cryptodev id %u.\n", dev_id);
+            TUNNEL_ERROR("can't start cryptodev id %u.", dev_id);
             for (j = 0; j < n_qs; j++) {
               s_destroy_cdevq(buf[j]);
               buf[j] = NULL;
@@ -636,7 +638,7 @@ s_setup_cdev(uint8_t dev_id,
           ret = LAGOPUS_RESULT_NOT_FOUND;
         }
       } else {
-        lagopus_msg_error("can't configure cryptodev id %u.\n", dev_id);
+        TUNNEL_ERROR("can't configure cryptodev id %u.", dev_id);
         ret = LAGOPUS_RESULT_NOT_FOUND;
       }
     } else {
@@ -652,7 +654,8 @@ done:
 
 static inline uint64_t
 s_gen_hashkey_with_cipher_auth(rte_crypto_cipher_t c, rte_crypto_auth_t a) {
-  return hash_fnv1a64((uint64_t)s_cipher2uint32(c) << 32 | (uint64_t)s_auth2uint32(a));
+  return hash_fnv1a64((uint64_t)s_cipher2uint32(c) << 32 |
+                      (uint64_t)s_auth2uint32(a));
 }
 
 static inline uint64_t
@@ -807,7 +810,7 @@ s_sort_cdevq_list(void *key, void *val,
       }
     }
   }
-  lagopus_exit_fatal("cdevq list sort failure.\n");
+  TUNNEL_FATAL("cdevq list sort failure.");
 
   /* not reached */
   return false;
@@ -888,17 +891,17 @@ s_setup(void *arg) {
             (ret = s_fill_hash(&s_outbound_q_tbl,
                                &(cdevqs_out[i][0]), n_cdevqs_out[i])) ==
             LAGOPUS_RESULT_OK) {
-          lagopus_msg_info("Added total " PF64(u) " queues into the "
-                           "cryptodev queue scheduler for cdev %u.\n",
-                           n_cdevqs_in[i] + n_cdevqs_out[i], i);
+          TUNNEL_INFO("Added total " PF64(u) " queues into the "
+                      "cryptodev queue scheduler for cdev %u.",
+                      n_cdevqs_in[i] + n_cdevqs_out[i], i);
         } else {
           goto done;
         }
       } else {
         n_cdevqs_in[i] = n_cdevqs_out[i] = 0;
-        lagopus_msg_warning("can't create queue on crypto device %u.\n",
-                            i);
-        lagopus_perror(ret);
+        TUNNEL_WARNING("can't create queue on crypto device %u.",
+                       i);
+        TUNNEL_PERROR(ret);
       }
     }
 
@@ -930,7 +933,7 @@ s_setup(void *arg) {
         (void)s_sort_cdevq_array(s_inbound_qs, s_n_inbound_qs);
         (void)s_sort_cdevq_array(s_outbound_qs, s_n_outbound_qs);
 
-        lagopus_msg_debug(2, "DUMP all cdev queues:\n");
+        TUNNEL_DEBUG("DUMP all cdev queues:");
 
         s_dump_cdevq_array(s_inbound_qs, s_n_inbound_qs);
         s_dump_cdevq_array(s_outbound_qs, s_n_outbound_qs);
@@ -1347,20 +1350,20 @@ s_create_session(pthread_t tid,
     if (likely(ret == LAGOPUS_RESULT_OK)) {
       ret = ipsecvsw_create_session_ctx_body(tid, sa, role, q, ctx_ptr);
       if (likely(ret == LAGOPUS_RESULT_OK)) {
-        if (unlikely(lagopus_log_get_debug_level() > 0)) {
-          lagopus_msg_debug(1, "A session context created for SA %p, "
-                            "session %p.\n",
-                            sa, *ctx_ptr);
+        if (unlikely(TUNNEL_DEBUG_ENABLED)) {
+          TUNNEL_DEBUG("A session context created for SA %p, "
+                       "session %p.",
+                       sa, *ctx_ptr);
         }
       } else {
-        lagopus_perror(ret);
-        lagopus_msg_error("can't create session for SA %p.\n",
-                          sa);
+        TUNNEL_PERROR(ret);
+        TUNNEL_ERROR("can't create session for SA %p.",
+                     sa);
       }
     } else {
-      lagopus_perror(ret);
-      lagopus_msg_error("can't create session for SA %p.\n",
-                        sa);
+      TUNNEL_PERROR(ret);
+      TUNNEL_ERROR("can't create session for SA %p.",
+                   sa);
     }
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
@@ -1382,14 +1385,14 @@ s_dispose_session(pthread_t tid,
              sctx != NULL)) {
     ret = ipsecvsw_dispose_session_ctx_body(sctx, gctx);
     if (likely(ret == LAGOPUS_RESULT_OK)) {
-      if (unlikely(lagopus_log_get_debug_level() > 0)) {
-        lagopus_msg_debug(1, "A session context disposed for "
-                          "session %p.\n", sctx);
+      if (unlikely(TUNNEL_DEBUG_ENABLED)) {
+        TUNNEL_DEBUG("A session context disposed for "
+                     "session %p.", sctx);
       }
     } else {
-      lagopus_perror(ret);
-      lagopus_msg_error("Can't destroy a session contxt for "
-                        "session %p.\n", sctx);
+      TUNNEL_PERROR(ret);
+      TUNNEL_ERROR("Can't destroy a session contxt for "
+                   "session %p.", sctx);
     }
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
@@ -1403,7 +1406,7 @@ s_dispose_session(pthread_t tid,
 
 
 static inline size_t
-s_flush_queue(ipsecvsw_cdevq_t q) {
+s_flush_queue(ipsecvsw_cdevq_t q, iface_stats_t *stats) {
   uint16_t n_put;
   uint16_t n_total_put = 0;
   size_t n_calls = 0;
@@ -1419,6 +1422,7 @@ s_flush_queue(ipsecvsw_cdevq_t q) {
               &(q->m_q_put_entries[n_total_put]),
               (uint16_t)((uint16_t)(q->m_n_cur_entries) - n_total_put));
     n_total_put = (uint16_t)(n_total_put + n_put);
+    n_calls++;
   }
   ret = (size_t)n_total_put;
 
@@ -1426,11 +1430,12 @@ s_flush_queue(ipsecvsw_cdevq_t q) {
     size_t i;
 
     for (i = n_total_put; i < q->m_n_cur_entries; i++) {
+      iface_stats_update_errors(stats);
       rte_pktmbuf_free(q->m_q_put_entries[i]->sym->m_src);
     }
 
     if (unlikely(n_calls >= q->m_n_cur_entries)) {
-      lagopus_msg_error("Too many enqueu retry. Check crypto ops.\n");
+      TUNNEL_ERROR("Too many enqueu retry. Check crypto ops.");
     }
   }
 
@@ -1441,17 +1446,18 @@ s_flush_queue(ipsecvsw_cdevq_t q) {
 
 
 static inline void
-s_put_queue(ipsecvsw_cdevq_t q, rte_cop_t cop) {
+s_put_queue(ipsecvsw_cdevq_t q, rte_cop_t cop, iface_stats_t *stats) {
   q->m_q_put_entries[q->m_n_cur_entries++] = cop;
   if (q->m_n_cur_entries == q->m_n_max_entries) {
-    (void)s_flush_queue(q);
+    (void)s_flush_queue(q, stats);
   }
 }
 
 
 static inline lagopus_result_t
 s_flush_queue_per_thread(pthread_t tid,
-                         ipsecvsw_queue_role_t role) {
+                         ipsecvsw_queue_role_t role,
+                         iface_stats_t *stats) {
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
 
   if (likely(tid != LAGOPUS_INVALID_THREAD &&
@@ -1463,15 +1469,15 @@ s_flush_queue_per_thread(pthread_t tid,
       size_t n = 0;
 
       for (i = 0; i < l->m_n_qs; i++) {
-        n += s_flush_queue(l->m_qs[i]);
+        n += s_flush_queue(l->m_qs[i], stats);
       }
       ret = (lagopus_result_t)n;
     } else {
       /*
        * must not happen.
        */
-      lagopus_exit_fatal("once could enqueue to queues but has "
-                         "no queues at this moment.\n");
+      TUNNEL_FATAL("once could enqueue to queues but has "
+                   "no queues at this moment.");
     }
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
@@ -1487,18 +1493,20 @@ s_put(pthread_t tid,
       ipsecvsw_xform_proc_t pre_xform_proc,
       rte_mbuf_t const pkts[],
       ipsecvsw_session_ctx_t sctxs[],
-      size_t n_pkts) {
+      size_t n_pkts,
+      iface_stats_t *stats) {
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
 
   if (likely(tid != LAGOPUS_INVALID_THREAD &&
              pre_xform_proc != NULL &&
-             pkts != NULL && sctxs != NULL && n_pkts > 0)) {
+             pkts != NULL && sctxs != NULL && n_pkts > 0 &&
+             stats != NULL)) {
     struct ipsec_mbuf_metadata *priv;
     ipsec_sa_t sa;
     ipsecvsw_session_ctx_t ctx = NULL;
     size_t i;
     size_t n = 0;
-    int xform_ret;
+    int xform_ret = 0;
 
     if (likely(n_pkts <= (size_t)USHRT_MAX)) {
       for (i = 0; i < n_pkts; i++) {
@@ -1530,13 +1538,18 @@ s_put(pthread_t tid,
           priv->cop.sym->m_src = NULL;
           if (likely((xform_ret = pre_xform_proc(pkts[i], sa, &(priv->cop)))
                      == 0)) {
-            s_put_queue(ctx->m_q, &(priv->cop));
+            s_put_queue(ctx->m_q, &(priv->cop), stats);
             ipsecvsw_session_ctx_incref(ctx);
             n++;
           } else {
-            lagopus_msg_error("pre xform function '%s' returns %d.\n",
-                              ipsecvsw_get_xform_funcname(pre_xform_proc),
-                              xform_ret);
+            TUNNEL_ERROR("pre xform function '%s' returns %d.",
+                         ipsecvsw_get_xform_funcname(pre_xform_proc),
+                         xform_ret);
+            if (xform_ret == -EPROTONOSUPPORT) {
+              iface_stats_update_unknown_protos(stats);
+            } else {
+              iface_stats_update_errors(stats);
+            }
             rte_pktmbuf_free(pkts[i]);
             continue;
           }
@@ -1544,21 +1557,22 @@ s_put(pthread_t tid,
           if (ctx != NULL &&
               ctx->m_q != NULL &&
               ctx->m_q->m_put_tid != tid) {
-            lagopus_msg_error("SA/cdevq is not acquired for this thread.\n");
+            TUNNEL_ERROR("SA/cdevq is not acquired for this thread.");
           } else if (ctx != NULL &&
                      ctx->m_q == NULL) {
-            lagopus_msg_error("cdevq is not acquired for this SA.\n");
+            TUNNEL_ERROR("cdevq is not acquired for this SA.");
           } else {
-            lagopus_msg_error("pkts/sas[" PFSZ(u) "] is not properly setup.\n",
-                              i);
+            TUNNEL_ERROR("pkts/sas[" PFSZ(u) "] is not properly setup.",
+                         i);
           }
+          iface_stats_update_errors(stats);
           rte_pktmbuf_free(pkts[i]);
           continue;
         }
       }
 
       if (likely(n > 0 &&
-                 s_flush_queue_per_thread(tid, role) >= 0)) {
+                 s_flush_queue_per_thread(tid, role, stats) >= 0)) {
         ret = (lagopus_result_t)n;
       } else if (n == 0) {
         ret = (lagopus_result_t)0;
@@ -1582,12 +1596,14 @@ s_get(pthread_t tid,
       ipsecvsw_queue_role_t role,
       ipsecvsw_xform_proc_t post_xform_proc,
       rte_mbuf_t pkts[],
-      size_t n_max_pkts) {
+      size_t n_max_pkts,
+      iface_stats_t *stats) {
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
 
   if (likely(tid != LAGOPUS_INVALID_THREAD &&
              role != ipsecvsw_queue_role_unknown &&
-             post_xform_proc != NULL)) {
+             post_xform_proc != NULL &&
+             stats != NULL)) {
     cdevq_per_thread_t l = s_get_cdevq_per_thread(tid, role);
 
     if (likely(l != NULL)) {
@@ -1604,7 +1620,7 @@ s_get(pthread_t tid,
       size_t vacant;
       uint16_t n_cops;
       uint16_t max_cops;
-      int xform_ret;
+      int xform_ret = 0;
 
       for (i = 0;
            ((i < l->m_n_qs) &&
@@ -1639,9 +1655,14 @@ s_get(pthread_t tid,
                      (xform_ret = post_xform_proc(pkt, sa, cop)) == 0)) {
             pkts[n_pkts++] = pkt;
           } else {
-            lagopus_msg_error("post xform function '%s' returns %d.\n",
-                              ipsecvsw_get_xform_funcname(post_xform_proc),
-                              xform_ret);
+            TUNNEL_ERROR("post xform function '%s' returns %d.",
+                         ipsecvsw_get_xform_funcname(post_xform_proc),
+                         xform_ret);
+            if (xform_ret == -EPROTONOSUPPORT) {
+              iface_stats_update_unknown_protos(stats);
+            } else {
+              iface_stats_update_errors(stats);
+            }
             rte_pktmbuf_free(pkt);
             continue;
           }
@@ -1672,13 +1693,8 @@ s_get(pthread_t tid,
 lagopus_result_t
 ipsecvsw_setup_cdevq(void *optarg) {
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
-  uint16_t dbglvl = lagopus_log_get_debug_level();
-
-  lagopus_log_set_debug_level(2);
 
   ret = s_setup(optarg);
-
-  lagopus_log_set_debug_level(dbglvl);
 
   return ret;
 }
@@ -1754,8 +1770,9 @@ ipsecvsw_cdevq_put(pthread_t tid,
                    ipsecvsw_xform_proc_t pre_xform_proc,
                    rte_mbuf_t const pkts[],
                    ipsecvsw_session_ctx_t sctxs[],
-                   size_t n_pkts) {
-  return s_put(tid, role, pre_xform_proc, pkts, sctxs, n_pkts);
+                   size_t n_pkts,
+                   iface_stats_t *stats) {
+  return s_put(tid, role, pre_xform_proc, pkts, sctxs, n_pkts, stats);
 }
 
 
@@ -1764,8 +1781,9 @@ ipsecvsw_cdevq_get(pthread_t tid,
                    ipsecvsw_queue_role_t role,
                    ipsecvsw_xform_proc_t post_xform_proc,
                    rte_mbuf_t pkts[],
-                   size_t max_pkts) {
-  return s_get(tid, role, post_xform_proc, pkts, max_pkts);
+                   size_t max_pkts,
+                   iface_stats_t *stats) {
+  return s_get(tid, role, post_xform_proc, pkts, max_pkts, stats);
 }
 
 

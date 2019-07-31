@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ package receiver
 
 import (
 	"io"
-	"log"
 	"math/rand"
 	"sync"
 	"syscall"
@@ -29,6 +28,7 @@ import (
 	"github.com/lagopus/vsw/agents/tunnel/ipsec/sad"
 	"github.com/lagopus/vsw/agents/tunnel/ipsec/spd"
 	"github.com/lagopus/vsw/modules/tunnel/ipsec"
+	"github.com/lagopus/vsw/modules/tunnel/log"
 	"github.com/lagopus/vsw/vswitch"
 )
 
@@ -58,13 +58,9 @@ func (s *sadbAddMsg) Parse(r io.Reader) error {
 }
 
 func (s *sadbAddMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
-	log.Printf("SadbAddMsg: handle spi %d\n", s.Sa.SadbSaSpi)
-	var i vswitch.VRFIndex
-	var ok bool
+	log.Logger.Info("SadbAddMsg: handle spi %d", s.Sa.SadbSaSpi)
 
-	if i, ok = vrfMap[s]; !ok {
-		panic("No vrf index found.")
-	}
+	i := vrfs.load(s)
 	selector := &sad.SASelector{
 		VRFIndex: i,
 	}
@@ -76,30 +72,47 @@ func (s *sadbAddMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 		_ = smsg.Serialize(w)
 		return nil
 	}
+	serializer := []pfkey.Serializer{
+		&pfkey.SadbExtTransport{
+			&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_SA},
+			s.Sa,
+		},
+		&pfkey.SadbExtTransport{
+			&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_ADDRESS_SRC},
+			s.SrcAddress,
+		},
+		&pfkey.SadbExtTransport{
+			&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_ADDRESS_DST},
+			s.DstAddress,
+		},
+		&pfkey.SadbExtTransport{
+			&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_LIFETIME_HARD},
+			s.HardLifetime,
+		},
+		&pfkey.SadbExtTransport{
+			&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_LIFETIME_SOFT},
+			s.SoftLifetime,
+		},
+	}
+	if s.NatTType != nil {
+		serializer = append(serializer,
+			&pfkey.SadbExtTransport{
+				&pfkey.SadbExt{SadbExtType: pfkey.SADB_X_EXT_NAT_T_TYPE},
+				s.NatTType,
+			},
+			&pfkey.SadbExtTransport{
+				&pfkey.SadbExt{SadbExtType: pfkey.SADB_X_EXT_NAT_T_SPORT},
+				s.NatTSrcPort,
+			},
+			&pfkey.SadbExtTransport{
+				&pfkey.SadbExt{SadbExtType: pfkey.SADB_X_EXT_NAT_T_DPORT},
+				s.NatTDstPort,
+			},
+		)
+	}
 	smsg := pfkey.SadbMsgTransport{
 		sadbMsg,
-		[]pfkey.Serializer{
-			&pfkey.SadbExtTransport{
-				&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_SA},
-				s.Sa,
-			},
-			&pfkey.SadbExtTransport{
-				&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_ADDRESS_SRC},
-				s.SrcAddress,
-			},
-			&pfkey.SadbExtTransport{
-				&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_ADDRESS_DST},
-				s.DstAddress,
-			},
-			&pfkey.SadbExtTransport{
-				&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_LIFETIME_HARD},
-				s.HardLifetime,
-			},
-			&pfkey.SadbExtTransport{
-				&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_LIFETIME_SOFT},
-				s.SoftLifetime,
-			},
-		},
+		serializer,
 	}
 	err := smsg.Serialize(w)
 	return err
@@ -120,12 +133,7 @@ func (s *sadbUpdateMsg) Parse(r io.Reader) error {
 }
 
 func (s *sadbUpdateMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
-	var i vswitch.VRFIndex
-	var ok bool
-
-	if i, ok = vrfMap[s]; !ok {
-		panic("No vrf index found.")
-	}
+	i := vrfs.load(s)
 	selector := &sad.SASelector{
 		VRFIndex: i,
 	}
@@ -136,25 +144,42 @@ func (s *sadbUpdateMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 			SadbMsg: sadbMsg,
 		}
 		_ = smsg.Serialize(w)
-		log.Printf("SadbUpdateMsg Handle err: %v\n", err.(syscall.Errno))
+		log.Logger.Err("SadbUpdateMsg Handle err: %v", err.(syscall.Errno))
 		return nil
+	}
+	serializer := []pfkey.Serializer{
+		&pfkey.SadbExtTransport{
+			&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_SA},
+			s.Sa,
+		},
+		&pfkey.SadbExtTransport{
+			&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_ADDRESS_SRC},
+			s.SrcAddress,
+		},
+		&pfkey.SadbExtTransport{
+			&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_ADDRESS_DST},
+			s.DstAddress,
+		},
+	}
+	if s.NatTType != nil {
+		serializer = append(serializer,
+			&pfkey.SadbExtTransport{
+				&pfkey.SadbExt{SadbExtType: pfkey.SADB_X_EXT_NAT_T_TYPE},
+				s.NatTType,
+			},
+			&pfkey.SadbExtTransport{
+				&pfkey.SadbExt{SadbExtType: pfkey.SADB_X_EXT_NAT_T_SPORT},
+				s.NatTSrcPort,
+			},
+			&pfkey.SadbExtTransport{
+				&pfkey.SadbExt{SadbExtType: pfkey.SADB_X_EXT_NAT_T_DPORT},
+				s.NatTDstPort,
+			},
+		)
 	}
 	smsg := pfkey.SadbMsgTransport{
 		sadbMsg,
-		[]pfkey.Serializer{
-			&pfkey.SadbExtTransport{
-				&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_SA},
-				s.Sa,
-			},
-			&pfkey.SadbExtTransport{
-				&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_ADDRESS_SRC},
-				s.SrcAddress,
-			},
-			&pfkey.SadbExtTransport{
-				&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_ADDRESS_DST},
-				s.DstAddress,
-			},
-		},
+		serializer,
 	}
 	err = smsg.Serialize(w)
 	return err
@@ -167,25 +192,20 @@ type sadbGetSPIMsg struct {
 func (s *sadbGetSPIMsg) Parse(r io.Reader) error {
 	err := s.ParseSadbMsg(r)
 	if err != nil {
-		log.Println("parse err")
+		log.Logger.Err("parse err")
 		return err
 	}
 	/* checking necessary options */
 	if (s.SrcAddress == nil && s.DstAddress == nil) ||
 		s.SadbSPIRange == nil {
-		log.Println("option err")
+		log.Logger.Err("option err")
 		return syscall.EINVAL
 	}
 	return err
 }
 
 func (s *sadbGetSPIMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
-	var i vswitch.VRFIndex
-	var ok bool
-
-	if i, ok = vrfMap[s]; !ok {
-		panic("No vrf index found.")
-	}
+	i := vrfs.load(s)
 	selector := &sad.SASelector{
 		VRFIndex: i,
 	}
@@ -214,7 +234,7 @@ func (s *sadbGetSPIMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 		if err = addSA(selector, &sav); err == nil {
 			break
 		}
-		log.Printf("SadbGetSPIMsg Handle err: spi range: %d-%d, spi = %d, retry = %d\n",
+		log.Logger.Err("SadbGetSPIMsg Handle err: spi range: %d-%d, spi = %d, retry = %d",
 			min, max, spi, retry)
 	}
 
@@ -267,25 +287,20 @@ type sadbGetMsgReply struct {
 func (s *sadbGetMsg) Parse(r io.Reader) error {
 	err := s.ParseSadbMsg(r)
 	if err != nil {
-		log.Println("parse err")
+		log.Logger.Err("parse err")
 		return err
 	}
 	/* checking necessary options */
 	if s.Sa == nil ||
 		(s.SrcAddress == nil && s.DstAddress == nil) {
-		log.Println("option err")
+		log.Logger.Err("option err")
 		return syscall.EINVAL
 	}
 	return err
 }
 
 func (s *sadbGetMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
-	var i vswitch.VRFIndex
-	var ok bool
-
-	if i, ok = vrfMap[s]; !ok {
-		panic("No vrf index found.")
-	}
+	i := vrfs.load(s)
 	selector := &sad.SASelector{
 		VRFIndex: i,
 		SPI:      sad.SPI(s.Sa.SadbSaSpi),
@@ -297,7 +312,7 @@ func (s *sadbGetMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 			SadbMsg: sadbMsg,
 		}
 		_ = smsg.Serialize(w)
-		log.Printf("SadbGetMsg Handle err: %v spi %d\n", syscall.ESRCH, s.Sa.SadbSaSpi)
+		log.Logger.Err("SadbGetMsg Handle err: %v spi %d", syscall.ESRCH, s.Sa.SadbSaSpi)
 		return nil
 	}
 	reply, ok := s.toSadbGetMsgReply(sav, s.Sa.SadbSaSpi)
@@ -307,7 +322,7 @@ func (s *sadbGetMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 			SadbMsg: sadbMsg,
 		}
 		_ = smsg.Serialize(w)
-		log.Printf("SadbGetMsg Handle err: %v spi %d\n", syscall.EINVAL, s.Sa.SadbSaSpi)
+		log.Logger.Err("SadbGetMsg Handle err: %v spi %d", syscall.EINVAL, s.Sa.SadbSaSpi)
 		return nil
 	}
 
@@ -373,13 +388,9 @@ func (s *sadbDeleteMsg) Parse(r io.Reader) error {
 }
 
 func (s *sadbDeleteMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
-	log.Printf("SadbDeleteMsg: handle spi %d\n", s.Sa.SadbSaSpi)
-	var i vswitch.VRFIndex
-	var ok bool
+	log.Logger.Info("SadbDeleteMsg: handle spi %d", s.Sa.SadbSaSpi)
 
-	if i, ok = vrfMap[s]; !ok {
-		panic("No vrf index found.")
-	}
+	i := vrfs.load(s)
 	selector := &sad.SASelector{
 		VRFIndex: i,
 		SPI:      sad.SPI(s.Sa.SadbSaSpi),
@@ -446,13 +457,13 @@ type sadbXSPDAddMsg struct {
 func (s *sadbXSPDAddMsg) Parse(r io.Reader) error {
 	err := s.ParseSadbMsg(r)
 	if err != nil {
-		log.Println("parse err")
+		log.Logger.Err("parse err")
 		return err
 	}
 	/* checking necessary options */
 	if s.Policy == nil ||
 		(s.SrcAddress == nil && s.DstAddress == nil) {
-		log.Println("option err")
+		log.Logger.Err("option err")
 		return syscall.EINVAL
 	}
 	return err
@@ -461,12 +472,8 @@ func (s *sadbXSPDAddMsg) Parse(r io.Reader) error {
 func (s *sadbXSPDAddMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 	var spi uint32
 	var err error
-	var i vswitch.VRFIndex
-	var ok bool
 
-	if i, ok = vrfMap[s]; !ok {
-		panic("No vrf index found.")
-	}
+	i := vrfs.load(s)
 	selector := &sad.SASelector{
 		VRFIndex: i,
 	}
@@ -480,18 +487,18 @@ func (s *sadbXSPDAddMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 				SadbMsg: sadbMsg,
 			}
 			_ = smsg.Serialize(w)
-			log.Printf("SadbXSPDAddMsg Handle err: %v\n", syscall.ESRCH)
+			log.Logger.Err("SadbXSPDAddMsg Handle err: %v", syscall.ESRCH)
 			return nil
 		}
 		selector.SPI = sad.SPI(spi)
 		if ipsec.DirectionType(s.Policy.Policy.SadbXPolicyDir) == ipsec.DirectionTypeIn {
-			log.Printf("enable spi:%d inbound\n", spi)
+			log.Logger.Info("enable spi:%d inbound", spi)
 			enableSA(selector, ipsec.DirectionTypeIn)
 		} else if ipsec.DirectionType(s.Policy.Policy.SadbXPolicyDir) == ipsec.DirectionTypeOut {
-			log.Printf("enable spi:%d outbound\n", spi)
+			log.Logger.Info("enable spi:%d outbound", spi)
 			enableSA(selector, ipsec.DirectionTypeOut)
 		} else {
-			log.Printf("no direction spi:%d\n", spi)
+			log.Logger.Err("no direction spi:%d", spi)
 		}
 	}
 	sps, spv := s.toSadbSPSSPV(i)
@@ -500,18 +507,18 @@ func (s *sadbXSPDAddMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 	}
 	spv.SPI = spi
 	spdi, err := addSP(ipsec.DirectionType(s.Policy.Policy.SadbXPolicyDir), sps, spv)
-	log.Printf("SadbXSPDAddMsg: add spdi %d, spi %d\n", spdi, spi)
+	log.Logger.Info("SadbXSPDAddMsg: add spdi %d, spi %d", spdi, spi)
 	if err != nil {
 		sadbMsg.SadbMsgErrno = uint8(syscall.EEXIST)
 		smsg := pfkey.SadbMsgTransport{
 			SadbMsg: sadbMsg,
 		}
 		_ = smsg.Serialize(w)
-		log.Printf("SadbXSPDAddMsg Handle err: %v\n", syscall.EEXIST)
+		log.Logger.Err("SadbXSPDAddMsg Handle err: %v", syscall.EEXIST)
 		return nil
 	}
 	if spi != 0 {
-		log.Printf("SadbXSPDAddMsg: completed spdi %d, spi %d\n", spdi, spi)
+		log.Logger.Info("SadbXSPDAddMsg: completed spdi %d, spi %d", spdi, spi)
 	}
 	s.Policy.Policy.SadbXPolicyID = spdi
 	smsg := pfkey.SadbMsgTransport{
@@ -542,12 +549,8 @@ type sadbXSPDUpdateMsg struct {
 func (s *sadbXSPDUpdateMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 	var spi uint32
 	var err error
-	var i vswitch.VRFIndex
-	var ok bool
 
-	if i, ok = vrfMap[s]; !ok {
-		panic("No vrf index found.")
-	}
+	i := vrfs.load(s)
 	selector := &sad.SASelector{
 		VRFIndex: i,
 	}
@@ -561,20 +564,20 @@ func (s *sadbXSPDUpdateMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 				SadbMsg: sadbMsg,
 			}
 			_ = smsg.Serialize(w)
-			log.Printf("SadbXSPDUpdateMsg Handle err: %v\n", syscall.EINVAL)
+			log.Logger.Err("SadbXSPDUpdateMsg Handle err: %v", syscall.EINVAL)
 			return nil
 		}
 		selector.SPI = sad.SPI(spi)
 		if ipsec.DirectionType(s.Policy.Policy.SadbXPolicyDir) == ipsec.DirectionTypeIn {
-			log.Printf("enable spi:%d inbound\n", spi)
+			log.Logger.Info("enable spi:%d inbound", spi)
 			enableSA(selector, ipsec.DirectionTypeIn)
 		} else if ipsec.DirectionType(s.Policy.Policy.SadbXPolicyDir) == ipsec.DirectionTypeOut {
-			log.Printf("enable spi:%d outbound\n", spi)
+			log.Logger.Info("enable spi:%d outbound", spi)
 			enableSA(selector, ipsec.DirectionTypeOut)
 		}
 	}
-	log.Printf("get spi:%d\n", spi)
-	log.Printf("receive policy_id :%d\n", s.Policy.Policy.SadbXPolicyID)
+	log.Logger.Info("get spi:%d", spi)
+	log.Logger.Info("receive policy_id :%d", s.Policy.Policy.SadbXPolicyID)
 	sps, spvNew := s.toSadbSPSSPV(i)
 	spvOld, ok := findSP(ipsec.DirectionType(s.Policy.Policy.SadbXPolicyDir), sps)
 	if !ok {
@@ -583,7 +586,7 @@ func (s *sadbXSPDUpdateMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 			SadbMsg: sadbMsg,
 		}
 		_ = smsg.Serialize(w)
-		log.Printf("SadbXSPDUpdateMsg Handle err: %v\n", syscall.EINVAL)
+		log.Logger.Err("SadbXSPDUpdateMsg Handle err: %v", syscall.EINVAL)
 		return nil
 	}
 	// directly modified spd entry.
@@ -596,7 +599,7 @@ func (s *sadbXSPDUpdateMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 	spvOld.LocalEPIP = spvNew.LocalEPIP
 	spvOld.RemoteEPIP = spvNew.RemoteEPIP
 	if spi != 0 {
-		log.Printf("set spi:%d\n", spi)
+		log.Logger.Info("set spi:%d", spi)
 		spvOld.SPI = spi
 		spvOld.State = spd.Completed
 		err = updateSP(ipsec.DirectionType(s.Policy.Policy.SadbXPolicyDir), sps, spvOld)
@@ -606,7 +609,7 @@ func (s *sadbXSPDUpdateMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 				SadbMsg: sadbMsg,
 			}
 			_ = smsg.Serialize(w)
-			log.Printf("SadbXSPDUpdateMsg Handle err: %v\n", syscall.EINVAL)
+			log.Logger.Err("SadbXSPDUpdateMsg Handle err: %v", syscall.EINVAL)
 			return nil
 		}
 	}
@@ -649,11 +652,11 @@ type sadbXSPDGetMsg struct {
 func (s *sadbXSPDGetMsg) Parse(r io.Reader) error {
 	err := s.ParseSadbMsg(r)
 	if err != nil {
-		log.Println("parse err")
+		log.Logger.Err("parse err")
 		return err
 	}
 	if s.Policy == nil {
-		log.Println("option err")
+		log.Logger.Err("option err")
 		return syscall.EINVAL
 	}
 	return nil
@@ -664,18 +667,13 @@ type sadbXSPDGetMsgReply struct {
 }
 
 func (s *sadbXSPDGetMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
-	var i vswitch.VRFIndex
-	var ok bool
-
-	if i, ok = vrfMap[s]; !ok {
-		panic("No vrf index found.")
-	}
+	i := vrfs.load(s)
 	selector := &spd.SPSelector{
 		CSPSelector: ipsec.CSPSelector{
 			VRFIndex: i,
 		},
 	}
-	log.Printf("SadbXSPDGetMsg: spdi %d, priority %d\n",
+	log.Logger.Info("SadbXSPDGetMsg: spdi %d, priority %d",
 		s.Policy.Policy.SadbXPolicyID, s.Policy.Policy.SadbXpolicyPriority)
 	spv, ok := findSPByEntryID(selector, s.Policy.Policy.SadbXPolicyID)
 	if !ok {
@@ -684,7 +682,7 @@ func (s *sadbXSPDGetMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 			SadbMsg: sadbMsg,
 		}
 		_ = smsg.Serialize(w)
-		log.Printf("SadbXSPDGetMsg Handle err: %v\n", syscall.ESRCH)
+		log.Logger.Err("SadbXSPDGetMsg Handle err: %v", syscall.ESRCH)
 		return nil
 	}
 	reply := toSadbXSPDGetMsgReply(&spv.SPSelector, spv)
@@ -720,25 +718,20 @@ type sadbXSPDDeleteMsg struct {
 func (s *sadbXSPDDeleteMsg) Parse(r io.Reader) error {
 	err := s.ParseSadbMsg(r)
 	if err != nil {
-		log.Println("parse err")
+		log.Logger.Err("parse err")
 		return err
 	}
 	/* checking necessary options */
 	if s.Policy == nil ||
 		(s.SrcAddress == nil && s.DstAddress == nil) {
-		log.Println("option err")
+		log.Logger.Err("option err")
 		return syscall.EINVAL
 	}
 	return err
 }
 
 func (s *sadbXSPDDeleteMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
-	var i vswitch.VRFIndex
-	var ok bool
-
-	if i, ok = vrfMap[s]; !ok {
-		panic("No vrf index found.")
-	}
+	i := vrfs.load(s)
 	sps := s.toSadbSPS(i)
 	deleteSP(ipsec.DirectionType(s.Policy.Policy.SadbXPolicyDir), sps)
 	smsg := pfkey.SadbMsgTransport{
@@ -771,12 +764,7 @@ func (s *sadbDumpMsg) Parse(r io.Reader) error {
 }
 
 func (s *sadbDumpMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
-	var i vswitch.VRFIndex
-	var ok bool
-
-	if i, ok = vrfMap[s]; !ok {
-		panic("No vrf index found.")
-	}
+	i := vrfs.load(s)
 	selector := &sad.SASelector{
 		VRFIndex: i,
 	}
@@ -860,6 +848,27 @@ type sadbAcquireMsg struct {
 	Policy     *pfkey.Policy
 }
 
+type vrfMap struct {
+	sm sync.Map
+}
+
+func (v *vrfMap) store(h pfkey.ParseHandler, i vswitch.VRFIndex) {
+	v.sm.Store(h, i)
+}
+
+func (v *vrfMap) load(h pfkey.ParseHandler) vswitch.VRFIndex {
+	if i, ok := v.sm.Load(h); ok {
+		return i.(vswitch.VRFIndex)
+	}
+	panic("No vrf index found.")
+}
+
+func (v *vrfMap) delete(h pfkey.ParseHandler) {
+	v.sm.Delete(h)
+}
+
+var vrfs = vrfMap{}
+
 var msgMuxDefault = pfkey.MsgMux{
 	pfkey.SADB_GETSPI:      &sadbGetSPIMsg{},
 	pfkey.SADB_UPDATE:      &sadbUpdateMsg{},
@@ -879,18 +888,14 @@ func NewMsgMux() pfkey.MsgMux {
 	return msgMuxDefault
 }
 
-var vrfMap = make(map[pfkey.ParseHandler]vswitch.VRFIndex)
-var lock sync.Mutex
-
+// RecieverMsgMux Msg.
 type RecieverMsgMux struct {
 	pfkey.MsgMux
 }
 
 // NewMsgMuxForVRF returns pfkey.MsgMux for earch VRF pfkey servers.
 func NewMsgMuxForVRF(i vswitch.VRFIndex) RecieverMsgMux {
-	lock.Lock()
-	defer lock.Unlock()
-	log.Printf("NewMsgMuxForVRF: vrf %d\n", i)
+	log.Logger.Info("NewMsgMuxForVRF: vrf %d", i)
 	msgMux := RecieverMsgMux{
 		pfkey.MsgMux{
 			pfkey.SADB_GETSPI:      &sadbGetSPIMsg{},
@@ -907,7 +912,7 @@ func NewMsgMuxForVRF(i vswitch.VRFIndex) RecieverMsgMux {
 		},
 	}
 	for _, p := range msgMux.MsgMux {
-		vrfMap[p] = i
+		vrfs.store(p, i)
 	}
 	return msgMux
 }
@@ -915,6 +920,6 @@ func NewMsgMuxForVRF(i vswitch.VRFIndex) RecieverMsgMux {
 // Free delete map entry in vrfMap."
 func (m *RecieverMsgMux) Free() {
 	for _, p := range m.MsgMux {
-		delete(vrfMap, p)
+		vrfs.delete(p)
 	}
 }

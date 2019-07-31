@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -60,7 +60,7 @@ func rpcclient() {
 	defer conn.Close()
 }
 
-func send(t *testing.T, mbuf *dpdk.Mbuf, self bool) bool {
+func send(t *testing.T, mbuf *dpdk.Mbuf) bool {
 	eh := mbuf.EtherHdr()
 	src_ha := eh.SrcAddr()
 	dst_ha := eh.DstAddr()
@@ -76,7 +76,7 @@ func send(t *testing.T, mbuf *dpdk.Mbuf, self bool) bool {
 	reh := rmbuf.EtherHdr()
 	md := (*vswitch.Metadata)(rmbuf.Metadata())
 
-	t.Logf("Rcv'd: src=%s, dst=%s, vif=%d, self=%v\n", reh.SrcAddr(), reh.DstAddr(), md.InVIF(), md.Self())
+	t.Logf("Rcv'd: src=%s, dst=%s, vif=%d\n", reh.SrcAddr(), reh.DstAddr(), md.InVIF())
 
 	return bytes.Compare(reh.SrcAddr(), src_ha) == 0 &&
 		bytes.Compare(reh.DstAddr(), dst_ha) == 0
@@ -94,14 +94,14 @@ func TestNormalFlow(t *testing.T) {
 	eh.SetDstAddr(dst_ha)
 	mbuf.SetEtherHdr(eh)
 
-	if !send(t, mbuf, false) {
+	if !send(t, mbuf) {
 		t.Errorf("Unexpected packet metadata recv'd")
 	}
 
 	// send to testvif
 	eh.SetDstAddr(vif_mac)
 
-	if !send(t, mbuf, true) {
+	if !send(t, mbuf) {
 		t.Errorf("Unexpected packet metadata recv'd")
 	}
 }
@@ -109,7 +109,6 @@ func TestNormalFlow(t *testing.T) {
 func TestMain(m *testing.M) {
 	// Initialize vswitch core
 	vswitch.Init("../../vsw.conf")
-	vswitch.EnableLog(true)
 	pool = vswitch.GetDpdkResource().Mempool
 
 	//

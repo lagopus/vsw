@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,18 +17,25 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
+
+	"github.com/lagopus/vsw/vswitch"
 )
 
 const (
-	TOKEN_STRING   = "STRING"
-	TOKEN_BOOL     = "BOOL"
-	TOKEN_INTEGER  = "INTEGER"
-	TOKEN_IPV4ADDR = "A.B.C.D"
-	TOKEN_MACADDR  = "MACADDR"
+	TOKEN_STRING          = "STRING"
+	TOKEN_BOOL            = "BOOL"
+	TOKEN_INTEGER         = "INTEGER"
+	TOKEN_IPV4ADDR        = "A.B.C.D"
+	TOKEN_MACADDR         = "MACADDR"
+	TOKEN_RANGE           = "MIN..MAX"
+	TOKEN_IPV4ADDR_PREFIX = "A.B.C.D/E"
+	TOKEN_PORTRANGE       = "PORTRANGE"
+	TOKEN_PROTOCOL        = "PROTOCOL"
 )
 
 type radixTree struct {
@@ -46,6 +53,87 @@ type node struct {
 
 func newRadixTree() *radixTree {
 	return &radixTree{}
+}
+
+type rangeValue struct {
+	min int
+	max int
+}
+
+func parseRange(s string) (*rangeValue, error) {
+	tokens := strings.Split(s, "..")
+
+	if len(tokens) != 2 {
+		return nil, errors.New("Bad format")
+	}
+
+	min, err := strconv.Atoi(tokens[0])
+	if err != nil {
+		return nil, errors.New("Bad min value")
+	}
+
+	max, err := strconv.Atoi(tokens[1])
+	if err != nil {
+		return nil, errors.New("Bad max value")
+	}
+
+	if min > max {
+		return nil, errors.New("Min value greater than max")
+	}
+
+	return &rangeValue{min, max}, nil
+}
+
+func parsePortRange(ports string) (*vswitch.PortRange, error) {
+	p := &vswitch.PortRange{}
+	if ports == "ANY" {
+		return p, nil
+	}
+
+	tmp := strings.Split(ports, "..")
+	len := len(tmp)
+	if len > 2 {
+		return p, errors.New("Invalid port range.")
+	}
+
+	start, _ := strconv.Atoi(tmp[0])
+	p.Start = uint16(start)
+	if len == 2 {
+		end, _ := strconv.Atoi(tmp[1])
+		p.End = uint16(end)
+	}
+
+	return p, nil
+}
+
+func parseProtocol(proto string) (vswitch.IPProto, error) {
+	switch proto {
+	case "TCP":
+		return vswitch.IPP_TCP, nil
+	case "UDP":
+		return vswitch.IPP_UDP, nil
+	case "ICMP":
+		return vswitch.IPP_ICMP, nil
+	case "IGMP":
+		return vswitch.IPP_IGMP, nil
+	case "PIM":
+		return vswitch.IPP_PIM, nil
+	case "RSVP":
+		return vswitch.IPP_RSVP, nil
+	case "GRE":
+		return vswitch.IPP_GRE, nil
+	case "AUTH":
+		return vswitch.IPP_AH, nil
+	case "L2TP":
+		return vswitch.IPP_L2TP, nil
+	default:
+		if v, err := strconv.Atoi(proto); err != nil {
+			return 0, err
+		} else {
+			return vswitch.IPProto(v), nil
+		}
+	}
+
 }
 
 func (nk nodeKey) parseInput(input []string) (int, bool, []interface{}) {
@@ -77,9 +165,37 @@ func (nk nodeKey) parseInput(input []string) (int, bool, []interface{}) {
 			} else {
 				return count, false, nil
 			}
+		case TOKEN_IPV4ADDR_PREFIX:
+			if addr, mask, err := net.ParseCIDR(input[n]); err == nil {
+				addr := vswitch.IPAddr{
+					IP:   addr,
+					Mask: mask.Mask,
+				}
+				args = append(args, addr)
+			} else {
+				return count, false, nil
+			}
+		case TOKEN_PORTRANGE:
+			if port, err := parsePortRange(input[n]); err == nil {
+				args = append(args, port)
+			} else {
+				return count, false, nil
+			}
 		case TOKEN_MACADDR:
 			if mac, err := net.ParseMAC(input[n]); err == nil {
 				args = append(args, mac)
+			} else {
+				return count, false, nil
+			}
+		case TOKEN_RANGE:
+			if rv, err := parseRange(input[n]); err == nil {
+				args = append(args, rv)
+			} else {
+				return count, false, nil
+			}
+		case TOKEN_PROTOCOL:
+			if proto, err := parseProtocol(input[n]); err == nil {
+				args = append(args, proto)
 			} else {
 				return count, false, nil
 			}
@@ -181,17 +297,12 @@ func (n *node) String() string {
 	return fmt.Sprintf("key=%v(%d){ nodes=%v }", n.key, n.depth, n.nodes)
 }
 
-type configure interface {
-	getNetworkInstance(string) *ni
-	getInterface(string) *iface
-}
-
 type parser struct {
 	rt *radixTree
-	c  configure
+	c  interface{}
 }
 
-type parserCallbackFunc func(configure, ocdcType, []interface{}) (interface{}, error)
+type parserCallbackFunc func(interface{}, ocdcType, []interface{}) (interface{}, error)
 
 type parserSyntaxEntry struct {
 	pattern  string
@@ -202,208 +313,6 @@ type parserSyntaxEntry struct {
 type parserSyntax struct {
 	prefix string
 	syntax []*parserSyntaxEntry
-}
-
-var ocdcSyntax = []*parserSyntax{
-	{
-		"network-instances network-instance STRING",
-		[]*parserSyntaxEntry{
-			{"config enabled BOOL", procNI, niEnabled},
-			{"config enabled-address-families STRING", procNI, niAddressFamily},
-			{"config type STRING", procNI, niTypes},
-			{"interfaces interface STRING subinterface INTEGER", procNI, niInterface},
-			{"vlans vlan INTEGER config status STRING", procNI, niVLAN},
-			{"fdb config mac-aging-time INTEGER", procNI, niFdbMacAgingTime},
-			{"fdb config mac-learning BOOL", procNI, niFdbMacLearning},
-			{"fdb config maximum-entries INTEGER", procNI, niFdbMaxEntries},
-		},
-	},
-	{
-		"network-instances network-instance STRING security ipsec sad sad-entries INTEGER config",
-		[]*parserSyntaxEntry{
-			{"sa-mode STRING", procIPSecSAD, sadSAMode},
-			{"life-time life-time-in-seconds INTEGER", procIPSecSAD, sadLifeTimeInSec},
-			{"life-time life-time-in-byte INTEGER", procIPSecSAD, sadLifeTimeInByte},
-			{"local-peer ipv4-address A.B.C.D", procIPSecSAD, sadLocalPeer},
-			{"remote-peer ipv4-address A.B.C.D", procIPSecSAD, sadRemotePeer},
-			{"esp authentication STRING", procIPSecSAD, sadESPAuth},
-			{"esp authentication STRING key-str STRING", procIPSecSAD, sadESPAuthKey},
-			{"esp encryption STRING", procIPSecSAD, sadESPEncrypt},
-			{"esp encryption STRING key-str STRING", procIPSecSAD, sadESPEncryptKey},
-		},
-	},
-	{
-		"network-instances network-instance STRING security ipsec spd spd-entries STRING config",
-		[]*parserSyntaxEntry{
-			{"spi INTEGER", procIPSecSPD, spdSPI},
-			{"destination-address ipv4-address A.B.C.D", procIPSecSPD, spdDestinationAddress},
-			{"destination-address port-number INTEGER", procIPSecSPD, spdDestinationPort},
-			{"destination-address prefix-length INTEGER", procIPSecSPD, spdDestinationPrefix},
-			{"source-address ipv4-address A.B.C.D", procIPSecSPD, spdSourceAddress},
-			{"source-address port-number INTEGER", procIPSecSPD, spdSourcePort},
-			{"source-address prefix-length INTEGER", procIPSecSPD, spdSourcePrefix},
-			{"upper-protocol STRING", procIPSecSPD, spdUpperProtocol},
-			{"direction STRING", procIPSecSPD, spdDirection},
-			{"security-protocol STRING", procIPSecSPD, spdSecurityProtocol},
-			{"priority INTEGER", procIPSecSPD, spdPriority},
-			{"policy STRING", procIPSecSPD, spdPolicy},
-		},
-	},
-	{
-		"interfaces interface STRING config",
-		[]*parserSyntaxEntry{
-			{"device STRING", procIF, ifDevice},
-			{"driver STRING", procIF, ifDriver},
-			{"enabled BOOL", procIF, ifEnabled},
-			{"mtu INTEGER", procIF, ifMTU},
-			{"type STRING", procIF, ifTypes},
-		},
-	},
-	{
-		"interfaces interface STRING ethernet",
-		[]*parserSyntaxEntry{
-			{"config mac-address MACADDR", procIF, ifMACAddr},
-			{"switched-vlan config interface-mode STRING", procIF, ifVLANMode},
-			{"switched-vlan config access-vlan INTEGER", procIF, ifVLANAccess},
-			{"switched-vlan config trunk-vlans INTEGER", procIF, ifVLANTrunk},
-		},
-	},
-	{
-		"interfaces interface STRING subinterfaces subinterface INTEGER",
-		[]*parserSyntaxEntry{
-			{"config enabled BOOL", procIF, ifSubEnabled},
-			{"ipv4 addresses address A.B.C.D config prefix-length INTEGER", procIF, ifSubAddress},
-			{"vlan config vlan-id INTEGER", procIF, ifSubVLAN},
-		},
-	},
-	{
-		"interfaces interface STRING subinterfaces subinterface INTEGER tunnel config",
-		[]*parserSyntaxEntry{
-			{"address-type STRING", procTunnel, ifSubTunnelAddressType},
-			{"encaps-method STRING", procTunnel, ifSubTunnelEncapsMethod},
-			{"hop-limit INTEGER", procTunnel, ifSubTunnelHopLimit},
-			{"local-inet-address A.B.C.D", procTunnel, ifSubTunnelLocalAddress},
-			{"remote-inet-address A.B.C.D", procTunnel, ifSubTunnelRemoteAddress},
-			{"security STRING", procTunnel, ifSubTunnelSecurity},
-			{"tos INTEGER", procTunnel, ifSubTunnelTOS},
-		},
-	},
-}
-
-type ocdcType int
-
-const (
-	niEnabled ocdcType = iota
-	niAddressFamily
-	niTypes
-	niInterface
-	niVLAN
-	niFdbMacAgingTime
-	niFdbMacLearning
-	niFdbMaxEntries
-
-	ifDevice
-	ifDriver
-	ifEnabled
-	ifMTU
-	ifTypes
-	ifMACAddr
-	ifVLANMode
-	ifVLANAccess
-	ifVLANTrunk
-	ifSubEnabled
-	ifSubAddress
-	ifSubVLAN
-
-	ifSubTunnelAddressType
-	ifSubTunnelEncapsMethod
-	ifSubTunnelHopLimit
-	ifSubTunnelLocalAddress
-	ifSubTunnelRemoteAddress
-	ifSubTunnelSecurity
-	ifSubTunnelTOS
-
-	sadSAMode
-	sadLifeTimeInSec
-	sadLifeTimeInByte
-	sadLocalPeer
-	sadRemotePeer
-	sadESPAuth
-	sadESPAuthKey
-	sadESPEncrypt
-	sadESPEncryptKey
-
-	spdSPI
-	spdDestinationAddress
-	spdDestinationPort
-	spdDestinationPrefix
-	spdSourceAddress
-	spdSourcePort
-	spdSourcePrefix
-	spdUpperProtocol
-	spdDirection
-	spdSecurityProtocol
-	spdPriority
-	spdPolicy
-)
-
-func (o ocdcType) String() string {
-	s := map[ocdcType]string{
-		niEnabled:                "niEnabled",
-		niAddressFamily:          "niAddressFamily",
-		niTypes:                  "niType",
-		niInterface:              "niInterface",
-		niVLAN:                   "niVLAN",
-		niFdbMacAgingTime:        "niFdbMacAgingTime",
-		niFdbMacLearning:         "niFdbMacLearning",
-		niFdbMaxEntries:          "niFdbMaxEntries",
-		ifDevice:                 "ifDevice",
-		ifDriver:                 "ifDriver",
-		ifEnabled:                "ifEnabled",
-		ifMTU:                    "ifMTU",
-		ifTypes:                  "ifType",
-		ifMACAddr:                "ifMACAddr",
-		ifVLANMode:               "ifVLANMode",
-		ifVLANAccess:             "ifVLANAccess",
-		ifVLANTrunk:              "ifVLANTrunk",
-		ifSubEnabled:             "ifSubEnabled",
-		ifSubAddress:             "ifSubAddress",
-		ifSubVLAN:                "ifSubVLAN",
-		ifSubTunnelEncapsMethod:  "ifSubTunnelEncapsMethod",
-		ifSubTunnelHopLimit:      "ifSubTunnelHopLimit",
-		ifSubTunnelLocalAddress:  "ifSubTunnelLocalAddress",
-		ifSubTunnelRemoteAddress: "ifSubTunnelRemoteAddress",
-		ifSubTunnelSecurity:      "ifSubTunnelSecurity",
-		ifSubTunnelTOS:           "ifSubTunnelTOS",
-		sadSAMode:                "sadSAMode",
-		sadLifeTimeInSec:         "sadLifeTimeInSec",
-		sadLifeTimeInByte:        "sadLifeTimeInByte",
-		sadLocalPeer:             "sadLocalPeer",
-		sadRemotePeer:            "sadRemotePeer",
-		sadESPAuth:               "sadESPAuth",
-		sadESPAuthKey:            "sadESPAuthKey",
-		sadESPEncrypt:            "sadESPEncrypt",
-		sadESPEncryptKey:         "sadESPEncryptKey",
-		spdSPI:                   "spdSPI",
-		spdDestinationAddress:    "spdDestinationAddress",
-		spdDestinationPort:       "spdDestinationPort",
-		spdDestinationPrefix:     "spdDestinationPrefix",
-		spdSourceAddress:         "spdSourceAddress",
-		spdSourcePort:            "spdSourcePort",
-		spdSourcePrefix:          "spdSourcePrefix",
-		spdUpperProtocol:         "spdUpperProtocol",
-		spdDirection:             "spdDirection",
-		spdSecurityProtocol:      "spdSecurityProtocol",
-		spdPriority:              "spdPriority",
-		spdPolicy:                "spdPolicy",
-	}
-	return s[o]
-}
-
-type ocdcTypeUnexpectedError ocdcType
-
-func (o ocdcTypeUnexpectedError) Error() string {
-	return fmt.Sprintf("Unexpected ocdcType %v found", o)
 }
 
 type parserError int
@@ -419,7 +328,7 @@ func (p parserError) Error() string {
 	return msg[p]
 }
 
-func newParser(c configure) *parser {
+func newParser(c interface{}) *parser {
 	return &parser{newRadixTree(), c}
 }
 
@@ -436,176 +345,4 @@ func (p *parser) parse(pattern []string) (interface{}, error) {
 
 	s, _ := node.value.(*parserSyntaxEntry)
 	return s.callback(p.c, s.ocdcType, args)
-}
-
-func initParser(c configure) *parser {
-	p := newParser(c)
-	for _, s := range ocdcSyntax {
-		for _, e := range s.syntax {
-			p.register(s.prefix, e)
-		}
-	}
-	return p
-}
-
-func procNI(c configure, key ocdcType, args []interface{}) (interface{}, error) {
-	ni := c.getNetworkInstance(args[0].(string))
-
-	switch key {
-	case niEnabled:
-		ni.setEnabled(args[1].(bool))
-	case niAddressFamily:
-		ni.addAddressFamily(args[1].(string))
-	case niTypes:
-		if err := ni.setType(args[1].(string)); err != nil {
-			return nil, err
-		}
-	case niInterface:
-		ni.addInterface(args[1].(string), args[2].(int))
-	case niVLAN:
-		ni.addVID(args[1].(int), args[2].(string))
-	case niFdbMacAgingTime:
-		ni.setMacAgingTime(args[1].(int))
-	case niFdbMacLearning:
-		ni.setMacLearning(args[1].(bool))
-	case niFdbMaxEntries:
-		ni.setMaximumEntries(args[1].(int))
-	default:
-		return nil, ocdcTypeUnexpectedError(key)
-	}
-
-	return ni, nil
-}
-
-func procIPSecSAD(c configure, key ocdcType, args []interface{}) (interface{}, error) {
-	ni := c.getNetworkInstance(args[0].(string))
-	spi := args[1].(int)
-
-	switch key {
-	case sadSAMode:
-		ni.setSAMode(spi, args[2].(string))
-	case sadLifeTimeInSec:
-		ni.setLifeTimeInSeconds(spi, args[2].(int))
-	case sadLifeTimeInByte:
-		ni.setLifeTimeInByte(spi, args[2].(int))
-	case sadLocalPeer:
-		ni.setLocalPeer(spi, args[2].(net.IP))
-	case sadRemotePeer:
-		ni.setRemotePeer(spi, args[2].(net.IP))
-
-	case sadESPAuthKey:
-		ni.setAuthKey(spi, args[3].(string))
-		fallthrough // We must set algorithm as well
-	case sadESPAuth:
-		ni.setAuth(spi, args[2].(string))
-
-	case sadESPEncryptKey:
-		ni.setEncryptKey(spi, args[3].(string))
-		fallthrough // We must set algorithm as well
-	case sadESPEncrypt:
-		ni.setEncrypt(spi, args[2].(string))
-
-	default:
-		return nil, ocdcTypeUnexpectedError(key)
-	}
-
-	return ni, nil
-}
-
-func procIPSecSPD(c configure, key ocdcType, args []interface{}) (interface{}, error) {
-	ni := c.getNetworkInstance(args[0].(string))
-	name := args[1].(string)
-
-	switch key {
-	case spdSPI:
-		ni.setSPI(name, args[2].(int))
-	case spdDestinationAddress:
-		ni.setDstAddress(name, args[2].(net.IP))
-	case spdDestinationPort:
-		ni.setDstPort(name, args[2].(int))
-	case spdDestinationPrefix:
-		ni.setDstPrefix(name, args[2].(int))
-	case spdSourceAddress:
-		ni.setSrcAddress(name, args[2].(net.IP))
-	case spdSourcePort:
-		ni.setSrcPort(name, args[2].(int))
-	case spdSourcePrefix:
-		ni.setSrcPrefix(name, args[2].(int))
-	case spdUpperProtocol:
-		ni.setUpperProtocol(name, args[2].(string))
-	case spdDirection:
-		ni.setDirection(name, args[2].(string))
-	case spdSecurityProtocol:
-		ni.setSecurityProtocol(name, args[2].(string))
-	case spdPriority:
-		ni.setPriority(name, args[2].(int))
-	case spdPolicy:
-		ni.setPolicy(name, args[2].(string))
-	default:
-		return nil, ocdcTypeUnexpectedError(key)
-	}
-
-	return ni, nil
-}
-
-func procIF(c configure, key ocdcType, args []interface{}) (interface{}, error) {
-	i := c.getInterface(args[0].(string))
-	var err error
-
-	switch key {
-	case ifDevice:
-		err = i.setDevice(args[1].(string))
-	case ifDriver:
-		err = i.setDriver(args[1].(string))
-	case ifEnabled:
-		i.setEnabled(args[1].(bool))
-	case ifMTU:
-		i.setMTU(args[1].(int))
-	case ifTypes:
-		err = i.setType(args[1].(string))
-	case ifMACAddr:
-		i.setMACAddr(args[1].(net.HardwareAddr))
-	case ifVLANMode:
-		i.setVLANMode(args[1].(string))
-	case ifVLANAccess, ifVLANTrunk:
-		i.addVID(args[1].(int))
-	case ifSubEnabled:
-		i.getSubiface(args[1].(int)).setEnabled(args[2].(bool))
-	case ifSubAddress:
-		i.getSubiface(args[1].(int)).addAddress(args[2].(net.IP), args[3].(int))
-	case ifSubVLAN:
-		i.getSubiface(args[1].(int)).setVID(args[2].(int))
-	default:
-		err = ocdcTypeUnexpectedError(key)
-	}
-
-	if err != nil {
-		return nil, err
-	}
-	return i, nil
-}
-
-func procTunnel(c configure, key ocdcType, args []interface{}) (interface{}, error) {
-	i := c.getInterface(args[0].(string))
-
-	switch key {
-	case ifSubTunnelAddressType:
-		i.getSubiface(args[1].(int)).setAddressType(args[2].(string))
-	case ifSubTunnelEncapsMethod:
-		i.getSubiface(args[1].(int)).setEncapsMethod(args[2].(string))
-	case ifSubTunnelHopLimit:
-		i.getSubiface(args[1].(int)).setHopLimit(args[2].(int))
-	case ifSubTunnelLocalAddress:
-		i.getSubiface(args[1].(int)).setLocalAddress(args[2].(net.IP))
-	case ifSubTunnelRemoteAddress:
-		i.getSubiface(args[1].(int)).setRemoteAddress(args[2].(net.IP))
-	case ifSubTunnelSecurity:
-		i.getSubiface(args[1].(int)).setSecurity(args[2].(string))
-	case ifSubTunnelTOS:
-		i.getSubiface(args[1].(int)).setTOS(args[2].(int))
-	default:
-		return nil, ocdcTypeUnexpectedError(key)
-	}
-
-	return i, nil
 }

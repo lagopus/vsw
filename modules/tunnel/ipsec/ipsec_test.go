@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -33,28 +33,37 @@ type testIPsecTestSuite struct {
 
 func (suite *testIPsecTestSuite) SetupTest() {
 	mgr = newMockMgr(suite)
-	a := &IfaceAccessor{
-		SetVRFIndexFn: mgr.SetVRFIndex,
-		SetRingFn:     mgr.SetRing,
-		UnsetRingFn:   mgr.UnsetRing,
-		SetTTLFn:      mgr.SetTTL,
-		SetTOSFn:      mgr.SetTOS,
+	a := &Accessor{
+		SetVRFFn:     mgr.SetVRF,
+		UnsetVRFFn:   mgr.UnsetVRF,
+		SetRingFn:    mgr.SetRing,
+		UnsetRingFn:  mgr.UnsetRing,
+		SetTTLFn:     mgr.SetTTL,
+		SetTOSFn:     mgr.SetTOS,
+		StatsFn:      mgr.Stats,
+		ResetStatsFn: mgr.ResetStats,
 	}
 	RegisterAccessor(a)
-	suite.NotNil(accessor.SetVRFIndexFn)
+	suite.NotNil(accessor.SetVRFFn)
+	suite.NotNil(accessor.UnsetVRFFn)
 	suite.NotNil(accessor.SetRingFn)
 	suite.NotNil(accessor.UnsetRingFn)
 	suite.NotNil(accessor.SetTTLFn)
 	suite.NotNil(accessor.SetTOSFn)
+	suite.NotNil(accessor.StatsFn)
+	suite.NotNil(accessor.ResetStatsFn)
 }
 
 func (suite *testIPsecTestSuite) TearDownTest() {
-	RegisterAccessor(&IfaceAccessor{})
-	suite.Nil(accessor.SetVRFIndexFn)
+	RegisterAccessor(&Accessor{})
+	suite.Nil(accessor.SetVRFFn)
+	suite.Nil(accessor.UnsetVRFFn)
 	suite.Nil(accessor.SetRingFn)
 	suite.Nil(accessor.UnsetRingFn)
 	suite.Nil(accessor.SetTTLFn)
 	suite.Nil(accessor.SetTOSFn)
+	suite.Nil(accessor.StatsFn)
+	suite.Nil(accessor.ResetStatsFn)
 }
 
 func newTestVIF() *VIF {
@@ -80,7 +89,6 @@ func newTestTunnelVIF(tif *TunnelIF, vif *VIF, isEnabled bool) *TunnelVIF {
 	tvif := &TunnelVIF{
 		tif:       tif,
 		vif:       vif,
-		vrfIndex:  0,
 		isEnabled: isEnabled,
 	}
 	if tif != nil {
@@ -150,21 +158,6 @@ func (suite *testIPsecTestSuite) TestTunnelIFEnableNil() {
 	mgr.EqualCountCallUnsetRing(0)
 }
 
-func (suite *testIPsecTestSuite) TestTunnelIFEnableErr() {
-	tif := newTestTunnelIF(false)
-	vif := newTestVIF()
-	_ = newTestTunnelVIF(tif, vif, true)
-
-	accessor.SetRingFn = nil
-
-	// enable.
-	err := tif.Enable()
-	suite.NotEmpty(err)
-	suite.True(tif.isEnabled)
-	mgr.EqualCountCallSetRing(0)
-	mgr.EqualCountCallUnsetRing(0)
-}
-
 func (suite *testIPsecTestSuite) TestTunnelIFDisable() {
 	tif := newTestTunnelIF(true)
 	vif := newTestVIF()
@@ -184,20 +177,6 @@ func (suite *testIPsecTestSuite) TestTunnelIFDisableNil() {
 	tif := newTestTunnelIF(true)
 
 	// disable - OK.
-	tif.Disable()
-	suite.False(tif.isEnabled)
-	mgr.EqualCountCallSetRing(0)
-	mgr.EqualCountCallUnsetRing(0)
-}
-
-func (suite *testIPsecTestSuite) TestTunnelIFDisableErr() {
-	tif := newTestTunnelIF(true)
-	vif := newTestVIF()
-	_ = newTestTunnelVIF(tif, vif, true)
-
-	accessor.UnsetRingFn = nil
-
-	// disable - ERROR.
 	tif.Disable()
 	suite.False(tif.isEnabled)
 	mgr.EqualCountCallSetRing(0)
@@ -249,21 +228,6 @@ func (suite *testIPsecTestSuite) TestTunnelVIFEnableNil() {
 	mgr.EqualCountCallUnsetRing(0)
 }
 
-func (suite *testIPsecTestSuite) TestTunnelVIFEnableErr() {
-	tif := newTestTunnelIF(true)
-	vif := newTestVIF()
-	tvif := newTestTunnelVIF(tif, vif, false)
-
-	accessor.SetRingFn = nil
-
-	// enable - ERROR.
-	err := tvif.Enable()
-	suite.NotEmpty(err)
-	suite.True(tvif.isEnabled)
-	mgr.EqualCountCallSetRing(0)
-	mgr.EqualCountCallUnsetRing(0)
-}
-
 func (suite *testIPsecTestSuite) TestTunnelVIFDisable() {
 	tif := newTestTunnelIF(true)
 	vif := newTestVIF()
@@ -291,20 +255,6 @@ func (suite *testIPsecTestSuite) TestTunnelVIFDisableNil() {
 	mgr.EqualCountCallUnsetRing(0)
 }
 
-func (suite *testIPsecTestSuite) TestTunnelVIFDisableErr() {
-	tif := newTestTunnelIF(true)
-	vif := newTestVIF()
-	tvif := newTestTunnelVIF(tif, vif, true)
-
-	accessor.UnsetRingFn = nil
-
-	// disable - ERROR.
-	tvif.Disable()
-	suite.False(tvif.isEnabled)
-	mgr.EqualCountCallSetRing(0)
-	mgr.EqualCountCallUnsetRing(0)
-}
-
 func (suite *testIPsecTestSuite) TestTunnelVIFFree() {
 	tif := newTestTunnelIF(true)
 	vif := newTestVIF()
@@ -323,14 +273,30 @@ func (suite *testIPsecTestSuite) TestTunnelVIFSetVRF() {
 	tif := newTestTunnelIF(true)
 	vif := newTestVIF()
 	tvif := newTestTunnelVIF(tif, vif, true)
-	mgr.expectedVRFIndex = tvif.vrfIndex
 
-	vrf := &vswitch.VRF{}
+	vrf := &vswitch.VRF{} // VRFIndex is 0.
+	mgr.expectedVRF = vrf
 
 	// set VRF - OK.
 	tvif.SetVRF(vrf)
-	suite.Equal(vrf.Index(), tvif.vrfIndex)
-	mgr.EqualCountCallSetVRFIndex(1)
+	suite.Equal(vrf, tvif.vrf)
+	mgr.EqualCountCallSetVRF(1)
+	mgr.EqualCountCallUnsetVRF(0)
+}
+
+func (suite *testIPsecTestSuite) TestTunnelVIFSetVRFNil() {
+	tif := newTestTunnelIF(true)
+	vif := newTestVIF()
+	tvif := newTestTunnelVIF(tif, vif, true)
+
+	tvif.vrf = &vswitch.VRF{} // VRFIndex is 0.
+	mgr.expectedVRF = tvif.vrf
+
+	// set VRF - OK.
+	tvif.SetVRF(nil)
+	suite.Empty(tvif.vrf)
+	mgr.EqualCountCallSetVRF(0)
+	mgr.EqualCountCallUnsetVRF(1)
 }
 
 func (suite *testIPsecTestSuite) TestTunnelVIFSetVRFNothingIF() {
@@ -342,21 +308,8 @@ func (suite *testIPsecTestSuite) TestTunnelVIFSetVRFNothingIF() {
 
 	// set VRF - ERROR.
 	tvif.SetVRF(vrf)
-	mgr.EqualCountCallSetVRFIndex(0)
-}
-
-func (suite *testIPsecTestSuite) TestTunnelVIFSetVRFNil() {
-	tif := newTestTunnelIF(true)
-	vif := newTestVIF()
-	tvif := newTestTunnelVIF(tif, vif, true)
-	mgr.expectedVRFIndex = tvif.vrfIndex
-
-	vrf := &vswitch.VRF{}
-	accessor.SetVRFIndexFn = nil
-
-	// set VRF - ERROR.
-	tvif.SetVRF(vrf)
-	mgr.EqualCountCallSetVRFIndex(0)
+	mgr.EqualCountCallSetVRF(0)
+	mgr.EqualCountCallUnsetVRF(0)
 }
 
 func (suite *testIPsecTestSuite) TestTunnelVIFHopLimitUpdated() {
@@ -382,19 +335,6 @@ func (suite *testIPsecTestSuite) TestTunnelVIFHopLimitUpdatedNothingIF() {
 	mgr.EqualCountCallSetTTL(0)
 }
 
-func (suite *testIPsecTestSuite) TestTunnelVIFHopLimitUpdatedNil() {
-	tif := newTestTunnelIF(true)
-	vif := newTestVIF()
-	tvif := newTestTunnelVIF(tif, vif, true)
-	ttl := uint8(100)
-
-	accessor.SetTTLFn = nil
-
-	// set TTL - ERROR.
-	tvif.HopLimitUpdated(ttl)
-	mgr.EqualCountCallSetTTL(0)
-}
-
 func (suite *testIPsecTestSuite) TestTunnelVIFTOSUpdated() {
 	tif := newTestTunnelIF(true)
 	vif := newTestVIF()
@@ -403,7 +343,7 @@ func (suite *testIPsecTestSuite) TestTunnelVIFTOSUpdated() {
 	mgr.expectedTOS = tos
 
 	// set TOS - OK.
-	tvif.TOSUpdated(tos)
+	tvif.L3TOSUpdated(tos)
 	mgr.EqualCountCallSetTOS(1)
 }
 
@@ -414,20 +354,7 @@ func (suite *testIPsecTestSuite) TestTunnelVIFTOSUpdatedNothingIF() {
 	tos := int8(100)
 
 	// set TOS - ERROR.
-	tvif.TOSUpdated(tos)
-	mgr.EqualCountCallSetTOS(0)
-}
-
-func (suite *testIPsecTestSuite) TestTunnelVIFTOSUpdatedNil() {
-	tif := newTestTunnelIF(true)
-	vif := newTestVIF()
-	tvif := newTestTunnelVIF(tif, vif, true)
-	tos := int8(100)
-
-	accessor.SetTOSFn = nil
-
-	// set TOS - ERROR.
-	tvif.TOSUpdated(tos)
+	tvif.L3TOSUpdated(tos)
 	mgr.EqualCountCallSetTOS(0)
 }
 

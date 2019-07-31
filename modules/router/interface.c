@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,111 +19,101 @@
  *      @brief  Interface table.
  */
 
+#include <assert.h>
+#include <inttypes.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
-#include <inttypes.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 
+#include <rte_ether.h>
 #include <rte_ip.h>
 #include <rte_malloc.h>
 
 #include "interface.h"
+#include "router.h"
 
-#include "router_log.h"
 #include "packet.h"
-
-#define ETHADDR_STRLEN 18
-
-static char *
-ip2str(uint32_t addr) {
-	static char buf[INET_ADDRSTRLEN];
-	inet_ntop(AF_INET, &addr, buf, sizeof(buf));
-	return buf;
-}
-
-static char *
-mac2str(struct ether_addr mac) {
-	static char buf[ETHADDR_STRLEN];
-	ether_format_addr(buf, sizeof buf, &mac);
-	return buf;
-}
+#include "router_log.h"
 
 static void
-print_interface_entry(char *str, char *name, struct interface *interface) {
-	LAGOPUS_DEBUG("[INTERFACE] (%s) %s: ifindex: %"PRIu32", mac: %s, mtu: %d, vid: %d\n",
-			name, str, interface->ifindex, mac2str(interface->mac),
-			interface->mtu, interface->vid);
+print_interface_entry(char *str, struct interface *interface) {
+	if (!interface)
+		return;
+
+	struct interface_entry *ie = &interface->base;
+
+	ROUTER_DEBUG("[INTERFACE] %s: ifindex: %" PRIu32 ", mac: %s, mtu: %d, vid: %d\n",
+		     str, ie->ifindex, mac2str(ie->mac), ie->mtu, ie->vid);
 	for (int i = 0; i < IPADDR_MAX_NUM && interface->addr[i].addr != 0; i++) {
-		LAGOPUS_DEBUG("\t\t\t\t: addr[%d] %s\n", i, ip2str(interface->addr[i].addr));
+		ROUTER_DEBUG("\t\t\t\t: addr[%d] %s\n", i, ip2str(interface->addr[i].addr));
 	}
 }
 
 static void
 print_interface_list(struct interface_table *interface_table) {
-#if 1 //debug
 	struct interface *interface;
 	uint32_t *idx;
 	uint32_t next = 0;
 
 	while (rte_hash_iterate(interface_table->hashmap, (const void **)&idx,
 				(void **)&interface, &next) >= 0) {
-		print_interface_entry("List", interface_table->name, interface);
+		print_interface_entry("List", interface);
 	}
-#endif
 }
 
 /*** public functions ***/
 /**
  * Initialize interface table.
  */
-bool
-interface_init(struct interface_table *interface_table, const char *name) {
-	// set module name.
-	snprintf(interface_table->name, sizeof(interface_table->name), "%s", name);
+struct interface_table *
+interface_init(const char *name) {
+	struct interface_table *it;
+	if (!(it = rte_zmalloc(NULL, sizeof(struct interface_table), 0))) {
+		ROUTER_ERROR("router: %s: interface table rte_zmalloc() failed.", name);
+		return NULL;
+	}
+
 	char hash_name[RTE_HASH_NAMESIZE];
-	/** interface information **/
+	// Interface information.
 	snprintf(hash_name, sizeof(hash_name), "if_%s", name);
-	LAGOPUS_DEBUG("[INTERFACE] (%s) interface table name: %s\n",
-			interface_table->name, hash_name);
+	ROUTER_DEBUG("[INTERFACE] (%s) interface table name: %s\n",
+		     name, hash_name);
 	struct rte_hash_parameters hash_params = {
-		.name = hash_name,
-		.entries = IPADDR_MAX_NUM, // TODO: max number of interfaces.
-		.key_len = sizeof(uint32_t),
-		.hash_func = rte_jhash,
-		.hash_func_init_val = 0,
-		.socket_id = rte_socket_id(),
+	    .name = hash_name,
+	    .entries = MAX_ROUTER_VIFS, // MAX number of interfaces.
+	    .key_len = sizeof(uint32_t),
+	    .hash_func = rte_jhash,
+	    .hash_func_init_val = 0,
+	    .socket_id = rte_socket_id(),
 	};
-	interface_table->hashmap = rte_hash_create(&hash_params);
-	if (!interface_table->hashmap) {
-		lagopus_printf("[INTERFACE] %s: (%s) Error allocating hash table",
-				__func__, interface_table->name);
-		return false;
+	it->hashmap = rte_hash_create(&hash_params);
+	if (!it->hashmap) {
+		ROUTER_ERROR("[INTERFACE] Error allocating hash table");
+		return NULL;
 	}
 
-	/** management self ip **/
+	// Management self ip.
 	snprintf(hash_name, sizeof(hash_name), "self_%s", name);
-	LAGOPUS_DEBUG("[INTERFACE] (%s) interface self table name: %s\n",
-			interface_table->name, hash_name);
+	ROUTER_DEBUG("[INTERFACE] (%s) interface self table name: %s\n",
+		     name, hash_name);
 	struct rte_hash_parameters self_hash_params = {
-		.name = hash_name,
-		.entries = IPADDR_MAX_NUM, // TODO: max number of ip address.
-		.key_len = sizeof(uint32_t),
-		.hash_func = rte_jhash,
-		.hash_func_init_val = 0,
-		.socket_id = rte_socket_id(),
+	    .name = hash_name,
+	    .entries = IPADDR_MAX_NUM, //MAX number of ip address.
+	    .key_len = sizeof(uint32_t),
+	    .hash_func = rte_jhash,
+	    .hash_func_init_val = 0,
+	    .socket_id = rte_socket_id(),
 	};
-	interface_table->self = rte_hash_create(&self_hash_params);
-	if (!interface_table->self) {
-		lagopus_printf("[INTERFACE] %s: (%s) Error allocating self hash table",
-				__func__, interface_table->name);
-		return false;
+	it->self = rte_hash_create(&self_hash_params);
+	if (!it->self) {
+		ROUTER_ERROR("[INTERFACE] Error allocating self hash table");
+		rte_free(it);
+		return NULL;
 	}
 
-	return true;
+	return it;
 }
 
 /**
@@ -131,14 +121,16 @@ interface_init(struct interface_table *interface_table, const char *name) {
  */
 void
 interface_fini(struct interface_table *interface_table) {
+	if (!interface_table)
+		return;
 	uint32_t *ifindex;
 	struct interface *interface;
 	uint32_t next = 0;
-	/* free all entries. */
+	// Free all entries.
 	while (rte_hash_iterate(interface_table->hashmap, (const void **)&ifindex, (void **)&interface, &next) >= 0) {
 		rte_free(interface);
 	}
-	/* destroy hashmaps */
+	// Destroy hashmaps.
 	if (interface_table->hashmap)
 		rte_hash_free(interface_table->hashmap);
 	if (interface_table->self)
@@ -154,45 +146,43 @@ interface_ip_add(struct interface_table *interface_table, struct interface_addr_
 	uint32_t ifindex = ia->ifindex;
 	uint32_t addr = ia->addr;
 	uint32_t prefixlen = ia->prefixlen;
-	if (!interface_table->hashmap) {
-		lagopus_printf("[INTERFACE] %s: (%s) Invalid argument (hashmap is nil).",
-				__func__, interface_table->name);
-		return false;
-	}
 
 	int ret = rte_hash_lookup_data(interface_table->hashmap, &ifindex, (void **)&interface);
-	if (ret < 0) {
-		lagopus_printf("[INTERFACE] %s: (%s) no interface. ifindex = %"PRIu32"\n",
-				__func__, interface_table->name, ifindex);
+	// No entry
+	if (unlikely(ret == -ENOENT)) {
+		ROUTER_DEBUG("[INTERFACE] no interface entry. ifindex = %d\n", ifindex);
 		return false;
 	}
+	// Invalid parameter, assertion fail..
+	assert(ret >= 0);
 
 	// full of ip address
 	if (interface->count == IPADDR_MAX_NUM)
 		return false;
 
-	// interface entry exists.
+	// Interface entry exists.
 	for (int i = 0; i < interface->count; i++) {
+		// If the same IP address has already been registered,
+		// it returns silently.
 		if (interface->addr[i].addr == addr)
-			return false;
+			return true;
 	}
 
-	// add new ip address.
+	// Add new ip address.
 	interface->addr[interface->count].addr = addr;
 	interface->addr[interface->count].prefixlen = prefixlen;
 	interface->count++;
 
-	// add a address to hashmap for self.
+	// Add a address to hashmap for self.
 	if (rte_hash_add_key(interface_table->self, &addr) < 0) {
-		lagopus_printf("[INTERFACE] %s: (%s) regist ip address to self table failed.",
-				__func__, interface_table->name);
+		ROUTER_ERROR("[INTERFACE] regist ip address to self table failed.");
 		return false;
 	}
 
-	// dump ip list
-	LAGOPUS_DEBUG("[INTERFACE] %s: (%s) Add IP Address: %s\n",
-			__func__, interface_table->name, ip2str(addr));
-	print_interface_list(interface_table);
+	// Dump ip list
+	ROUTER_DEBUG("[INTERFACE] Add IP Address: %s\n", ip2str(addr));
+	if (VSW_LOG_DEBUG_ENABLED(router_log_id))
+		print_interface_list(interface_table);
 	return true;
 }
 
@@ -204,37 +194,33 @@ interface_ip_delete(struct interface_table *interface_table, struct interface_ad
 	struct interface *interface;
 	uint32_t ifindex = ia->ifindex;
 	uint32_t addr = ia->addr;
-	uint32_t prefixlen = ia->prefixlen;
-	if (!interface_table->hashmap) {
-		lagopus_printf("[INTERFACE] %s: (%s) Invalid argument (hashmap is nil).",
-				__func__, interface_table->name);
+
+	int ret = rte_hash_lookup_data(interface_table->hashmap, &(ifindex), (void **)&interface);
+	// No entry
+	if (unlikely(ret == -ENOENT)) {
+		ROUTER_DEBUG("[NEIGH] no interface entry. ifindex = %d\n", ifindex);
 		return false;
 	}
+	// Invalid parameter, assertion fail..
+	assert(ret >= 0);
 
-	int ret  = rte_hash_lookup_data(interface_table->hashmap, &(ifindex), (void **)&interface);
-	if (ret < 0 || !interface) {
-		lagopus_printf("[INTERFACE] %s: (%s) no interface. ifindex = %"PRIu32"\n",
-				__func__, interface_table->name, ifindex);
-		return false;
-	}
-
-	// remove ip address.
+	// Remove ip address.
 	for (int i = 0; i < interface->count; i++) {
-		uint32_t addr = interface->addr[i].addr;
 		if (interface->addr[i].addr == addr) {
 			interface->count--;
 			interface->addr[i].addr = interface->addr[interface->count].addr;
 
-			// delete a address from hashmap for self.
+			// Delete a address from hashmap for self.
 			if (rte_hash_del_key(interface_table->self, &addr) < 0) {
-				lagopus_printf("[INTERFACE] %s: Not found entry.", __func__);
+				ROUTER_INFO("[INTERFACE] Not found entry.");
 			}
 			break;
 		}
 	}
 
-	// dump ip list
-	print_interface_list(interface_table);
+	// Dump ip list
+	if (VSW_LOG_DEBUG_ENABLED(router_log_id))
+		print_interface_list(interface_table);
 	return true;
 }
 
@@ -242,63 +228,47 @@ interface_ip_delete(struct interface_table *interface_table, struct interface_ad
  * Add interface(vif) entry.
  */
 bool
-interface_entry_add(struct interface_table *interface_table, struct interface_entry *ie) {
+interface_entry_add(struct router_context *ctx, struct interface_entry *ie) {
+	struct interface_table *interface_table = ctx->tables.interface;
 	struct interface *interface;
-	uint32_t ifindex       = ie->ifindex;
-	struct ether_addr *mac = &(ie->mac);
-	uint16_t mtu           = ie->mtu;
-	struct rte_ring *ring  = ie->ring;
-	uint16_t vid           = ie->vid;
-	bool tunnel            = ie->tunnel;
+	uint32_t ifindex = ie->ifindex;
 
-	if (!(interface_table->hashmap)) {
-		lagopus_printf("[INTERFACE] %s: (%s) Invalid argument (hashmap is nil).",
-				__func__, interface_table->name);
-		return false;
-	}
-
-	/* check if entry is exist in interface table. */
+	// Check if entry is exist in interface table.
 	int ret = rte_hash_lookup_data(interface_table->hashmap, &ifindex, (void **)&interface);
-	if (ret < 0 && ret != -ENOENT) {
-		lagopus_printf("[INTERFACE] %s: (%s) interface hash table lookup error.",
-				__func__, interface_table->name);
+
+	if (ret >= 0) {
+		return true;
+	} else if (ret != -ENOENT) {
+		ROUTER_ERROR("[INTERFACE] Unexpected error during lookup: %d", ret);
 		return false;
 	}
 
-	if (ret >= 0 ) {
-		/* if the interface entry already exists,
-		 * to update the entry. */
-		LAGOPUS_DEBUG("%s(%d) update entry.\n", __func__, __LINE__);
-		ether_addr_copy(mac, &(interface->mac));
-		interface->mtu    = mtu;
-		interface->ring   = ring;
-		interface->vid    = vid;
-		interface->tunnel = tunnel;
-	} else if (ret == -ENOENT) {
-		// add new entry
-		interface= rte_zmalloc(NULL, sizeof(struct interface), 0);
-		if (!interface) {
-			lagopus_printf("[INTERFACE] %s: (%s) interface entry allocation failed.",
-					__func__, interface_table->name);
-			return false;
-		}
-		ether_addr_copy(mac, &(interface->mac));
-		interface->ifindex      = ifindex;
-		interface->mtu          = mtu;
-		interface->ring         = ring;
-		interface->vid          = vid;
-		interface->tunnel       = tunnel;
-
-		// add key to hash table of the self interface.
-		if (rte_hash_add_key_data(interface_table->hashmap, &interface->ifindex, interface) < 0) {
-			lagopus_printf("[INTERFACE] %s: (%s) interface entry add failed.",
-				__func__, interface_table->name);
-			rte_free(interface);
-			return false;
-		}
+	// create new entry
+	ie->rr = get_router_ring(ctx, ie->ring);
+	if (!ie->rr) {
+		ROUTER_ERROR("[INTERFACE] Can't get router ring for VIF %d", ifindex);
+		return false;
 	}
 
-	print_interface_entry("Add", interface_table->name, interface);
+	interface = rte_zmalloc(NULL, sizeof(struct interface), 0);
+	if (!interface) {
+		ROUTER_ERROR("[INTERFACE] interface entry allocation failed.");
+		return false;
+	}
+
+	// Add new key to hash table of the self interface.
+	if (rte_hash_add_key_data(interface_table->hashmap, &ifindex, interface) < 0) {
+		ROUTER_ERROR("[INTERFACE] interface entry add failed.");
+		rte_free(interface);
+		return false;
+	}
+
+	// If the interface entry already exists,
+	// to update the entry.
+	interface->base = *ie;
+
+	if (VSW_LOG_DEBUG_ENABLED(router_log_id))
+		print_interface_entry("Add", interface);
 	return true;
 }
 
@@ -306,42 +276,39 @@ interface_entry_add(struct interface_table *interface_table, struct interface_en
  * Delete interface(vif) entry.
  */
 bool
-interface_entry_delete(struct interface_table *interface_table, struct interface_entry *ie) {
+interface_entry_delete(struct router_context *ctx, struct interface_entry *ie) {
+	struct interface_table *interface_table = ctx->tables.interface;
 	struct interface *interface;
-	bool is_ip = false;
 
-	if (!(interface_table->hashmap)) {
-		lagopus_printf("[INTERFACE] %s: (%s) Invalid argument (hashmap is nil).",
-				__func__, interface_table->name);
+	int ret = rte_hash_lookup_data(interface_table->hashmap, &(ie->ifindex), (void **)&interface);
+	// No entry
+	if (unlikely(ret == -ENOENT)) {
+		ROUTER_DEBUG("[NEIGH] no interface entry. ifindex = %d\n", ie->ifindex);
 		return false;
 	}
+	// Invalid parameter, assertion fail..
+	assert(ret >= 0);
 
-	int ret  = rte_hash_lookup_data(interface_table->hashmap, &(ie->ifindex), (void **)&interface);
-	if (ret < 0 && !interface) {
-		lagopus_printf("[INTERFACE] %s: (%s) interface entry free failed.",
-				__func__, interface_table->name);
-		return false;
-	}
-
-	// delete ip address from self table.
+	// Delete ip address from self table.
 	for (int i = 0; i < interface->count; i++) {
 		if (!interface_ip_delete(interface_table, &interface->addr[i])) {
-			lagopus_printf("[INTERFACE] %s: (%s) failed to delete ip address.");
+			ROUTER_INFO("[INTERFACE] %s: (%s) failed to delete ip address.");
 		}
 	}
 
-	// delete from interface table.
+	// Delete from interface table.
 	if (rte_hash_del_key(interface_table->hashmap, &(ie->ifindex)) < 0) {
-		lagopus_printf("[INTERFACE] %s: (%s) not found interface [ifindex: %"PRIu32"]",
-				__func__, interface_table->name, ie->ifindex);
+		ROUTER_ERROR("[INTERFACE] not found interface [ifindex: %" PRIu32 "]",
+			     ie->ifindex);
 		return false;
 	}
 
-	// free entry data.
+	put_router_ring(ctx, interface->base.rr);
+
+	// Free entry data.
 	rte_free(interface);
 
-	LAGOPUS_DEBUG("[INTERFACE] (%s) deleted entry [ifindex = %"PRIu32"]\n",
-			interface_table->name, ie->ifindex);
+	ROUTER_DEBUG("[INTERFACE] deleted entry [ifindex = %" PRIu32 "]\n", ie->ifindex);
 	return true;
 }
 
@@ -352,20 +319,44 @@ struct interface *
 interface_entry_get(struct interface_table *interface_table, uint32_t ifindex) {
 	struct interface *interface;
 	uint32_t key = ifindex;
-	if (!(interface_table->hashmap)) {
-		lagopus_printf("[INTERFACE] %s: (%s) Invalid argument (hashmap is nil).",
-				__func__, interface_table->name);
+	int ret = rte_hash_lookup_data(interface_table->hashmap,
+				       (const void *)&key, (void **)&interface);
+	// No entry
+	if (unlikely(ret == -ENOENT)) {
+		ROUTER_INFO("[INTERFACE] Not found entry.");
 		return NULL;
 	}
-	if (rte_hash_lookup_data(interface_table->hashmap,
-			         (const void*)&key, (void **)&interface) < 0) {
-		lagopus_printf("[INTERFACE] %s: (%s) Not found entry.",
-				__func__, interface_table->name);
-		return NULL;
+	// Invalid parameter, assertion fail..
+	assert(ret >= 0);
+
+	if (VSW_LOG_DEBUG_ENABLED(router_log_id)) {
+		print_interface_entry("Get", interface);
+		print_interface_list(interface_table);
 	}
-
-	print_interface_entry("Get", interface_table->name, interface) ;
-	print_interface_list(interface_table);
-
 	return interface;
+}
+
+/**
+ * Update interface(vif) mtu.
+ */
+bool
+interface_mtu_update(struct interface_table *interface_table, struct interface_entry *ie) {
+	struct interface *interface;
+	int ret = rte_hash_lookup_data(interface_table->hashmap,
+				       &(ie->ifindex), (void **)&interface);
+
+	// No entry
+	if (unlikely(ret == -ENOENT)) {
+		ROUTER_INFO("[INTERFACE] Not found entry in %s\n", __func__);
+		return false;
+	}
+	// Invalid parameter, assertion fail.
+	assert(ret >= 0);
+
+	// If the interface entry already exists, update MTU>
+	interface->base.mtu = ie->mtu;
+
+	ROUTER_DEBUG("[INTERFACE] Update MTU: %u\n", interface->base.mtu);
+
+	return true;
 }

@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,25 +17,22 @@
 package openconfigd
 
 import (
-	"log"
-
+	"github.com/lagopus/vsw/agents/tunnel/ipsec/handlers"
 	"github.com/lagopus/vsw/agents/tunnel/ipsec/openconfigd/sad"
 	"github.com/lagopus/vsw/agents/tunnel/ipsec/openconfigd/spd"
+	"github.com/lagopus/vsw/modules/tunnel/log"
 	"github.com/lagopus/vsw/vswitch"
 )
 
 // Handler openconfigd handler.
 type Handler struct {
-	name    string
-	vrf     *vswitch.VRF
-	running bool
+	handlers.BaseHandler
 }
 
 // NewHandler Create openconfigd handler.
 func NewHandler(vrf *vswitch.VRF) *Handler {
 	return &Handler{
-		name: vrf.Name(),
-		vrf:  vrf,
+		BaseHandler: handlers.NewBaseHandler(vrf),
 	}
 }
 
@@ -73,32 +70,28 @@ func (h *Handler) SPDEntryDeleted(vrf *vswitch.VRF, sp vswitch.SP) {
 
 // Start Start openconfigd handler.
 func (h *Handler) Start() error {
-	if h.running {
+	if h.Running() {
 		return nil
 	}
 
-	log.Printf("%v: Start openconfigd handler", h)
+	log.Logger.Info("%v: Start openconfigd handler", h)
 
-	sadbs := h.vrf.SADatabases()
+	vrf := h.VRF()
+	sadbs := vrf.SADatabases()
 	sadbs.RegisterObserver(h)
 
-	h.running = true
+	h.SetRunning()
 
 	return nil
 }
 
 // Stop Stop openconfigd handler.
 func (h *Handler) Stop() {
-	if !h.running {
+	if !h.Running() {
 		return
 	}
 
-	log.Printf("%v: Stop openconfigd handler", h)
+	log.Logger.Info("%v: Stop openconfigd handler", h)
 
-	h.running = false
-}
-
-// String Return Name.
-func (h *Handler) String() string {
-	return h.name
+	h.UnsetRunning()
 }

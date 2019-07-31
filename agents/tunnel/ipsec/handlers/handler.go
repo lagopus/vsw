@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,7 +24,6 @@ import (
 type Handler interface {
 	Start() error
 	Stop()
-	String() string
 }
 
 // BaseHandler Base of handler.
@@ -40,6 +39,31 @@ func NewBaseHandler(vrf *vswitch.VRF) BaseHandler {
 		name: vrf.Name(),
 		vrf:  vrf,
 	}
+}
+
+// VRF Get VRF.
+func (h *BaseHandler) VRF() *vswitch.VRF {
+	return h.vrf
+}
+
+// Running Is running handler.
+func (h *BaseHandler) Running() bool {
+	return h.running
+}
+
+// SetRunning Set running.
+func (h *BaseHandler) SetRunning() {
+	h.running = true
+}
+
+// UnsetRunning Unset running.
+func (h *BaseHandler) UnsetRunning() {
+	h.running = false
+}
+
+// Name Get name.
+func (h *BaseHandler) Name() string {
+	return h.name
 }
 
 // String Return Name.

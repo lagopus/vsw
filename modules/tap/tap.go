@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package tap
 import (
 	"errors"
 	"fmt"
+	"os"
 	"reflect"
 	"runtime"
 	"sync"
@@ -28,12 +29,16 @@ import (
 	"github.com/lagopus/vsw/dpdk"
 	"github.com/lagopus/vsw/utils/notifier"
 	"github.com/lagopus/vsw/vswitch"
+	vlog "github.com/lagopus/vsw/vswitch/log"
 )
 
 const (
+	moduleName       = "tap"
 	queueLength      = 64
 	tapMaxRetryCount = 100
 	tapRetryInterval = 100 * time.Millisecond
+	vrfRetryCount    = 100
+	vrfRetryInterval = 100 * time.Millisecond
 )
 
 var log = vswitch.Logger
@@ -84,7 +89,7 @@ func (t *TapInstance) Free() {
 func (t *TapInstance) listener() {
 	for n := range t.notiCh {
 		rule, ok := n.Value.(vswitch.Rule)
-		if !ok || rule.Match != vswitch.MATCH_OUT_VIF {
+		if !ok || rule.Match != vswitch.MatchOutVIF {
 			continue
 		}
 
@@ -230,6 +235,12 @@ func (t *TapInstance) rxTask() {
 				if vif := vswitch.GetVIFByIndex(md.InVIF()); vif != nil {
 					tap := vif.TAP()
 					frame := mbuf.Data()
+					nxt := mbuf.Next()
+					for nxt != nil {
+						frame = append(frame, nxt.Data()...)
+						nxt = nxt.Next()
+					}
+
 					_, err := tap.Write(frame)
 					if err != nil {
 						log.Printf("%v: Write to Tap failed: %v", t, err)
@@ -257,6 +268,14 @@ func (t *TapInstance) Enable() error {
 		return fmt.Errorf("Can't set IP_HDRINCL: %v", err)
 	}
 
+	vpath := "/sys/class/net/" + t.vrf
+	for i := 0; i < vrfRetryCount; i++ {
+		if _, err := os.Stat(vpath); err == nil {
+			break
+		}
+		time.Sleep(vrfRetryInterval)
+	}
+
 	if err := syscall.SetsockoptString(rs, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, t.vrf); err != nil {
 		syscall.Close(rs)
 		return fmt.Errorf("Can't set SO_BINDTODEVICE: %v", err)
@@ -282,6 +301,12 @@ func (t *TapInstance) String() string {
 }
 
 func init() {
+	if l, err := vlog.New(moduleName); err == nil {
+		log = l
+	} else {
+		log.Fatalf("Can't create logger: %s", moduleName)
+	}
+
 	rp := &vswitch.RingParam{
 		Count:    queueLength,
 		SocketId: dpdk.SOCKET_ID_ANY,

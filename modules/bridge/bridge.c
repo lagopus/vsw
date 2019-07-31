@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,11 +25,18 @@
 #include <rte_jhash.h>
 #include <rte_errno.h>
 
-//#define DEBUG
 #include "packet.h"
 #include "logger.h"
 
 #include "bridge.h"
+
+static uint32_t bridge_log_id = 0;
+
+#define BRIDGE_DEBUG(fmt, x...)		vsw_msg_debug(bridge_log_id, 0, fmt, ## x)
+#define BRIDGE_INFO(fmt, x...)		vsw_msg_info(bridge_log_id, fmt, ## x)
+#define BRIDGE_WARNING(fmt, x...)	vsw_msg_warning(bridge_log_id, fmt, ## x)
+#define BRIDGE_ERROR(fmt, x...)		vsw_msg_error(bridge_log_id, fmt, ## x)
+#define BRIDGE_FATAL(fmt, x...)		vsw_msg_fatal(bridge_log_id, fmt, ## x)
 
 struct bridge_runtime {
 	struct rte_hash		*bridge_hash;
@@ -43,15 +50,14 @@ struct bridge_runtime {
 static inline bool
 dispatch_packet(struct bridge_instance *b, struct rte_mbuf *mbuf)
 {
-	struct lagopus_packet_metadata *md = LAGOPUS_MBUF_METADATA(mbuf);
+	struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
 	struct ether_hdr *hdr = rte_pktmbuf_mtod(mbuf, struct ether_hdr *);
-	struct ether_addr *saddr = &hdr->s_addr;
 	struct ether_addr *daddr = &hdr->d_addr;
 	struct rte_ring *ring = NULL;
 
 	if (!is_unicast_ether_addr(daddr) ||
 	    (!b->mac_hash) || (rte_hash_lookup_data(b->mac_hash, daddr, (void **)&ring) < 0)) {
-		LAGOPUS_DEBUG("%s: Flooding to %d VIFs", __func__, b->vif_count);
+		BRIDGE_DEBUG("%s: Flooding to %d VIFs", __func__, b->vif_count);
 
 		// Update refcnt first
 		int expect = b->vif_count - 1;
@@ -59,12 +65,12 @@ dispatch_packet(struct bridge_instance *b, struct rte_mbuf *mbuf)
 			rte_pktmbuf_refcnt_update(mbuf, (int16_t)(expect - 1));
 
 		// flooding by split horizon
-		vifindex_t in_vif = md->md_vif.in_vif;
+		vifindex_t in_vif = md->common.in_vif;
 		int sent = 0;
 		for (int n = 0; n < b->vif_count; n++) {
 			if ((b->vifs[n].index != in_vif) &&
 			    (rte_ring_enqueue(b->vifs[n].ring, mbuf) == 0)) {
-				LAGOPUS_DEBUG("%s: queing to %d @ %p", __func__, n, b->vifs[n].ring);
+				BRIDGE_DEBUG("%s: queing to %d @ %p", __func__, n, b->vifs[n].ring);
 				sent++;
 			}
 		}
@@ -122,7 +128,7 @@ bridge_create_mac_hash(const char *name, int entries) {
 	};
 
 	if ((hash = rte_hash_create(&mac_hash_params)) == NULL) {
-		LAGOPUS_DEBUG("%s: Can't create a MAC hash (%s)\n",
+		BRIDGE_DEBUG("%s: Can't create a MAC hash (%s)\n",
 				name, rte_strerror(rte_errno));
 		return NULL;
 	}
@@ -132,19 +138,20 @@ bridge_create_mac_hash(const char *name, int entries) {
 
 /* Bridge Domain Related */
 static bool
-bridge_register_instance(void *p, struct lagopus_instance *base)
+bridge_register_instance(void *p, struct vsw_instance *base)
 {
 	struct bridge_runtime *r = p;
 	struct bridge_instance *b = (struct bridge_instance*)base;
 
 	b->max_mac_entries = 0;
 	b->mac_hash = NULL;
+	b->mat = NULL;
 	b->mtu = 0;
 	b->rif_count = 0;
 	b->vif_count = 0;
 
 	if (rte_hash_add_key_data(r->bridge_hash, &b->base.id, b) < 0) {
-		LAGOPUS_DEBUG("birdge: Can't add domain %s", b->base.name);
+		BRIDGE_DEBUG("birdge: Can't add domain %s", b->base.name);
 		return false;
 	}
 
@@ -152,7 +159,7 @@ bridge_register_instance(void *p, struct lagopus_instance *base)
 }
 
 static bool
-bridge_unregister_instance(void *p, struct lagopus_instance *base)
+bridge_unregister_instance(void *p, struct vsw_instance *base)
 {
 	struct bridge_runtime *r = p;
 	struct bridge_instance *b = (struct bridge_instance*)base;
@@ -198,7 +205,7 @@ bridge_rif_delete(struct bridge_instance *b, struct bridge_control_param *bp) {
 /* VIF Related */
 static inline bool
 bridge_vif_add(struct bridge_instance *b, struct bridge_control_param *bp) {
-	LAGOPUS_DEBUG("%s: Adding VIF: %d @ %p (mtu=%d)", __func__, bp->index, bp->ring, bp->mtu);
+	BRIDGE_DEBUG("%s: Adding VIF: %d @ %p (mtu=%d)", __func__, bp->index, bp->ring, bp->mtu);
 	if (b->vif_count == MAX_BRIDGE_VIFS)
 		return false;
 
@@ -255,9 +262,8 @@ bridge_mac_recreate_hash(struct bridge_instance *b, int max_mac_entries) {
 #define CMD_DEFS(NAME)	[BRIDGE_CMD_ ## NAME] = #NAME
 
 static bool
-bridge_control_instance(void *p, struct lagopus_instance *base, void *param)
+bridge_control_instance(void *p, struct vsw_instance *base, void *param)
 {
-	struct bridge_runtime *r = p;
 	struct bridge_instance *b = (struct bridge_instance*)base;
 	struct bridge_control_param *bp = param;
 
@@ -268,11 +274,12 @@ bridge_control_instance(void *p, struct lagopus_instance *base, void *param)
 		CMD_DEFS(VIF_DELETE),
 		CMD_DEFS(MAC_ADD),
 		CMD_DEFS(MAC_DELETE),
+		CMD_DEFS(SET_MTU),
 		CMD_DEFS(SET_MAX_ENTRIES),
 		CMD_DEFS(SET_MAT),
 	};
 
-	LAGOPUS_DEBUG("%s: %s domain: %s", __func__, cmds[bp->cmd], b->base.name);
+	BRIDGE_DEBUG("%s: %s domain: %s", __func__, cmds[bp->cmd], b->base.name);
 
 	switch (bp->cmd) {
 		case BRIDGE_CMD_RIF_ADD:
@@ -291,12 +298,16 @@ bridge_control_instance(void *p, struct lagopus_instance *base, void *param)
 			{
 				char mac[ETHADDR_STRLEN];
 				ether_format_addr(mac, sizeof mac, &bp->mac);
-				LAGOPUS_DEBUG("%s: Adding %s", __func__, mac);
+				BRIDGE_DEBUG("%s: Adding %s", __func__, mac);
 			}
 			return bridge_mac_add(b, bp);
 
 		case BRIDGE_CMD_MAC_DELETE:
 			return bridge_mac_delete(b, bp);
+
+		case BRIDGE_CMD_SET_MTU:
+			b->mtu = bp->mtu;
+			return true;
 
 		case BRIDGE_CMD_SET_MAX_ENTRIES:
 			return bridge_mac_recreate_hash(b, bp->max_mac_entries);
@@ -314,13 +325,13 @@ init_mac_learning(struct bridge_runtime *r, struct rte_ring *learn, struct rte_r
 {
 	unsigned count = rte_ring_free_count(learn);
 	if (count == 0 || count != rte_ring_free_count(free)) {
-		LAGOPUS_DEBUG("bridge: Invalid ring sizes for learning.")
+		BRIDGE_DEBUG("bridge: Invalid ring sizes for learning.");
 		return -1;
 	}
 
 	size_t size = sizeof(struct bridge_learn) * count;
 	if (!(r->learning_data = rte_zmalloc(NULL, size, 0))) {
-		LAGOPUS_DEBUG("bridge: rte_zmalloc() failed. Can't alloc memory for learning (%d/%d).", size, count);
+		BRIDGE_DEBUG("bridge: rte_zmalloc() failed. Can't alloc memory for learning (%d/%d).", size, count);
 		return -1;
 	}
 
@@ -331,6 +342,14 @@ init_mac_learning(struct bridge_runtime *r, struct rte_ring *learn, struct rte_r
 	return 0;
 }
 
+static void
+update_logid()
+{
+	int id = vsw_log_getid("bridge");
+	if (id >= 0)
+		bridge_log_id = (uint32_t)id;
+}
+
 static void bridge_deinit(void*);
 
 static void*
@@ -339,8 +358,10 @@ bridge_init(void *param)
 	struct bridge_runtime *r;
 	struct bridge_runtime_param *p = param;
 
+	update_logid();
+
 	if (!(r = rte_zmalloc(NULL, sizeof(struct bridge_runtime), 0))) {
-		LAGOPUS_DEBUG("%s: BE: rte_zmalloc() failed. Can't start.", __func__);
+		BRIDGE_DEBUG("%s: BE: rte_zmalloc() failed. Can't start.", __func__);
 		return NULL;
 	}
 
@@ -389,7 +410,7 @@ bridge_process(void *p)
 		unsigned count = rte_ring_dequeue_burst(b->base.input, (void **)mbufs, MAX_BRIDGE_MBUFS, NULL);
 
 		if (count > 0)
-			LAGOPUS_DEBUG("%s: name=%s count=%d", __func__, b->base.name, count);
+			BRIDGE_DEBUG("%s: name=%s count=%d", __func__, b->base.name, count);
 		for (int i = 0; i < count; i++) {
 			struct rte_mbuf *mbuf = mbufs[i];
 
@@ -399,18 +420,18 @@ bridge_process(void *p)
 				continue;
 			}
 
-			struct lagopus_packet_metadata *md = LAGOPUS_MBUF_METADATA(mbuf);
+			struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
 
 			// Need to learn if the mbuf is not from MAT
-			if (!(md->md_vif.flags & LAGOPUS_MD_MAT)) {
-				if ((b->mac_hash) && (md->md_vif.out_vif == VIF_INVALID_INDEX)) {
+			if (!(md->common.flags & VSW_MD_MAT)) {
+				if ((b->mac_hash) && (md->common.out_vif == VIF_INVALID_INDEX)) {
 					// Extract src mac from the packet
 					struct bridge_learn *l;
 					if (rte_ring_dequeue(free_ring, (void**)&l) == 0) {
 						struct ether_hdr *hdr = rte_pktmbuf_mtod(mbuf, struct ether_hdr *);
 
 						l->domain_id = b->domain_id;
-						l->index = md->md_vif.in_vif;
+						l->index = md->common.in_vif;
 						ether_addr_copy(&hdr->s_addr, &l->mac);
 
 						rte_ring_enqueue(learn_ring, (void*)l);
@@ -419,7 +440,7 @@ bridge_process(void *p)
 
 				if (b->mat) {
 					// Forward to MAT
-					md->md_vif.flags |= LAGOPUS_MD_MAT;
+					md->common.flags |= VSW_MD_MAT;
 					if (rte_ring_enqueue(b->mat, mbuf) != 0)
 						rte_pktmbuf_free(mbuf);
 					continue;
@@ -427,9 +448,9 @@ bridge_process(void *p)
 			}
 
 			// Forward to VIF
-			md->md_vif.flags &= ~LAGOPUS_MD_MAT;
+			md->common.flags &= ~VSW_MD_MAT;
 			if (!dispatch_packet(b, mbufs[i]))
-				LAGOPUS_DEBUG("brdige: dispatch failed.");
+				BRIDGE_DEBUG("brdige: dispatch failed.");
 		}
 	}
 
@@ -455,7 +476,7 @@ bridge_deinit(void *p)
 	rte_free(r);
 }
 
-struct lagopus_runtime_ops bridge_runtime_ops = {
+struct vsw_runtime_ops bridge_runtime_ops = {
 	.init = bridge_init,
 	.process = bridge_process,
 	.deinit = bridge_deinit,

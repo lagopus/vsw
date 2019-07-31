@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef _LAGOPUS_MODULES_BRIDGE_H
-#define _LAGOPUS_MODULES_BRIDGE_H
+#ifndef VSW_MODULES_BRIDGE_H_
+#define VSW_MODULES_BRIDGE_H_
 
 #include <stdbool.h>
 #include <rte_ether.h>
@@ -44,7 +44,7 @@ struct bridge_vif {
 };
 
 struct bridge_instance {
-	struct lagopus_instance base;
+	struct vsw_instance base;
 	uint32_t		domain_id;
 
 	// Filled by backend
@@ -71,11 +71,11 @@ typedef enum {
 	BRIDGE_CMD_MAC_ADD,		// Add MAC entry to the bridge domain
 	BRIDGE_CMD_MAC_DELETE,		// Delete MAC entry from the bridge domain
 
+	BRIDGE_CMD_SET_MTU,		// Set MTU in the bridge domain
+
 	BRIDGE_CMD_SET_MAX_ENTRIES,	// Set Max MAC Entries
 
 	BRIDGE_CMD_SET_MAT,		// Set ring for MAT
-
-	BRIDGE_CMD_END
 } bridge_cmd_t;
 
 struct bridge_control_param {
@@ -101,6 +101,6 @@ struct bridge_learn {
 	struct ether_addr mac;		// Observed MAC
 };
 
-extern struct lagopus_runtime_ops bridge_runtime_ops;
+extern struct vsw_runtime_ops bridge_runtime_ops;
 
-#endif /* _LAGOPUS_MODULES_BRIDGE_H */
+#endif /* VSW_MODULES_BRIDGE_H_ */

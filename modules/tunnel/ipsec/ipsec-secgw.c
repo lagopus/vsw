@@ -1,3 +1,19 @@
+/*
+ * Copyright 2019 Nippon Telegraph and Telephone Corporation.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*-
  *   BSD LICENSE
  *
@@ -33,14 +49,17 @@
 
 #include <netinet/ip.h>
 #include <netinet/ip6.h>
+#include <numa.h>
 #include <rte_ip.h>
 #include <rte_mbuf.h>
 
 #include "module.h"
 #include "ipsec.h"
+#include "esp.h"
 #include "sp4.h"
 #include "sp6.h"
 #include "ipsecvsw.h"
+#include "nat_t.h"
 
 /* For performance improvement(inline expansion). */
 #include "ifaces.c"
@@ -48,34 +67,7 @@
 /* Configure how many packets ahead to prefetch, when reading packets */
 #define PREFETCH_OFFSET	3
 
-#if RTE_BYTE_ORDER != RTE_LITTLE_ENDIAN
-#define __BYTES_TO_UINT64(a, b, c, d, e, f, g, h) \
-  (((uint64_t)((a) & 0xff) << 56) | \
-   ((uint64_t)((b) & 0xff) << 48) | \
-   ((uint64_t)((c) & 0xff) << 40) | \
-   ((uint64_t)((d) & 0xff) << 32) | \
-   ((uint64_t)((e) & 0xff) << 24) | \
-   ((uint64_t)((f) & 0xff) << 16) | \
-   ((uint64_t)((g) & 0xff) << 8)  | \
-   ((uint64_t)(h) & 0xff))
-#else
-#define __BYTES_TO_UINT64(a, b, c, d, e, f, g, h) \
-  (((uint64_t)((h) & 0xff) << 56) | \
-   ((uint64_t)((g) & 0xff) << 48) | \
-   ((uint64_t)((f) & 0xff) << 40) | \
-   ((uint64_t)((e) & 0xff) << 32) | \
-   ((uint64_t)((d) & 0xff) << 24) | \
-   ((uint64_t)((c) & 0xff) << 16) | \
-   ((uint64_t)((b) & 0xff) << 8) | \
-   ((uint64_t)(a) & 0xff))
-#endif
-#define ETHADDR(a, b, c, d, e, f) (__BYTES_TO_UINT64(a, b, c, d, e, f, 0, 0))
-
-#define ETHADDR_TO_UINT64(addr) __BYTES_TO_UINT64( \
-    addr.addr_bytes[0], addr.addr_bytes[1], \
-    addr.addr_bytes[2], addr.addr_bytes[3], \
-    addr.addr_bytes[4], addr.addr_bytes[5], \
-    0, 0)
+#define ETHADDR(a, b, c, d, e, f) (BYTES_TO_UINT64(a, b, c, d, e, f, 0, 0))
 
 struct ethaddr_info ethaddr_tbl[RTE_MAX_ETHPORTS] = {0};
 
@@ -90,15 +82,29 @@ struct ipsec_traffic {
   struct traffic_type ipsec;
   struct traffic_type ip4;
   struct traffic_type ip6;
+  struct traffic_type ike;
 };
+
+typedef lagopus_result_t
+(*prepare_one_packet_proc_t)(struct rte_mbuf *pkt,
+                             uint8_t *proto,
+                             size_t size_of_ip,
+                             struct traffic_type *t_ipsec,
+                             struct traffic_type *t_ike,
+                             struct traffic_type *t_ip);
+
+typedef void
+(*prepare_tx_pkt_proc_t)(struct rte_mbuf *pkt, iface_stats_t *stats);
 
 struct ipsec_data {
   pthread_t tid;
-  bool is_first;
-  bool is_succeeded;
   ipsecvsw_queue_role_t role;
   uint32_t socket_id;
+  bool is_core_bind;
+  uint64_t core_mask;
+  cpu_set_t cpu_set;
   vrfindex_t vrf_index; /* current VRF Index. */
+  vifindex_t vif_index; /* current VIF Index. */
   lagopus_chrono_t now;
   struct sa_ctx *sad; /* current sad with VRF.*/
   struct sa_ctx *sads[VRF_MAX_ENTRY];
@@ -108,55 +114,147 @@ struct ipsec_data {
   struct spd6 *spd6s[VRF_MAX_ENTRY];
   struct iface *iface;
   struct ifaces *ifaces;
+  prepare_one_packet_proc_t prepare_one_packet_proc;
+  prepare_tx_pkt_proc_t prepare_tx_pkt_proc;
   bool running;
   ipsecvsw_session_gc_ctx_record session_gc_ctx;
 };
 
-static inline void
-prepare_one_packet(struct rte_mbuf *pkt, struct ipsec_traffic *t,
-                   uint8_t ttl, int8_t tos) {
-  uint8_t *nlp;
-  struct ether_hdr *eth;
+lagopus_result_t
+prepare_one_packet_inbound(struct rte_mbuf *pkt,
+                           uint8_t *proto,
+                           size_t size_of_ip,
+                           struct traffic_type *t_ipsec,
+                           struct traffic_type *t_ike,
+                           struct traffic_type *t_ip) {
+  struct vsw_packet_metadata *metadata = VSW_MBUF_METADATA(pkt);
   struct ipsec_mbuf_metadata *priv = get_priv(pkt);
+  uint16_t nat_t_len;
+
+  if (unlikely(nat_t_is_ike_pkt(pkt, *proto,
+                                ETHER_HDR_LEN + size_of_ip))) {
+    /* IKE packet. */
+    /* NOTE: Not frequent. */
+    metadata->common.to_tap = true;
+    t_ike->pkts[(t_ike->num)++] = pkt;
+    return LAGOPUS_RESULT_OK;
+  }
+
+  /* ESP(Normal, NAT-T) packet.*/
+  if (likely(rte_pktmbuf_adj(pkt, ETHER_HDR_LEN) != NULL)) {
+    if (*proto == IPPROTO_ESP) {
+      /* ESP. */
+      IPSEC_SET_NAT_T_LEN(priv, 0);
+    } else if ((nat_t_len = nat_t_get_len_by_proto(*proto)) != 0) {
+      /* NAT-T. */
+      IPSEC_SET_NAT_T_LEN(priv, nat_t_len);
+    } else {
+      TUNNEL_ERROR("Unsupported packet type(%d).", *proto);
+      return LAGOPUS_RESULT_UNKNOWN_PROTO;
+    }
+
+    t_ipsec->pkts[(t_ipsec->num)++] = pkt;
+    return LAGOPUS_RESULT_OK;
+  }
+
+  TUNNEL_ERROR("No memory.");
+  return LAGOPUS_RESULT_NO_MEMORY;
+}
+
+lagopus_result_t
+prepare_one_packet_outbound(struct rte_mbuf *pkt,
+                            uint8_t *proto,
+                            size_t size_of_ip,
+                            struct traffic_type *t_ipsec,
+                            struct traffic_type *t_ike,
+                            struct traffic_type *t_ip) {
+  struct ipsec_mbuf_metadata *priv = get_priv(pkt);
+
+  /* IP packet. */
+  if (likely(rte_pktmbuf_adj(pkt, ETHER_HDR_LEN) != NULL)) {
+    t_ip->data[t_ip->num] = proto;
+    t_ip->pkts[(t_ip->num)++] = pkt;
+    IPSEC_SET_NAT_T_LEN(priv, 0);
+
+    /* set inner packet bytes(for stats). */
+    set_meta_inner_pkt_bytes(pkt);
+
+    return LAGOPUS_RESULT_OK;
+  }
+
+  TUNNEL_ERROR("No memory.");
+  return LAGOPUS_RESULT_NO_MEMORY;
+}
+
+static inline void
+prepare_one_packet(struct module *myself,
+                   struct rte_mbuf *pkt,
+                   struct ipsec_traffic *t,
+                   uint8_t ttl, int8_t tos,
+                   iface_stats_t *stats) {
+  lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
+  struct ipsec_data *data = myself->context;
+  struct ipsec_mbuf_metadata *priv = get_priv(pkt);
+  struct ether_hdr *eth;
+  struct ip *ip;
+
+  /* Flooding packet. */
+  if (unlikely(IS_FLOODING(pkt) == true)) {
+    /* Flooding packet: drop the packet */
+    TUNNEL_ERROR("Flooding packet.");
+    ret = LAGOPUS_RESULT_UNSUPPORTED;
+    goto done;
+  }
+
+  /* Linearize mbuf. */
+  /* NOTE: Crypto PMD doesn't support segmented mbuf. */
+  if (unlikely(rte_pktmbuf_linearize(pkt) != 0)) {
+    /* not enough tailroom: drop the packet. */
+    TUNNEL_ERROR("Not enough tailroom.");
+    ret = LAGOPUS_RESULT_NO_MEMORY;
+    goto done;
+  }
 
   /* Set TTL/TOS. */
   priv->ttl = ttl;
   priv->tos = tos;
 
   eth = rte_pktmbuf_mtod(pkt, struct ether_hdr *);
+  ip = rte_pktmbuf_mtod_offset(pkt, struct ip *, sizeof(struct ether_hdr));
 
-  if (unlikely(IS_FLOODING(pkt) == true)) {
-    /* Flooding packet: drop the packet */
-    lagopus_msg_error("Flooding packet.\n");
-    rte_pktmbuf_free(pkt);
-  } else if (eth->ether_type == rte_cpu_to_be_16(ETHER_TYPE_IPv4)) {
-    nlp = (uint8_t *)rte_pktmbuf_adj(pkt, ETHER_HDR_LEN);
-    nlp = RTE_PTR_ADD(nlp, offsetof(struct ip, ip_p));
-    if (*nlp == IPPROTO_ESP) {
-      t->ipsec.pkts[(t->ipsec.num)++] = pkt;
-    } else {
-      t->ip4.data[t->ip4.num] = nlp;
-      t->ip4.pkts[(t->ip4.num)++] = pkt;
-    }
+  if (eth->ether_type == rte_cpu_to_be_16(ETHER_TYPE_IPv4)) {
+    /* IPv4. */
+    ret = data->prepare_one_packet_proc(pkt, &ip->ip_p,
+                                        sizeof(struct ip),
+                                        &t->ipsec, &t->ike, &t->ip4);
   } else if (eth->ether_type == rte_cpu_to_be_16(ETHER_TYPE_IPv6)) {
-    nlp = (uint8_t *)rte_pktmbuf_adj(pkt, ETHER_HDR_LEN);
-    nlp = RTE_PTR_ADD(nlp, offsetof(struct ip6_hdr, ip6_nxt));
-    if (*nlp == IPPROTO_ESP) {
-      t->ipsec.pkts[(t->ipsec.num)++] = pkt;
-    } else {
-      t->ip6.data[t->ip6.num] = nlp;
-      t->ip6.pkts[(t->ip6.num)++] = pkt;
-    }
+    /* IPv6. */
+    struct ip6_hdr *ip6 = (struct ip6_hdr *) ip;
+    ret = data->prepare_one_packet_proc(pkt, &ip6->ip6_nxt,
+                                        sizeof(struct ip6_hdr),
+                                        &t->ipsec, &t->ike, &t->ip6);
   } else {
-    /* Unknown/Unsupported type: drop the packet */
-    lagopus_msg_error("Unsupported packet type.\n");
+    /* Unknown/Unsupported type. */
+    TUNNEL_ERROR("Unsupported packet type.");
+    ret = LAGOPUS_RESULT_UNKNOWN_PROTO;
+  }
+
+done:
+  if (unlikely(ret != LAGOPUS_RESULT_OK)) {
+    /* drop packet. */
+    if (ret == LAGOPUS_RESULT_UNKNOWN_PROTO) {
+      iface_stats_update_unknown_protos(stats);
+    } else {
+      iface_stats_update_errors(stats);
+    }
     rte_pktmbuf_free(pkt);
   }
 }
 
 static inline void
 prepare_traffic(struct module *myself, struct rte_mbuf **pkts,
-                struct ipsec_traffic *t, uint16_t nb_pkts) {
+                struct ipsec_traffic *t, uint16_t nb_pkts,
+                iface_stats_t *stats) {
   struct ipsec_data *data = myself->context;
   int32_t i;
   uint8_t ttl;
@@ -165,6 +263,7 @@ prepare_traffic(struct module *myself, struct rte_mbuf **pkts,
   t->ipsec.num = 0;
   t->ip4.num = 0;
   t->ip6.num = 0;
+  t->ike.num = 0;
 
   ttl = iface_get_ttl(data->iface);
   tos = iface_get_tos(data->iface);
@@ -172,18 +271,38 @@ prepare_traffic(struct module *myself, struct rte_mbuf **pkts,
   for (i = 0; i < (nb_pkts - PREFETCH_OFFSET); i++) {
     rte_prefetch0(rte_pktmbuf_mtod(pkts[i + PREFETCH_OFFSET],
                                    void *));
-    prepare_one_packet(pkts[i], t, ttl, tos);
+    prepare_one_packet(myself, pkts[i], t, ttl, tos, stats);
   }
   /* Process left packets */
   for (; i < nb_pkts; i++) {
-    prepare_one_packet(pkts[i], t, ttl, tos);
+    prepare_one_packet(myself, pkts[i], t, ttl, tos, stats);
   }
 }
 
+void
+prepare_tx_pkt_inbound(struct rte_mbuf *pkt, iface_stats_t *stats) {
+  /* set inner packet bytes(for stats). */
+  set_meta_inner_pkt_bytes(pkt);
+  /* update stats. */
+  iface_stats_update(stats, pkt);
+  return;
+}
+
+void
+prepare_tx_pkt_outbound(struct rte_mbuf *pkt, iface_stats_t *stats) {
+  /* update stats. */
+  iface_stats_update(stats, pkt);
+  return;
+}
+
 static inline void
-prepare_tx_pkt(struct rte_mbuf *pkt) {
+prepare_tx_pkt(struct module *myself, struct rte_mbuf *pkt,
+               iface_stats_t *stats) {
+  struct ipsec_data *data = myself->context;
   struct ip *ip;
   struct ether_hdr *ethhdr;
+
+  data->prepare_tx_pkt_proc(pkt, stats);
 
   ip = rte_pktmbuf_mtod(pkt, struct ip *);
 
@@ -195,7 +314,6 @@ prepare_tx_pkt(struct rte_mbuf *pkt) {
     ipv4_hdr->hdr_checksum = 0;
     ipv4_hdr->hdr_checksum = rte_ipv4_cksum(ipv4_hdr);
     pkt->ol_flags |= PKT_TX_IPV4;
-
     pkt->l3_len = sizeof(struct ip);
     pkt->l2_len = ETHER_HDR_LEN;
 
@@ -213,17 +331,20 @@ prepare_tx_pkt(struct rte_mbuf *pkt) {
 }
 
 static inline void
-prepare_tx_burst(struct rte_mbuf *pkts[], uint16_t nb_pkts) {
+prepare_tx_burst(struct module *myself,
+                 struct rte_mbuf *pkts[],
+                 uint16_t nb_pkts,
+                 iface_stats_t *stats) {
   int32_t i;
   const int32_t prefetch_offset = 2;
 
   for (i = 0; i < (nb_pkts - prefetch_offset); i++) {
     rte_mbuf_prefetch_part2(pkts[i + prefetch_offset]);
-    prepare_tx_pkt(pkts[i]);
+    prepare_tx_pkt(myself, pkts[i], stats);
   }
   /* Process left packets */
   for (; i < nb_pkts; i++) {
-    prepare_tx_pkt(pkts[i]);
+    prepare_tx_pkt(myself, pkts[i], stats);
   }
 }
 
@@ -233,7 +354,8 @@ inbound_sp_sa(struct module *module,
               sp_classify_spd_proc_t classify_proc,
               sp_set_lifetime_current_proc_t set_lifetime_proc,
               struct traffic_type *ip,
-              uint16_t lim) {
+              uint16_t lim,
+              iface_stats_t *stats) {
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
   struct ipsec_data *data = module->context;
   struct rte_mbuf *m;
@@ -254,7 +376,7 @@ inbound_sp_sa(struct module *module,
       if (unlikely((ret = set_lifetime_proc(spd, sa_idx,
                                             data->now)) !=
                    LAGOPUS_RESULT_OK)) {
-        lagopus_perror(ret);
+        TUNNEL_PERROR(ret);
         return;
       }
 
@@ -263,16 +385,21 @@ inbound_sp_sa(struct module *module,
         continue;
       }
       if (res & RESERVED) {
-        lagopus_msg_error("Used RESERVED rules.\n");
+        TUNNEL_ERROR("Used RESERVED rules(%"PRIu32").", res);
+        iface_stats_update_errors(stats);
         rte_pktmbuf_free(m);
         continue;
       }
       if (res & DISCARD || i < lim) {
+        TUNNEL_DEBUG("DISCARD(%"PRIu32").", res);
+        iface_stats_update_errors(stats);
         rte_pktmbuf_free(m);
         continue;
       }
       /* Only check SPI match for processed IPSec packets */
       if (sa_idx == 0 || !inbound_sa_check(data->sad, m, sa_idx)) {
+        TUNNEL_DEBUG("DISCARD(%"PRIu32").", sa_idx);
+        iface_stats_update_errors(stats);
         rte_pktmbuf_free(m);
         continue;
       }
@@ -280,8 +407,9 @@ inbound_sp_sa(struct module *module,
     }
     ip->num = j;
   } else {
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
     for (i = 0; i < ip->num; i++) {
+      iface_stats_update_errors(stats);
       rte_pktmbuf_free(ip->pkts[i]);
     }
   }
@@ -290,7 +418,8 @@ inbound_sp_sa(struct module *module,
 static inline void
 process_pkts_inbound(struct module *module,
                      const pthread_t tid,
-                     struct ipsec_traffic *traffic) {
+                     struct ipsec_traffic *traffic,
+                     iface_stats_t *stats) {
   struct ipsec_data *data = module->context;
   struct rte_mbuf *m;
   uint32_t idx;
@@ -300,7 +429,8 @@ process_pkts_inbound(struct module *module,
   nb_pkts_in = ipsec_esp_inbound(tid, data->sad,
                                  traffic->ipsec.pkts,
                                  traffic->ipsec.num,
-                                 data->now, MAX_PKT_BURST);
+                                 data->now, MAX_PKT_BURST,
+                                 stats);
 
   n_ip4 = (uint16_t)traffic->ip4.num;
   n_ip6 = (uint16_t)traffic->ip6.num;
@@ -321,14 +451,15 @@ process_pkts_inbound(struct module *module,
                                uint8_t *,
                                offsetof(struct ip6_hdr, ip6_nxt));
     } else {
+      iface_stats_update_unknown_protos(stats);
       rte_pktmbuf_free(m);
     }
   }
 
   inbound_sp_sa(module, (void *)data->spd4, sp4_classify_spd_in,
-                sp4_set_lifetime_current, &traffic->ip4, n_ip4);
+                sp4_set_lifetime_current, &traffic->ip4, n_ip4, stats);
   inbound_sp_sa(module, (void *)data->spd6, sp6_classify_spd_in,
-                sp6_set_lifetime_current, &traffic->ip6, n_ip6);
+                sp6_set_lifetime_current, &traffic->ip6, n_ip6, stats);
 }
 
 static inline void
@@ -337,7 +468,8 @@ outbound_sp(struct module *module,
             sp_classify_spd_proc_t classify_proc,
             sp_set_lifetime_current_proc_t set_lifetime_proc,
             struct traffic_type *ip,
-            struct traffic_type *ipsec) {
+            struct traffic_type *ipsec,
+            iface_stats_t *stats) {
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
   struct ipsec_data *data = module->context;
   struct rte_mbuf *m = NULL;
@@ -359,31 +491,40 @@ outbound_sp(struct module *module,
       if (unlikely((ret = set_lifetime_proc(spd, sa_idx,
                                             data->now)) !=
                    LAGOPUS_RESULT_OK)) {
-        lagopus_perror(ret);
+        TUNNEL_PERROR(ret);
         return;
       }
 
       if ((ip->res[i] == 0) || (ip->res[i] & DISCARD)) {
+        TUNNEL_DEBUG("DISCARD(%"PRIu32").", ip->res[i]);
+        iface_stats_update_errors(stats);
         rte_pktmbuf_free(m);
       } else if (ip->res[i] & RESERVED) {
-        lagopus_msg_error("Used RESERVED rules.\n");
+        TUNNEL_ERROR("Used RESERVED rules(%"PRIu32").", ip->res[i]);
+        iface_stats_update_errors(stats);
         rte_pktmbuf_free(m);
+      } else if (ip->res[i] & BYPASS) {
+        ip->pkts[j++] = m;
+        priv->sp_entry_id = DATA2SP_ENTRY_ID(ip->res[i]);
+        TUNNEL_DEBUG("OK BYPASS(%"PRIu32").", ip->res[i]);
       } else if (sa_idx != 0 && sa_idx < IPSEC_SA_MAX_ENTRIES) {
         ipsec->res[ipsec->num] = sa_idx;
         ipsec->pkts[ipsec->num++] = m;
         priv->sp_entry_id = DATA2SP_ENTRY_ID(ip->res[i]);
-        lagopus_msg_debug(1, "OK, sa index = %"PRIu32
-                          ", entry id = %"PRIu32".\n",
-                          sa_idx, priv->sp_entry_id);
-      } else {/* BYPASS */
-        ip->pkts[j++] = m;
-        priv->sp_entry_id = DATA2SP_ENTRY_ID(ip->res[i]);
+        TUNNEL_DEBUG("OK, sa index = %"PRIu32
+                     ", entry id = %"PRIu32".",
+                     sa_idx, priv->sp_entry_id);
+      } else {
+        TUNNEL_ERROR("Bad SA entry(%"PRIu32").", ip->res[i]);
+        iface_stats_update_errors(stats);
+        rte_pktmbuf_free(m);
       }
     }
     ip->num = j;
   } else {
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
     for (i = 0; i < ip->num; i++) {
+      iface_stats_update_errors(stats);
       rte_pktmbuf_free(ip->pkts[i]);
     }
   }
@@ -392,7 +533,8 @@ outbound_sp(struct module *module,
 static inline void
 process_pkts_outbound(struct module *module,
                       const pthread_t tid,
-                      struct ipsec_traffic *traffic) {
+                      struct ipsec_traffic *traffic,
+                      iface_stats_t *stats) {
   struct ipsec_data *data = module->context;
   struct rte_mbuf *m;
   uint32_t idx;
@@ -401,22 +543,24 @@ process_pkts_outbound(struct module *module,
 
   /* Drop any IPsec traffic from protected ports */
   for (i = 0; i < traffic->ipsec.num; i++) {
+    iface_stats_update_errors(stats);
     rte_pktmbuf_free(traffic->ipsec.pkts[i]);
   }
 
   traffic->ipsec.num = 0;
 
   outbound_sp(module, (void *) data->spd4, sp4_classify_spd_out,
-              sp4_set_lifetime_current, &traffic->ip4, &traffic->ipsec);
+              sp4_set_lifetime_current, &traffic->ip4, &traffic->ipsec, stats);
 
   outbound_sp(module, (void *) data->spd6, sp6_classify_spd_out,
-              sp6_set_lifetime_current, &traffic->ip6, &traffic->ipsec);
+              sp6_set_lifetime_current, &traffic->ip6, &traffic->ipsec, stats);
 
   nb_pkts_out = ipsec_esp_outbound(tid, data->sad,
                                    traffic->ipsec.pkts,
                                    traffic->ipsec.res,
                                    traffic->ipsec.num,
-                                   data->now, MAX_PKT_BURST);
+                                   data->now, MAX_PKT_BURST,
+                                   stats);
 
   for (i = 0; i < nb_pkts_out; i++) {
     m = traffic->ipsec.pkts[i];
@@ -442,15 +586,15 @@ ipsec_pre_process(struct ipsec_data *data) {
   if (unlikely((ret = sad_pre_process(data->sad, data->role, data->tid,
                                       &(data->session_gc_ctx)))
                != LAGOPUS_RESULT_OK)) {
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
     goto done;
   }
   if (unlikely((ret = sp4_pre_process(data->spd4)) != LAGOPUS_RESULT_OK)) {
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
     goto done;
   }
   if (unlikely((ret = sp6_pre_process(data->spd6)) != LAGOPUS_RESULT_OK)) {
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
     goto done;
   }
 
@@ -463,17 +607,163 @@ ipsec_post_process(struct ipsec_data *data) {
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
 
   if (unlikely((ret = sp4_post_process(data->spd4)) != LAGOPUS_RESULT_OK)) {
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
     goto done;
   }
   if (unlikely((ret = sp6_post_process(data->spd6)) != LAGOPUS_RESULT_OK)) {
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
     goto done;
   }
   if (unlikely((ret = sad_post_process(data->sad)) != LAGOPUS_RESULT_OK)) {
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
     goto done;
   }
+
+done:
+  return ret;
+}
+
+static inline lagopus_result_t
+core_affinity(pthread_t tid,
+              cpu_set_t *cpu_set) {
+  int r;
+
+  r = pthread_setaffinity_np(tid, sizeof(cpu_set_t), cpu_set);
+  if (unlikely(r < 0)) {
+    TUNNEL_ERROR("failed pthread_setaffinity_np(): %s",
+                 strerror(errno));
+    return LAGOPUS_RESULT_POSIX_API_ERROR;
+  }
+
+  return LAGOPUS_RESULT_OK;
+}
+
+#define BIT_LSB (0x1ULL)
+#define BIT_MASK_LSB (BIT_LSB)
+
+static inline void
+set_cpu_set(uint64_t core_mask, cpu_set_t *cpu_set) {
+  uint64_t mask, i;
+
+  CPU_ZERO(cpu_set);
+  for (mask = core_mask, i = 0ULL; mask != 0ULL; mask >>= BIT_LSB, i++) {
+    if (mask & BIT_MASK_LSB) {
+      /* set cup_set. */
+      CPU_SET((int) i, cpu_set);
+    }
+  }
+}
+
+static inline uint32_t
+get_socket_id(uint64_t core_mask) {
+  int socket_id = SOCKET_ID_ANY;
+  uint64_t mask, i;
+
+  for (mask = core_mask, i = 0ULL; mask != 0ULL; mask >>= BIT_LSB, i++) {
+    if (mask & BIT_MASK_LSB) {
+      if (socket_id == SOCKET_ID_ANY) {
+        socket_id = numa_node_of_cpu((int) i);
+        continue;
+      }
+      if (socket_id != numa_node_of_cpu((int) i)) {
+        socket_id = SOCKET_ID_ANY;
+        break;
+      }
+    }
+  }
+
+  if (socket_id == SOCKET_ID_ANY) {
+    socket_id = DEFAULT_SOCKET_ID;
+  }
+
+  return (uint32_t) socket_id;
+}
+
+static inline lagopus_result_t
+ipsec_setup_cdevqs(struct module *myself) {
+  lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
+  struct ipsec_data *data = myself->context;
+  size_t n_qs;
+  size_t n_actual = 0;
+
+  /*
+   * FIXME:
+   *   For single-threaded operation, we need to scan whole the
+   *   cdevqs for get.
+   */
+  ret = ipsecvsw_get_cdevqs_no(data->role);
+  if (likely((ret > 0))) {
+    n_qs = (size_t)ret;
+    ret = ipsecvsw_acquire_cdevqs_for_get(data->tid, data->role,
+                                          n_qs, &n_actual);
+    if (unlikely((size_t)ret != n_qs)) {
+      if (ret < 0) {
+        TUNNEL_PERROR(ret);
+        TUNNEL_ERROR("can't acquire crypto device queues to get.");
+        goto done;
+      } else {
+        /* Modified to "ERROR".                                    */
+        /* Original code is "WARNING":                             */
+        /*   Because it considered "cdevqs" was added dynamically. */
+        ret = LAGOPUS_RESULT_INVALID_OBJECT;
+        TUNNEL_PERROR(ret);
+        TUNNEL_ERROR("can't acquire all cyrpto device queues "
+                     "to get.");
+        goto done;
+      }
+    }
+  }
+
+  ipsecvsw_session_gc_initialize(data->tid,
+                                 &(data->session_gc_ctx));
+  ret = LAGOPUS_RESULT_OK;
+
+done:
+  return ret;
+}
+
+static inline lagopus_result_t
+ipsec_setup(struct module *myself) {
+  lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
+  struct ipsec_data *data = myself->context;
+  int r;
+
+  /* get thread ID. */
+  data->tid = pthread_self();
+
+  /* set name of thread. */
+  r = pthread_setname_np(data->tid, data->role == ipsecvsw_queue_role_inbound ?
+                         "ipsec-inbound" : "ipsec-outbound");
+  if (unlikely(r < 0)) {
+    TUNNEL_ERROR("failed pthread_setname_np(): %s",
+                 strerror(errno));
+    ret = LAGOPUS_RESULT_POSIX_API_ERROR;
+    TUNNEL_PERROR(ret);
+    goto done;
+  }
+
+  /* CPU core affinity.  */
+  if (data->is_core_bind) {
+    TUNNEL_DEBUG("IPsec core_affinity: %s : core mask = 0x%"PRIx64","
+                 " socket_id = %d.",
+                 data->role == ipsecvsw_queue_role_inbound ?
+                 "inbound" : "outbound",
+                 data->core_mask, data->socket_id);
+    ret = core_affinity(data->tid, &data->cpu_set);
+    if (unlikely(ret != LAGOPUS_RESULT_OK)) {
+      TUNNEL_PERROR(ret);
+      goto done;
+    }
+  }
+
+  TUNNEL_DEBUG("setup cdevqs.");
+  ret = ipsec_setup_cdevqs(myself);
+  if (unlikely(ret != LAGOPUS_RESULT_OK)) {
+    TUNNEL_PERROR(ret);
+    goto done;
+  }
+
+  ret = LAGOPUS_RESULT_OK;
 
 done:
   return ret;
@@ -489,55 +779,78 @@ static void
 s_cdevq_init_once(void) {
   lagopus_result_t r = ipsecvsw_setup_cdevq(NULL);
   if (unlikely(r != LAGOPUS_RESULT_OK)) {
-    lagopus_perror(r);
-    lagopus_msg_error("can't initialize DPDK crypto device(s).\n");
+    TUNNEL_PERROR(r);
+    TUNNEL_ERROR("can't initialize DPDK crypto device(s).");
   }
 }
-
 
 lagopus_result_t
 ipsec_configure(struct module *myself, void *p) {
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
-  size_t i;
   struct ipsec_data *data = myself->context;
-  struct ipsec_param *param = p;
+  struct ipsec_params *params = p;
+  size_t i;
 
-  /*
-   * FIXME:
-   *	It's kinda useless to decide where to allocate SA/SP tables at
-   *	this moment, tho;
-   */
-  uint32_t socket_id = rte_socket_id();
-  if (socket_id == LCORE_ID_ANY) {
-    socket_id = 0;
-  }
+  data->role = params->role;
+  if (likely(data->role == ipsecvsw_queue_role_inbound ||
+             data->role == ipsecvsw_queue_role_outbound)) {
+    if (data->role == ipsecvsw_queue_role_inbound) {
+      data->prepare_one_packet_proc = prepare_one_packet_inbound;
+      data->prepare_tx_pkt_proc = prepare_tx_pkt_inbound;
+      data->core_mask = params->inbound_core_mask;
+    } else {
+      data->prepare_one_packet_proc = prepare_one_packet_outbound;
+      data->prepare_tx_pkt_proc = prepare_tx_pkt_outbound;
+      data->core_mask = params->outbound_core_mask;
+    }
 
-  if (param->role == ipsecvsw_queue_role_inbound ||
-      param->role == ipsecvsw_queue_role_outbound) {
-    data->socket_id = socket_id;
-    data->role = param->role;
-    data->running = false;
-    data->is_first = true;
+    data->is_core_bind = params->is_core_bind;
+    if (data->is_core_bind) {
+      /* set cpu_set. */
+      set_cpu_set(data->core_mask, &data->cpu_set);
+      /* get socket_id. */
+      data->socket_id = get_socket_id(data->core_mask);
+    } else {
+      data->socket_id = DEFAULT_SOCKET_ID;
+    }
 
     (void)pthread_once(&s_cdev_once, s_cdevq_init_once);
 
-    // assumed single core per module.
-    ifaces_initialize(&data->ifaces);
-    lagopus_msg_debug(1, "sad_init()\n");
+    /* assumed single core per module. */
+    ret = ifaces_initialize(&data->ifaces);
+    TUNNEL_DEBUG("initialize ifaces.");
+    if (unlikely(ret != LAGOPUS_RESULT_OK)) {
+      TUNNEL_PERROR(ret);
+      goto done;
+    }
+
+    TUNNEL_DEBUG("initialize SAD/SPD.");
     for (i = 0; i < VRF_MAX_ENTRY; i++) {
       ret = sad_init(&data->sads[i], data->socket_id, data->role);
       if (unlikely(ret != LAGOPUS_RESULT_OK)) {
-        lagopus_perror(ret);
+        TUNNEL_PERROR(ret);
         goto done;
       }
 
-      sp4_initialize(&data->spd4s[i], socket_id);
-      sp6_initialize(&data->spd6s[i], socket_id);
+      ret = sp4_initialize(&data->spd4s[i], data->socket_id);
+      if (unlikely(ret != LAGOPUS_RESULT_OK)) {
+        TUNNEL_PERROR(ret);
+        goto done;
+      }
+
+      ret = sp6_initialize(&data->spd6s[i], data->socket_id);
+      if (unlikely(ret != LAGOPUS_RESULT_OK)) {
+        TUNNEL_PERROR(ret);
+        goto done;
+      }
     }
+
+    data->running = false;
+
     ret = LAGOPUS_RESULT_OK;
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
 done:
@@ -563,108 +876,129 @@ ipsec_input(struct module *myself, struct rte_mbuf **mbufs, size_t n_mbufs) {
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
   struct ipsec_data *data = myself->context;
   struct ipsec_traffic traffic;
-  uint32_t i, send4, send6;
+  iface_stats_t *stats = NULL;
+  uint32_t i, send4 = 0, send6 = 0, sendike = 0;
 
-  if (unlikely(data->is_first == true)) {
-    size_t n_qs;
-    size_t n_actual = 0;
-    bool succeeded = false;
-
-    data->tid = pthread_self();
-    /*
-     * FIXME:
-     *	For single-threaded operation, we need to scan whole the
-     *	cdevqs for get.
-     */
-    ret = ipsecvsw_get_cdevqs_no(data->role);
-    if (likely((ret > 0))) {
-      n_qs = (size_t)ret;
-      ret = ipsecvsw_acquire_cdevqs_for_get(data->tid, data->role,
-                                            n_qs, &n_actual);
-      if (likely((size_t)ret == n_qs)) {
-        succeeded = true;
-      } else {
-        if (ret < 0) {
-          lagopus_perror(ret);
-          lagopus_msg_error("can't acquire crypto device queues to get.\n");
-        } else {
-          lagopus_msg_warning("can't acquire all cyrpto device queues "
-                              "to get.\n");
-        }
-      }
-    }
-
-    ipsecvsw_session_gc_initialize(data->tid,
-                                   &(data->session_gc_ctx));
-
-    data->is_first = false;
-    data->is_succeeded = succeeded;
+  if (unlikely(data->tid != pthread_self())) {
+    TUNNEL_ERROR("thread is changed from the first execution of this "
+                 "function which is strongly unacceptable.");
+    ret = LAGOPUS_RESULT_INVALID_OBJECT;
+    TUNNEL_PERROR(ret);
+    goto free;
   }
 
-  if (likely(data->is_succeeded == true)) {
+  if (unlikely(data->prepare_one_packet_proc == NULL)) {
+    TUNNEL_ERROR("prepare_one_packet_proc is NULL");
+    ret = LAGOPUS_RESULT_INVALID_OBJECT;
+    TUNNEL_PERROR(ret);
+    goto free;
+  }
 
-    if (unlikely(data->tid != pthread_self())) {
-      lagopus_exit_fatal("thread is changed from the first execution of this "
-                         "function which is strongly unacceptable.\n");
-    }
+  if (unlikely(data->prepare_tx_pkt_proc == NULL)) {
+    TUNNEL_ERROR("prepare_tx_pkt_proc is NULL");
+    ret = LAGOPUS_RESULT_INVALID_OBJECT;
+    TUNNEL_PERROR(ret);
+    goto free;
+  }
 
-    WHAT_TIME_IS_IT_NOW_IN_NSEC(data->now);
+  if (unlikely((stats = ifaces_get_stats_internal(
+          data->ifaces, data->vif_index)) == NULL)) {
+    TUNNEL_ERROR("stats is NULL");
+    ret = LAGOPUS_RESULT_INVALID_OBJECT;
+    TUNNEL_PERROR(ret);
+    goto free;
+  }
 
-    // pre.
-    if (unlikely((ret = ipsec_pre_process(data)) != LAGOPUS_RESULT_OK)) {
-      lagopus_perror(ret);
-      goto done;
-    }
+  WHAT_TIME_IS_IT_NOW_IN_NSEC(data->now);
 
-    ipsecvsw_session_ctx_gc(data->tid, &(data->session_gc_ctx));
+  // pre.
+  if (unlikely((ret = ipsec_pre_process(data)) != LAGOPUS_RESULT_OK)) {
+    TUNNEL_PERROR(ret);
+    goto free;
+  }
 
-    prepare_traffic(myself, mbufs, &traffic, (uint16_t)n_mbufs);
+  ipsecvsw_session_ctx_gc(data->tid, &(data->session_gc_ctx));
 
-    if (data->role == ipsecvsw_queue_role_inbound) {
-      process_pkts_inbound(myself, data->tid, &traffic);
-      prepare_tx_burst((struct rte_mbuf **)mbufs, (uint16_t)n_mbufs);
-    } else if (data->role == ipsecvsw_queue_role_outbound) {
-      process_pkts_outbound(myself, data->tid, &traffic);
-      prepare_tx_burst((struct rte_mbuf **)mbufs, (uint16_t)n_mbufs);
-    } else {
-      lagopus_msg_debug(1,"drop\n");
-    }
+  prepare_traffic(myself, mbufs, &traffic, (uint16_t)n_mbufs, stats);
 
-    // send next module.
-    if (likely(traffic.ip4.num != 0)) {
-      send4 = rte_ring_enqueue_burst(iface_get_output(data->iface),
-                                     (void **)traffic.ip4.pkts,
-                                     traffic.ip4.num,
+  if (data->role == ipsecvsw_queue_role_inbound) {
+    process_pkts_inbound(myself, data->tid, &traffic, stats);
+  } else if (data->role == ipsecvsw_queue_role_outbound) {
+    process_pkts_outbound(myself, data->tid, &traffic, stats);
+  } else {
+    TUNNEL_DEBUG("drop");
+  }
+
+  // send next module.
+  if (likely(traffic.ip4.num != 0)) {
+    prepare_tx_burst(myself, (struct rte_mbuf **)traffic.ip4.pkts,
+                     (uint16_t)traffic.ip4.num, stats);
+    send4 = rte_ring_enqueue_burst(iface_get_output(data->iface),
+                                   (void **)traffic.ip4.pkts,
+                                   traffic.ip4.num,
+                                   NULL);
+  }
+  if (likely(traffic.ip6.num != 0)) {
+    prepare_tx_burst(myself, (struct rte_mbuf **)traffic.ip6.pkts,
+                     (uint16_t)traffic.ip6.num, stats);
+    send6 = rte_ring_enqueue_burst(iface_get_output(data->iface),
+                                   (void **)traffic.ip6.pkts,
+                                   traffic.ip6.num,
+                                   NULL);
+  }
+  if (likely(traffic.ike.num != 0)) {
+    sendike = rte_ring_enqueue_burst(iface_get_output(data->iface),
+                                     (void **)traffic.ike.pkts,
+                                     traffic.ike.num,
                                      NULL);
-    }
-    if (likely(traffic.ip6.num != 0)) {
-      send6 = rte_ring_enqueue_burst(iface_get_output(data->iface),
-                                     (void **)traffic.ip6.pkts,
-                                     traffic.ip6.num,
-                                     NULL);
-    }
+  }
 
-    // free.
-    if (unlikely(traffic.ip4.num != send4)) {
-      for (i = send4; i < traffic.ip4.num; i++) {
-        rte_pktmbuf_free(traffic.ip4.pkts[i]);
+  // free.
+  if (unlikely(traffic.ip4.num != send4)) {
+    for (i = send4; i < traffic.ip4.num; i++) {
+      /* drop packets. */
+      iface_stats_update_dropped(stats);
+      rte_pktmbuf_free(traffic.ip4.pkts[i]);
+    }
+  }
+  if (unlikely(traffic.ip6.num != send6)) {
+    for (i = send6; i < traffic.ip6.num; i++) {
+      /* drop packets. */
+      iface_stats_update_dropped(stats);
+      rte_pktmbuf_free(traffic.ip6.pkts[i]);
+    }
+  }
+  if (unlikely(traffic.ike.num != sendike)) {
+    for (i = sendike; i < traffic.ike.num; i++) {
+      /* drop packets. */
+      iface_stats_update_dropped(stats);
+      rte_pktmbuf_free(traffic.ike.pkts[i]);
+    }
+  }
+
+  tunnel_debug_print_stats("ipsec", stats,
+                           data->role == ipsecvsw_queue_role_inbound ?
+                           TUNNEL_STATS_TYPE_INBOUND: TUNNEL_STATS_TYPE_OUTBOUND);
+
+  // post.
+  if (unlikely((ret = ipsec_post_process(data)) != LAGOPUS_RESULT_OK)) {
+    TUNNEL_PERROR(ret);
+    goto done;
+  }
+
+free:
+  if (unlikely(ret != LAGOPUS_RESULT_OK)) {
+    for (i = 0; i < n_mbufs; i++) {
+      if (stats != NULL) {
+        iface_stats_update_errors(stats);
       }
-    }
-    if (unlikely(traffic.ip6.num != send6)) {
-      for (i = send6; i < traffic.ip6.num; i++) {
-        rte_pktmbuf_free(traffic.ip6.pkts[i]);
-       }
-    }
-
-    // post.
-    if (unlikely((ret = ipsec_post_process(data)) != LAGOPUS_RESULT_OK)) {
-      lagopus_perror(ret);
-      goto done;
+      /* In this case, stats can't be updated. */
+      rte_pktmbuf_free(mbufs[i]);
     }
   }
 
 done:
-  return (ret >= 0) ? (size_t)ret : 0;
+  return ret;
 }
 
 uint32_t
@@ -732,7 +1066,7 @@ ipsec_add_ethaddr(uint8_t port,
     ret = LAGOPUS_RESULT_OK;
   } else {
     ret = LAGOPUS_RESULT_OUT_OF_RANGE;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
   return ret;
 }
@@ -746,6 +1080,14 @@ ipsec_mainloop(struct module *myself) {
   struct iface *iface;
   uint32_t n_mbufs;
 
+
+  /* setup. */
+  if (unlikely((ret = ipsec_setup(myself)) !=
+               LAGOPUS_RESULT_OK)) {
+    TUNNEL_PERROR(ret);
+    goto done;
+  }
+
   data->running = true;
   mbar();
   while (data->running) {
@@ -753,20 +1095,21 @@ ipsec_mainloop(struct module *myself) {
     if (unlikely((ret = ifaces_pre_process(data->ifaces,
                                            &active_ifaces)) !=
                  LAGOPUS_RESULT_OK)) {
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
       goto done;
     }
 
     TAILQ_FOREACH(iface, active_ifaces, entry) {
       data->iface = iface;
       data->vrf_index = iface_get_vrf_index(iface);
+      data->vif_index = iface_get_vif_index(iface);
 
       n_mbufs = (uint32_t) rte_ring_dequeue_burst(iface_get_input(data->iface),
                 (void **)mbufs, MAX_PKT_BURST, NULL);
       if (n_mbufs > 0) {
         ret = ipsec_input(myself, mbufs, (size_t) n_mbufs);
         if (ret != LAGOPUS_RESULT_OK) {
-          lagopus_perror(ret);
+          TUNNEL_PERROR(ret);
           goto done;
         }
       }
@@ -775,7 +1118,7 @@ ipsec_mainloop(struct module *myself) {
     // post.
     if (unlikely((ret = ifaces_post_process(data->ifaces)) !=
                  LAGOPUS_RESULT_OK)) {
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
       goto done;
     }
 

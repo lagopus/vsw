@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2018-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-#ifndef LAGOPUS_DPDK_H_
-#define LAGOPUS_DPDK_H_
+#ifndef VSW_DPDK_H_
+#define VSW_DPDK_H_
 
 extern int get_rte_errno();
 
-#endif /* LAGOPUS_DPDK_H_ */
+#endif /* VSW_DPDK_H_ */

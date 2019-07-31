@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,13 +23,12 @@ import "C"
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"sync"
 	"unsafe"
 
-	"github.com/lagopus/vsw/modules/tunnel"
-	"github.com/lagopus/vsw/modules/tunnel/ipsec/tick"
+	"github.com/lagopus/vsw/modules/tunnel/log"
+	"github.com/lagopus/vsw/modules/tunnel/tick"
 	"github.com/lagopus/vsw/vswitch"
 )
 
@@ -44,7 +43,7 @@ var (
 	tickerStoped  sync.Once
 	wg            sync.WaitGroup
 	lock          sync.Mutex
-	accessor      IfaceAccessor
+	accessor      Accessor
 	modules       = map[DirectionType]*Module{}
 	directions    = []DirectionType{
 		DirectionTypeOut,
@@ -52,17 +51,11 @@ var (
 	}
 )
 
-func init() {
-	if err := tunnel.RegisterConcreteIF(tunnel.IPsec,
-		newTunnelIF); err != nil {
-		log.Fatalf("%v", err)
-	}
-}
-
 // TunnelIF IPsec tunnel interface.
 type TunnelIF struct {
 	name      string
 	tvif      *TunnelVIF
+	counter   *C.struct_vsw_counter
 	lock      sync.Mutex
 	isEnabled bool
 }
@@ -71,7 +64,8 @@ type TunnelIF struct {
 type TunnelVIF struct {
 	tif       *TunnelIF
 	vif       *VIF
-	vrfIndex  vswitch.VRFIndex
+	vrf       *vswitch.VRF
+	counter   *C.struct_vsw_counter
 	lock      sync.Mutex
 	isEnabled bool
 }
@@ -86,9 +80,12 @@ type Module struct {
 	done      chan int
 }
 
+func init() {
+	ticker = tick.NewTicker()
+}
+
 func startTicker() {
 	fn := func() {
-		ticker = tick.GetTicker()
 		ticker.Start(&wg)
 	}
 	tickerStarted.Do(fn)
@@ -101,7 +98,7 @@ func stopTicker() {
 	tickerStoped.Do(fn)
 }
 
-func moduleNoLock(direction DirectionType) (*Module, error) {
+func moduleNoLock(direction DirectionType, params CParams) (*Module, error) {
 	// No lock.
 	// Assume module locked.
 
@@ -126,12 +123,11 @@ func moduleNoLock(direction DirectionType) (*Module, error) {
 		return nil, fmt.Errorf("%v: Can't create cmodule", m)
 	}
 
-	params := &C.struct_ipsec_param{}
-	params.role = m.direction.Role()
-
+	params.SetRole(m.direction)
 	if ret := C.ipsec_configure(m.cmodule,
-		unsafe.Pointer(params)); ret != C.LAGOPUS_RESULT_OK {
-		log.Fatalf("%v: Fail ipsec_configure(), %v.", m, ret)
+		unsafe.Pointer(&params)); ret != C.LAGOPUS_RESULT_OK {
+		return nil, fmt.Errorf("%v: Fail ipsec_configure(), %s", m,
+			C.GoString(C.lagopus_error_get_string(ret)))
 	}
 
 	modules[direction] = m
@@ -143,22 +139,27 @@ func module(direction DirectionType) (*Module, error) {
 	lock.Lock()
 	defer lock.Unlock()
 
-	return moduleNoLock(direction)
+	if m, ok := modules[direction]; ok {
+		return m, nil
+	}
+	return nil, fmt.Errorf("No found module: %v", direction)
 }
 
-func newTunnelIF(base *vswitch.BaseInstance, priv interface{},
-	config *tunnel.ModuleConfig) (tunnel.ConcreteIF, error) {
+// NewTunnelIF Create Tunnel IF.
+func NewTunnelIF(name string, counter *vswitch.Counter,
+	params CParams) (*TunnelIF, error) {
 	lock.Lock()
 	defer lock.Unlock()
 
 	for _, direction := range directions {
-		if _, err := moduleNoLock(direction); err != nil {
+		if _, err := moduleNoLock(direction, params); err != nil {
 			return nil, err
 		}
 	}
 
 	tif := &TunnelIF{
-		name: base.Name(),
+		name:    name,
+		counter: (*C.struct_vsw_counter)(unsafe.Pointer(counter)),
 	}
 
 	return tif, nil
@@ -169,29 +170,27 @@ func enable(i *TunnelIF, v *TunnelVIF) error {
 	defer lock.Unlock()
 
 	if i == nil || v == nil {
-		log.Printf("%v: TunnelIF or TunnelVIF is nil", i)
+		log.Logger.Err("%v: TunnelIF or TunnelVIF is nil", i)
 		// ignore.
 		return nil
 	}
 
 	if i.isEnabled && v.isEnabled {
-		log.Printf("%v: enable.", i)
+		log.Logger.Info("%v: enable.", i)
 
-		iiring := i.tvif.vif.Inbound()
-		ioring := i.tvif.vif.Outbound()
-		oring := i.tvif.vif.Output()
-		// TODO: get input.
+		inputInbound := i.tvif.vif.Inbound()
+		inputOutbound := i.tvif.vif.Outbound()
+		outputInbound := i.tvif.vif.Output()
+		outputOutbound := i.tvif.vif.Rules().Output(vswitch.MatchIPv4Dst)
 
-		if iiring == nil || ioring == nil || oring == nil {
-			return fmt.Errorf("%v: input_inbound(%p) or input_outbound(%p) or output(%p) is nil",
-				i, iiring, ioring, oring)
+		if inputInbound == nil || inputOutbound == nil ||
+			outputInbound == nil || outputOutbound == nil {
+			return fmt.Errorf("%v: input_inbound(%p) or input_outbound(%p) or "+
+				"output_Inbound(%p) is nil or output_outbound(%p) is nil",
+				i, inputInbound, inputOutbound, outputInbound, outputOutbound)
 		}
-		if accessor.SetRingFn != nil {
-			rings := NewRings(iiring, ioring, oring)
-			accessor.SetRingFn(i.tvif.vif.Index(), rings)
-		} else {
-			return fmt.Errorf("%v: setRingFn is nil", i)
-		}
+		rings := NewRings(inputInbound, inputOutbound, outputInbound, outputOutbound)
+		accessor.SetRingFn(i.tvif.vif.Index(), rings)
 
 		for _, direction := range directions {
 			modules[direction].start()
@@ -209,31 +208,34 @@ func disable(i *TunnelIF, v *TunnelVIF) error {
 	}
 
 	if (!i.isEnabled && v.isEnabled) || (i.isEnabled && !v.isEnabled) {
-		log.Printf("%v: disable.", i)
+		log.Logger.Info("%v: disable.", i)
 
-		if accessor.UnsetRingFn != nil {
-			accessor.UnsetRingFn(i.tvif.vif.Index())
-		} else {
-			return fmt.Errorf("%v: unsetRingFn is nil", i)
-		}
+		accessor.UnsetRingFn(i.tvif.vif.Index())
 	}
 	return nil
 }
 
 // RegisterAccessor Set set/unset ring func.
-func RegisterAccessor(a *IfaceAccessor) {
+func RegisterAccessor(a *Accessor) {
 	lock.Lock()
 	defer lock.Unlock()
 
 	accessor = *a
 }
 
-// TunnelIF.
+// GetTicker Get Ticker.
+func GetTicker() *tick.Ticker {
+	return ticker
+}
+
+//
+// Tunnel IF.
+//
 
 func (i *TunnelIF) disable() {
 	// No lock.
 	// Assume module locked.
-	log.Printf("%v: Disable.", i)
+	log.Logger.Info("%v: Disable.", i)
 
 	if !i.isEnabled {
 		return
@@ -242,7 +244,7 @@ func (i *TunnelIF) disable() {
 	// Disable even if an error occurs.
 	i.isEnabled = false
 	if err := disable(i, i.tvif); err != nil {
-		log.Printf("Error: %v", err)
+		log.Logger.Err("%v", err)
 		return
 	}
 }
@@ -264,7 +266,7 @@ func (i *TunnelIF) Enable() error {
 	i.lock.Lock()
 	defer i.lock.Unlock()
 
-	log.Printf("%v: Enable.", i)
+	log.Logger.Info("%v: Enable.", i)
 
 	if i.isEnabled {
 		return nil
@@ -285,6 +287,36 @@ func (i *TunnelIF) Disable() {
 	i.disable()
 }
 
+// UpdateCounter Update stats.
+func (i *TunnelIF) UpdateCounter() {
+	i.lock.Lock()
+	defer i.lock.Unlock()
+
+	log.Logger.Info("%v: UpdateCounter.", i)
+
+	if i.tvif == nil {
+		log.Logger.Err("%v: tvif is nil", i)
+		return
+	}
+
+	i.tvif.UpdateCounter()
+}
+
+// ResetCounter Reset stats.
+func (i *TunnelIF) ResetCounter() {
+	i.lock.Lock()
+	defer i.lock.Unlock()
+
+	log.Logger.Info("%v: ResetCounter.", i)
+
+	if i.tvif == nil {
+		log.Logger.Err("%v: tvif is nil", i)
+		return
+	}
+
+	i.tvif.ResetCounter()
+}
+
 // NewVIF Create Tunnel VIF.
 func (i *TunnelIF) NewVIF(vif *vswitch.VIF) (vswitch.VIFInstance, error) {
 	i.lock.Lock()
@@ -303,7 +335,8 @@ func (i *TunnelIF) NewVIF(vif *vswitch.VIF) (vswitch.VIFInstance, error) {
 	}
 
 	tvif := &TunnelVIF{
-		tif: i,
+		tif:     i,
+		counter: (*C.struct_vsw_counter)(unsafe.Pointer(vif.Counter())),
 		vif: &VIF{
 			VIF: vif,
 		},
@@ -312,7 +345,7 @@ func (i *TunnelIF) NewVIF(vif *vswitch.VIF) (vswitch.VIFInstance, error) {
 
 	if t := tvif.vif.Tunnel(); t != nil {
 		tvif.HopLimitUpdated(t.HopLimit())
-		tvif.TOSUpdated(t.TOS())
+		tvif.L3TOSUpdated(t.TOS())
 	} else {
 		return nil, fmt.Errorf("%v: vif.tunnel is nil", i)
 	}
@@ -325,7 +358,9 @@ func (i *TunnelIF) String() string {
 	return i.name
 }
 
+//
 // Tunnel VIF.
+//
 
 func (v *TunnelVIF) disable() {
 	// No lock.
@@ -338,7 +373,7 @@ func (v *TunnelVIF) disable() {
 	// Disable even if an error occurs.
 	v.isEnabled = false
 	if err := disable(v.tif, v); err != nil {
-		log.Printf("Error: %v", err)
+		log.Logger.Err("%v", err)
 		return
 	}
 }
@@ -384,19 +419,31 @@ func (v *TunnelVIF) SetVRF(vrf *vswitch.VRF) {
 	v.lock.Lock()
 	defer v.lock.Unlock()
 
-	if vrf.Index() >= MaxVRFEntries {
-		log.Fatalf("%v: Out of ragne vrf index: %v", v, vrf.Index())
-	}
-
-	v.vrfIndex = vrf.Index()
-	if accessor.SetVRFIndexFn != nil {
-		if v.tif != nil {
-			accessor.SetVRFIndexFn(v.vif.Index(), v.vrfIndex)
-		} else {
-			log.Printf("%v: tunnel IF is nil", v)
+	if vrf == nil {
+		// Unset VRF index.
+		if v.vrf != nil {
+			if err := accessor.UnsetVRFFn(v.vif.Index(), v.vrf); err != nil {
+				log.Logger.Err("%v: Failed UnsetVRFFn(): %v", v, err)
+				return
+			}
+			v.vrf = nil
 		}
 	} else {
-		log.Printf("%v: setVRFIndexFn is nil", v)
+		// Set VRF index.
+		index := vrf.Index()
+		if index >= MaxVRFEntries {
+			log.Logger.Fatalf("%v: Out of ragne vrf index: %v", v, vrf.Index())
+		}
+
+		v.vrf = vrf
+		if v.tif != nil {
+			if err := accessor.SetVRFFn(v.vif.Index(), v.vrf); err != nil {
+				log.Logger.Err("%v: Failed SetVRFFn(): %v", v, err)
+				return
+			}
+		} else {
+			log.Logger.Err("%v: tunnel IF is nil", v)
+		}
 	}
 }
 
@@ -405,30 +452,55 @@ func (v *TunnelVIF) HopLimitUpdated(ttl uint8) {
 	v.lock.Lock()
 	defer v.lock.Unlock()
 
-	if accessor.SetTTLFn != nil {
-		if v.tif != nil {
-			accessor.SetTTLFn(v.vif.Index(), ttl)
-		} else {
-			log.Printf("%v: tunnel IF is nil", v)
-		}
+	if v.tif != nil {
+		accessor.SetTTLFn(v.vif.Index(), ttl)
 	} else {
-		log.Printf("%v: setTTLFn is nil", v)
+		log.Logger.Err("%v: tunnel IF is nil", v)
 	}
 }
 
-// TOSUpdated Update TOS.
-func (v *TunnelVIF) TOSUpdated(tos int8) {
+// L3TOSUpdated Update TOS.
+func (v *TunnelVIF) L3TOSUpdated(tos int8) {
 	v.lock.Lock()
 	defer v.lock.Unlock()
 
-	if accessor.SetTOSFn != nil {
-		if v.tif != nil {
-			accessor.SetTOSFn(v.vif.Index(), tos)
-		} else {
-			log.Printf("%v: tunnel IF is nil", v)
-		}
+	if v.tif != nil {
+		accessor.SetTOSFn(v.vif.Index(), tos)
 	} else {
-		log.Printf("%v: setTOSFn is nil", v)
+		log.Logger.Err("%v: tunnel IF is nil", v)
+	}
+}
+
+// UpdateCounter Update stats.
+func (v *TunnelVIF) UpdateCounter() {
+	v.lock.Lock()
+	defer v.lock.Unlock()
+
+	if v.tif != nil {
+		statsIn := accessor.StatsFn(v.vif.Index(), DirectionTypeIn)
+		statsOut := accessor.StatsFn(v.vif.Index(), DirectionTypeOut)
+		// NOTE: outbound stats doesn't have unknown_protos.
+		//       So add unknown_protos to errors.
+		statsOut.errors += C.uint64_t(statsOut.unknown_protos)
+		sIn := (*C.struct_tunnel_stats)(unsafe.Pointer(statsIn))
+		sOut := (*C.struct_tunnel_stats)(unsafe.Pointer(statsOut))
+		C.tunnel_update_counter(v.tif.counter, sIn, sOut)
+		C.tunnel_update_counter(v.counter, sIn, sOut)
+	} else {
+		log.Logger.Err("%v: tunnel IF is nil", v)
+	}
+}
+
+// ResetCounter Reset stats.
+func (v *TunnelVIF) ResetCounter() {
+	v.lock.Lock()
+	defer v.lock.Unlock()
+
+	if v.tif != nil {
+		accessor.ResetStatsFn(v.vif.Index(), DirectionTypeIn)
+		accessor.ResetStatsFn(v.vif.Index(), DirectionTypeOut)
+		C.tunnel_reset_counter(v.tif.counter, nil, nil)
+		C.tunnel_reset_counter(v.counter, nil, nil)
 	}
 }
 
@@ -437,18 +509,13 @@ func (v *TunnelVIF) AddressTypeUpdated(family vswitch.AddressFamily) {
 	// do nothing.
 }
 
-// EncapsMethodUpdated Update encaps method.
-func (v *TunnelVIF) EncapsMethodUpdated(method vswitch.EncapsMethod) {
-	// do nothing.
-}
-
 // LocalAddressUpdated Update local IP addr.
 func (v *TunnelVIF) LocalAddressUpdated(ip net.IP) {
 	// do nothing.
 }
 
-// RemoteAddressUpdated Update remote IP addr.
-func (v *TunnelVIF) RemoteAddressUpdated(ip net.IP) {
+// RemoteAddressesUpdated Update remote IP addr.
+func (v *TunnelVIF) RemoteAddressesUpdated(ip []net.IP) {
 	// do nothing.
 }
 
@@ -457,7 +524,14 @@ func (v *TunnelVIF) SecurityUpdated(security vswitch.Security) {
 	// do nothing.
 }
 
+// VRFUpdated Update VRF.
+func (v *TunnelVIF) VRFUpdated(vrf *vswitch.VRF) {
+	// do nothing.
+}
+
+//
 // module.
+//
 
 //String Get name of module.
 func (m *Module) String() string {
@@ -469,12 +543,12 @@ func (m *Module) start() bool {
 	// No lock.
 	// Assume module locked.
 	if !m.running {
-		log.Printf("%v: Start.", m)
+		log.Logger.Info("%v: Start.", m)
 		m.running = true
 
 		if C.pthread_create(&m.th, nil, (*[0]byte)(C.ipsec_mainloop),
 			unsafe.Pointer(m.cmodule)) != 0 {
-			log.Fatalf("%v: Fail pthread_create()", m)
+			log.Logger.Fatalf("%v: Fail pthread_create()", m)
 		}
 
 		startTicker()
@@ -487,7 +561,7 @@ func (m *Module) start() bool {
 func (m *Module) stop() {
 	// No lock.
 	// Assume module locked.
-	log.Printf("%v: Stop.", m)
+	log.Logger.Info("%v: Stop.", m)
 	C.ipsec_stop(m.cmodule)
 	stopTicker()
 }
@@ -496,7 +570,7 @@ func (m *Module) stop() {
 func (m *Module) wait() {
 	// No lock.
 	// Assume module locked.
-	log.Printf("%v: Wait.", m)
+	log.Logger.Info("%v: Wait.", m)
 	C.pthread_join(m.th, nil)
 	wg.Wait()
 	C.ipsec_unconfigure(m.cmodule)

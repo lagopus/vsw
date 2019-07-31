@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -45,6 +45,22 @@ func (d *dummyRouter) Enable() error {
 
 func (d *dummyRouter) Disable() {
 	d.ch <- OpDisable
+}
+
+func (d *dummyRouter) AddOutputDevice(dev OutputDevice) error {
+	return nil
+}
+
+func (d *dummyRouter) DeleteOutputDevice(dev OutputDevice) error {
+	return nil
+}
+
+func (d *dummyRouter) EnableNAPT(vif *VIF) error {
+	return nil
+}
+
+func (d *dummyRouter) DisableNAPT(vif *VIF) error {
+	return nil
 }
 
 func (d *dummyRouter) Free() {

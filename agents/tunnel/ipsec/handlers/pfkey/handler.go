@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,15 +18,17 @@ package pfkey
 
 import (
 	"fmt"
-	"log"
+	"io"
 	"net"
 	"os"
 	"strings"
 	"sync"
 
 	"github.com/lagopus/vsw/agents/tunnel/ipsec/connections"
+	"github.com/lagopus/vsw/agents/tunnel/ipsec/handlers"
 	"github.com/lagopus/vsw/agents/tunnel/ipsec/pfkey"
 	"github.com/lagopus/vsw/agents/tunnel/ipsec/pfkey/receiver"
+	"github.com/lagopus/vsw/modules/tunnel/log"
 	"github.com/lagopus/vsw/vswitch"
 )
 
@@ -40,22 +42,19 @@ const (
 // Handler PFKey handler.
 // Nolock
 type Handler struct {
-	name     string
-	vrf      *vswitch.VRF
+	handlers.BaseHandler
 	sock     string
 	listener *net.UnixListener
 	conns    *conns
 	wg       *sync.WaitGroup
-	running  bool
 }
 
 // NewHandler Create PFKey handler.
 func NewHandler(vrf *vswitch.VRF) *Handler {
 	return &Handler{
-		name:  vrf.Name(),
-		vrf:   vrf,
-		conns: newConns(),
-		wg:    &sync.WaitGroup{},
+		BaseHandler: handlers.NewBaseHandler(vrf),
+		conns:       newConns(),
+		wg:          &sync.WaitGroup{},
 	}
 }
 
@@ -71,17 +70,19 @@ func (h *Handler) handlePFkeyConn(c net.Conn) error {
 
 	defer h.conns.closeAndDelete(conn)
 
-	msgMux := receiver.NewMsgMuxForVRF(h.vrf.Index())
+	vrf := h.VRF()
+	msgMux := receiver.NewMsgMuxForVRF(vrf.Index())
 	defer msgMux.Free()
-	for h.running == true {
+	for h.Running() {
 		_, err := pfkey.HandlePfkey(c, conn, msgMux.MsgMux)
 		if err != nil {
-			if !strings.Contains(err.Error(), "use of closed network connection") {
-				log.Printf("%v: error %v", h, err)
+			if err != io.EOF {
+				log.Logger.Err("%v: error %v", h, err)
 			}
 			return err
 		}
 	}
+
 	return nil
 }
 
@@ -90,14 +91,14 @@ func (h *Handler) mainLoop() {
 	// for graceful shutdown.
 	defer h.conns.allClose()
 
-	for h.running == true {
+	for h.Running() {
 		if conn, err := h.listener.Accept(); err == nil {
-			log.Printf("%v: accept %v", h, conn)
+			log.Logger.Info("%v: accept %v", h, conn)
 			h.wg.Add(1)
 			go h.handlePFkeyConn(conn)
 		} else {
 			if !strings.Contains(err.Error(), "use of closed network connection") {
-				log.Printf("%v: error %v", h, err)
+				log.Logger.Err("%v: error %v", h, err)
 			}
 		}
 	}
@@ -107,23 +108,23 @@ func (h *Handler) mainLoop() {
 
 // Start Start PHKey handler.
 func (h *Handler) Start() error {
-	if h.running {
+	if h.Running() {
 		return nil
 	}
 
-	h.sock = fmt.Sprintf(SockFile, h.vrf.Name())
+	h.sock = fmt.Sprintf(SockFile, h.Name())
 	h.clean()
 
-	log.Printf("%v: Start pfkey handler: %v", h, h.sock)
+	log.Logger.Info("%v: Start pfkey handler: %v", h, h.sock)
 
 	var err error
 	if h.listener, err = net.ListenUnix("unixpacket",
 		&net.UnixAddr{Name: h.sock, Net: "unixpacket"}); err != nil {
-		log.Printf("%v: Can't create listener", h)
+		log.Logger.Err("%v: Can't create listener", h)
 		return err
 	}
 
-	h.running = true
+	h.SetRunning()
 
 	h.wg.Add(1)
 	go h.mainLoop()
@@ -133,21 +134,17 @@ func (h *Handler) Start() error {
 
 // Stop Stop PHKey handler.
 func (h *Handler) Stop() {
-	if !h.running {
+	if !h.Running() {
 		return
 	}
 
 	defer h.clean()
 
-	log.Printf("%v: Stop pfkey handler", h)
+	log.Logger.Info("%v: Stop pfkey handler", h)
 
-	h.running = false
+	h.UnsetRunning()
+
 	// for graceful shutdown.
 	h.listener.Close()
 	h.wg.Wait()
-}
-
-// String Return Name.
-func (h *Handler) String() string {
-	return h.name
 }

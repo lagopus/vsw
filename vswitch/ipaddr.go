@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -42,6 +42,13 @@ func (af AddressFamily) String() string {
 	return s[af]
 }
 
+func (af AddressFamily) MarshalJSON() ([]byte, error) {
+	if af == AF_IPv4 {
+		return []byte(`"IPv4"`), nil
+	}
+	return []byte(`"IPv6"`), nil
+}
+
 // IPAddrs manages IP Addresses of the device.
 type IPAddrs struct {
 	container interface{}
@@ -55,9 +62,35 @@ type IPAddr struct {
 	Mask net.IPMask // Network Mask
 }
 
+// Represents any IP (0.0.0.0/0)
+var AnyIPAddr = IPAddr{
+	[]byte{0, 0, 0, 0},
+	[]byte{0, 0, 0, 0},
+}
+
+// CreateIPAddr creates IPAddr from net.IP.
+// Network mask is set to 32.
+func CreateIPAddr(ip net.IP) IPAddr {
+	return IPAddr{ip, []byte{0xff, 0xff, 0xff, 0xff}}
+}
+
+// ParseCIDR parases a CIDR notation IP address and prefix,
+// and returns IPAddr.  Works as net.ParseCIDR.
+func ParseCIDR(s string) (IPAddr, error) {
+	ip, ipnet, err := net.ParseCIDR(s)
+	if err != nil {
+		return AnyIPAddr, err
+	}
+	return IPAddr{ip, ipnet.Mask}, nil
+}
+
 func (ip IPAddr) String() string {
 	prefix, _ := ip.Mask.Size()
 	return fmt.Sprintf("%v/%d", ip.IP, prefix)
+}
+
+func (ip IPAddr) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + ip.String() + `"`), nil
 }
 
 // Equal reports whether ip and x are the same IP address with

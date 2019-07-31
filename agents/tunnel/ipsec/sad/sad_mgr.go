@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,14 +18,13 @@ package sad
 
 import (
 	"fmt"
-
-	"log"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/lagopus/vsw/modules/tunnel/ipsec"
-	"github.com/lagopus/vsw/modules/tunnel/ipsec/tick"
+	"github.com/lagopus/vsw/modules/tunnel/log"
+	"github.com/lagopus/vsw/modules/tunnel/tick"
 	"github.com/lagopus/vsw/vswitch"
 )
 
@@ -57,13 +56,13 @@ func init() {
 		vrfs: map[vswitch.VRFIndex]*vrf{},
 		lock: sync.RWMutex{},
 	}
-	log.Printf("created Inbound/Outbound SAMgr.\n")
+	log.Logger.Info("created Inbound/Outbound SAMgr")
 	// Register tick
 	if registerTickTask() != nil {
-		panic("Can't add tick-task in SAD mgr.")
+		panic("Can't add tick-task in SAD mgr")
 	}
-	log.Printf("registerd SAMgr tick-task.\n")
-	log.Printf("SAMgr initialize complete.\n")
+	log.Logger.Info("registerd SAMgr tick-task")
+	log.Logger.Info("SAMgr initialize complete")
 }
 
 func registerTickTask() error {
@@ -71,7 +70,7 @@ func registerTickTask() error {
 	if err != nil {
 		return err
 	}
-	return tick.GetTicker().RegisterTask(task)
+	return ipsec.GetTicker().RegisterTask(task)
 }
 
 // SAD tick-task
@@ -92,17 +91,17 @@ func (mgr *Mgr) tick() (err error) {
 	// pull
 	pullErr := mgr.PullSAD()
 	if pullErr != nil {
-		log.Printf("tick-pull-%v: ERR %s\n", mgr.dir, pullErr)
+		log.Logger.Err("tick-pull-%v: ERR %s", mgr.dir, pullErr)
 	}
 	// check lifetime
 	lifetimeErr := mgr.CheckLifetime()
 	if lifetimeErr != nil {
-		log.Printf("tick-lifetime-%v: ERR %s\n", mgr.dir, lifetimeErr)
+		log.Logger.Err("tick-lifetime-%v: ERR %s", mgr.dir, lifetimeErr)
 	}
 	// push
 	pushErr := mgr.PushSAD()
 	if pushErr != nil {
-		log.Printf("tick-push-%v: ERR %s\n", mgr.dir, pushErr)
+		log.Logger.Err("tick-push-%v: ERR %s", mgr.dir, pushErr)
 	}
 
 	// TBD error handle
@@ -174,9 +173,9 @@ func (mgr *Mgr) ReserveSA(selector *SASelector) (err error) {
 
 	err = vrf.sad.reserve(selector.SPI)
 	if err == nil {
-		log.Printf("Reserved SA-%v, %s\n", mgr.dir, vrf.sad.logString(selector.SPI))
+		log.Logger.Info("Reserved SA-%v, %s", mgr.dir, vrf.sad.logString(selector.SPI))
 	} else {
-		log.Printf("ERR: Failed Reserve: %s\n", err)
+		log.Logger.Err("ERR: Failed Reserve: %s", err)
 	}
 	return
 }
@@ -197,9 +196,9 @@ func (mgr *Mgr) UpdateSA(selector *SASelector, sav *SAValue) (err error) {
 
 	err = vrf.sad.update(selector.SPI, sav)
 	if err == nil {
-		log.Printf("Updated SA-%v, %s\n", mgr.dir, vrf.sad.logString(selector.SPI))
+		log.Logger.Info("Updated SA-%v, %s", mgr.dir, vrf.sad.logString(selector.SPI))
 	} else {
-		log.Printf("ERR: Failed Update: %s\n", err)
+		log.Logger.Err("ERR: Failed Update: %s", err)
 	}
 	return
 }
@@ -220,9 +219,9 @@ func (mgr *Mgr) AddSA(selector *SASelector, sav *SAValue) (err error) {
 
 	err = vrf.sad.add(selector.SPI, sav)
 	if err == nil {
-		log.Printf("Added SA-%v, %s\n", mgr.dir, vrf.sad.logString(selector.SPI))
+		log.Logger.Info("Added SA-%v, %s", mgr.dir, vrf.sad.logString(selector.SPI))
 	} else {
-		log.Printf("ERR: Failed Add: %s\n", err)
+		log.Logger.Err("ERR: Failed Add: %s", err)
 	}
 	return
 }
@@ -244,9 +243,9 @@ func (mgr *Mgr) EnableSA(selector *SASelector) (err error) {
 	oldStat := vrf.sad[selector.SPI].inStat
 	_, err = vrf.sad.enable(selector.SPI)
 	if err == nil {
-		log.Printf("Enabled SA-%v, %s\n", mgr.dir, vrf.sad.logStringChanged(selector.SPI, oldStat))
+		log.Logger.Info("Enabled SA-%v, %s", mgr.dir, vrf.sad.logStringChanged(selector.SPI, oldStat))
 	} else {
-		log.Printf("ERR: Failed Enable: %s\n", err)
+		log.Logger.Err("ERR: Failed Enable: %s", err)
 	}
 	return
 }
@@ -268,9 +267,9 @@ func (mgr *Mgr) DeleteSA(selector *SASelector) (err error) {
 	oldStat := vrf.sad[selector.SPI].inStat
 	_, err = vrf.sad.delete(selector.SPI)
 	if err == nil {
-		log.Printf("Deleted SA-%v, %s\n", mgr.dir, vrf.sad.logStringChanged(selector.SPI, oldStat))
+		log.Logger.Info("Deleted SA-%v, %s", mgr.dir, vrf.sad.logStringChanged(selector.SPI, oldStat))
 	} else {
-		log.Printf("ERR: Failed Delete: %s\n", err)
+		log.Logger.Err("ERR: Failed Delete: %s", err)
 	}
 	return
 }
@@ -321,7 +320,7 @@ func (mgr *Mgr) FindSAbyIP(selector *SASelector, local net.IP,
 	}
 
 	for spi, sav := range vrf.sad {
-		if local.Equal(sav.LocalEPIP.IP) && remote.Equal(sav.RemoteEPIP.IP) {
+		if local.Equal(sav.LocalEPIP) && remote.Equal(sav.RemoteEPIP) {
 			if sav.inStat.findable() &&
 				(sav.LifeTimeCurrent.After(tmp) || sav.LifeTimeCurrent.Equal(tmp)) {
 				retk = spi
@@ -349,7 +348,7 @@ func (mgr *Mgr) push(vrf *vrf, entries map[SPI]SAValue) int {
 				entArr = append(entArr, csa)
 			} else {
 				// TBD error handle
-				log.Printf("WARN: failed to convert C struct: %s", err)
+				log.Logger.Warning("WARN: failed to convert C struct: %s", err)
 			}
 		}
 	}
@@ -361,7 +360,7 @@ func (mgr *Mgr) pullLifetime(vrf *vrf) error {
 		if sav.inStat.pullable() {
 			if lifetime, byte, err := vrf.csad.PullLifetime(ipsec.CSPI(spi)); err != nil {
 				vrf.sad.changeLifetimeCurrent(spi, lifetime, byte)
-				//log.Printf("pull SA-%v %s\n", vrf.csad.dir, vrf.sad.logString(spi))
+				//log.Logger.Debug("pull SA-%v %s", vrf.csad.dir, vrf.sad.logString(spi))
 			} else {
 				return err
 			}
@@ -393,9 +392,9 @@ func (mgr *Mgr) PushSAD() (err error) {
 					for spi, sav := range ent {
 						_, e := vrf.sad.pushed(spi)
 						if e == nil {
-							log.Printf("pushed SA-%v %s\n", mgr.dir, vrf.sad.logStringChanged(spi, sav.inStat))
+							log.Logger.Info("pushed SA-%v %s", mgr.dir, vrf.sad.logStringChanged(spi, sav.inStat))
 						} else {
-							log.Printf("Failed post-push operation: %s\n", e)
+							log.Logger.Err("Failed post-push operation: %s", e)
 							// TBD error handle
 						}
 					}
@@ -403,13 +402,13 @@ func (mgr *Mgr) PushSAD() (err error) {
 						oldStat := vrf.sad[spi].inStat
 						_, e := vrf.sad.pushed(spi)
 						if e == nil {
-							log.Printf("detached SA-%v %s\n", mgr.dir, vrf.sad.logStringChanged(spi, oldStat))
+							log.Logger.Info("detached SA-%v %s", mgr.dir, vrf.sad.logStringChanged(spi, oldStat))
 						} else {
-							log.Printf("Failed post-detach operation: %s\n", e)
+							log.Logger.Err("Failed post-detach operation: %s", e)
 							// TBD error handle
 						}
 					}
-					log.Printf("Pushed SAD-%v(), push=%d (changed=%d), expire=%d\n",
+					log.Logger.Info("Pushed SAD-%v(), push=%d (changed=%d), expire=%d",
 						mgr.dir, len(ent), changed, len(exp))
 				} else {
 					err = fmt.Errorf("sad_push returns error code=%d", result)
@@ -454,9 +453,9 @@ func (mgr *Mgr) CheckLifetime() (err error) {
 				if SadbExpire(vrfIndex, mgr.dir, spi, &sav, SoftLifetimeExpired) { // send SADB_EXPIRE(Soft)
 					_, e := vrf.sad.softExpired(spi)
 					if e == nil {
-						log.Printf("softExpired SA-%v: %s\n", mgr.dir, vrf.sad.logStringChanged(spi, sav.inStat))
+						log.Logger.Info("softExpired SA-%v: %s", mgr.dir, vrf.sad.logStringChanged(spi, sav.inStat))
 					} else {
-						log.Printf("ERR: Failed post-softExpired op: %s\n", e)
+						log.Logger.Err("ERR: Failed post-softExpired op: %s", e)
 						// TBD error handle
 					}
 				} else {
@@ -468,9 +467,9 @@ func (mgr *Mgr) CheckLifetime() (err error) {
 				if SadbExpire(vrfIndex, mgr.dir, spi, &sav, HardLifetimeExpired) { // send SADB_EXPIRE(Hard)
 					_, e := vrf.sad.hardExpired(spi)
 					if e == nil {
-						log.Printf("hardExpired SA-%v: %s\n", mgr.dir, vrf.sad.logStringChanged(spi, sav.inStat))
+						log.Logger.Info("hardExpired SA-%v: %s", mgr.dir, vrf.sad.logStringChanged(spi, sav.inStat))
 					} else {
-						log.Printf("ERR: Failed post-hardExpired op: %s\n", e)
+						log.Logger.Err("ERR: Failed post-hardExpired op: %s", e)
 						// TBD error handle
 					}
 				} else {
@@ -479,7 +478,7 @@ func (mgr *Mgr) CheckLifetime() (err error) {
 			}
 		}
 		if cntSoft+cntHard > 0 {
-			log.Printf("checked SADB-%v len:%d softExpired: %d hardExpired: %d\n",
+			log.Logger.Info("checked SADB-%v len:%d softExpired: %d hardExpired: %d",
 				mgr.dir, len(vrf.sad), cntSoft, cntHard)
 		}
 	}

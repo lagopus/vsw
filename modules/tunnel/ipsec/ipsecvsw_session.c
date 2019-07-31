@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2018-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 #include "lagopus_apis.h"
 #include "ipsec.h"
 #include "ipsecvsw.h"
+#include "dpdk_glue.h"
 
 
 
@@ -62,7 +63,6 @@ s_create_session_ctx(pthread_t tid,
                      ipsecvsw_cdevq_t q,
                      ipsecvsw_session_ctx_t *ctx_ptr) {
   ipsecvsw_session_ctx_t ret = NULL;
-  int32_t r = 0;
   uint16_t iv_length;
   uint16_t q_id;
   struct rte_cryptodev_info cdev_info;
@@ -111,6 +111,7 @@ s_create_session_ctx(pthread_t tid,
       } else {
         switch (ret->m_sa.cipher_algo) {
           case RTE_CRYPTO_CIPHER_NULL:
+          case RTE_CRYPTO_CIPHER_3DES_CBC:
           case RTE_CRYPTO_CIPHER_AES_CBC:
             iv_length = ret->m_sa.iv_len;
             break;
@@ -118,7 +119,7 @@ s_create_session_ctx(pthread_t tid,
             iv_length = CIPHER_AES_CTR_IV_LENGTH;
             break;
           default:
-            lagopus_exit_fatal("must not happen.\n");
+            TUNNEL_FATAL("must not happen.");
             break;
         }
 
@@ -160,7 +161,7 @@ s_create_session_ctx(pthread_t tid,
             break;
           }
           default:
-            lagopus_exit_fatal("must not happen.\n");
+            TUNNEL_FATAL("must not happen.");
             break;
         }
         ret->a.next = &(ret->b);
@@ -180,14 +181,7 @@ s_create_session_ctx(pthread_t tid,
                    session_pool) == 0)) {
           rte_cryptodev_info_get(ret->m_dev_id,
                                  &cdev_info);
-          if (unlikely(cdev_info.sym.max_nb_sessions_per_qp > 0)) {
-            r = rte_cryptodev_queue_pair_attach_sym_session(
-                  ret->m_dev_id, q_id, ret->m_session);
-            if (unlikely(r < 0)) {
-              lagopus_free_on_numanode((void *)ret);
-              *ctx_ptr = NULL;
-            }
-          }
+          cryptodev_attach_sym_session(&cdev_info, q_id, ctx_ptr);
         } else {
           lagopus_free_on_numanode((void *)ret);
           *ctx_ptr = NULL;
@@ -207,7 +201,6 @@ static inline ipsecvsw_session_ctx_t
 s_destroy_session_ctx(ipsecvsw_session_ctx_t ctx) {
   ipsecvsw_session_ctx_t ret = NULL;
   lagopus_result_t r;
-  uint16_t q_id;
   struct rte_cryptodev_info cdev_info;
 
   if (likely(ctx != NULL &&
@@ -215,14 +208,8 @@ s_destroy_session_ctx(ipsecvsw_session_ctx_t ctx) {
     if (ctx->m_session != NULL) {
       rte_cryptodev_info_get(ctx->m_dev_id,
                              &cdev_info);
-      if (unlikely(cdev_info.sym.max_nb_sessions_per_qp > 0)) {
-        if (ctx->m_q != NULL) {
-          if (unlikely((q_id = ipsecvsw_cdevq_get_queue_id(ctx->m_q)) >= 0)) {
-            rte_cryptodev_queue_pair_detach_sym_session (
-              ctx->m_dev_id, q_id, ctx->m_session);
-          }
-        }
-      }
+
+      cryptodev_detach_sym_session(&cdev_info, ctx);
       (void)rte_cryptodev_sym_session_free(ctx->m_session);
       ctx->m_session = NULL;
     }
@@ -232,8 +219,8 @@ s_destroy_session_ctx(ipsecvsw_session_ctx_t ctx) {
         lagopus_free_on_numanode((void *)ctx);
         ret = ctx;
       } else {
-        lagopus_perror(r);
-        lagopus_msg_warning("can't release cdevq.\n");
+        TUNNEL_PERROR(r);
+        TUNNEL_WARNING("can't release cdevq.");
       }
     }
   }

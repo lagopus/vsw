@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,8 @@
 
 package tunnel
 
-// #cgo LDFLAGS: -L/usr/local/lib -ldpdk -lnuma
-// #cgo CFLAGS: -I ${SRCDIR} -I /usr/local/include/dpdk -m64 -O3 -msse4.2
+/*
+#cgo LDFLAGS: -Wl,-unresolved-symbols=ignore-all -llagopus_util -lnuma
+#cgo CFLAGS: -I${SRCDIR}/../../include -I${SRCDIR}/hash -I${SRCDIR}/log -D_GNU_SOURCE -m64 -O3 -msse4.2
+*/
 import "C"

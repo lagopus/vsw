@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,7 +33,7 @@ struct sched_rings {
 struct sched_runtime {
 	int id;
 	char *name;
-	struct lagopus_runtime_ops *ops;
+	struct vsw_runtime_ops *ops;
 	void *priv;
 	bool enabled;
 };
@@ -65,7 +65,7 @@ sched_runtime_add(struct sched *s, struct sched_request *req)
 		return false;
 
 	// sanity check
-	struct lagopus_runtime_ops *ops = req->ops;
+	struct vsw_runtime_ops *ops = req->ops;
 	if ((!ops->init) || (!ops->process) || (!ops->deinit) ||
 	    (!ops->register_instance) || (!ops->unregister_instance) ||
 	    (!ops->control_instance))
@@ -74,7 +74,7 @@ sched_runtime_add(struct sched *s, struct sched_request *req)
 	// init runtime
 	void *p;
 	if (!(p = ops->init(req->param))) {
-		lagopus_printf("%s: Initializing runtime %s failed.", __func__, req->name);
+		vsw_printf("%s: Initializing runtime %s failed.", __func__, req->name);
 		return false;
 	}
 
@@ -119,7 +119,7 @@ sched_proc_requests(struct sched *s)
 
 	// Dequeue result buffers
 	if (rte_ring_sc_dequeue_bulk(s->result.free, res, count, NULL) != count) {
-		lagopus_fatalf("%s: Couldn't allocate enough result buffers. (%d)", __func__, count);
+		vsw_fatalf("%s: Couldn't allocate enough result buffers. (%d)", __func__, count);
 		return false;
 	}
 
@@ -180,19 +180,19 @@ sched_proc_requests(struct sched *s)
 			break;
 
 		default:
-			lagopus_fatalf("%s: Unknown command: %d", __func__, req->cmd);
+			vsw_fatalf("%s: Unknown command: %d", __func__, req->cmd);
 		}
 	}
 
 	// Free up requests
 	if (rte_ring_sp_enqueue_bulk(s->request.free, reqs, count, NULL) != count) {
-		lagopus_fatalf("%s: Couldn't requeue freed request buffers. (%d)", __func__, count);
+		vsw_fatalf("%s: Couldn't requeue freed request buffers. (%d)", __func__, count);
 		return false;
 	}
 
 	// Enqueue results
 	if (rte_ring_sp_enqueue_bulk(s->result.used, res, count, NULL) != count) {
-		lagopus_fatalf("%s: Couldn't enqueue results. (%d)", __func__, count);
+		vsw_fatalf("%s: Couldn't enqueue results. (%d)", __func__, count);
 		return false;
 	}
 
@@ -209,7 +209,7 @@ sched_exec_runtime(struct sched *s)
 			continue;
 
 		if (!r->ops->process(r->priv)) {
-			lagopus_printf("%s: Runtime %s (%lu) failed. Disabling.", __func__, r->name, r->id);
+			vsw_printf("%s: Runtime %s (%lu) failed. Disabling.", __func__, r->name, r->id);
 			r->enabled = false;
 		}
 	}
@@ -239,7 +239,7 @@ sched_main(void *arg)
 	void *objp[SCHED_MAX_REQUESTS * 2];
 
 	if (!(sched = rte_zmalloc(NULL, sizeof(struct sched), 0))) {
-		LAGOPUS_DEBUG("%s: Can't allocate memory for scheduler", __func__);
+		VSW_DEBUG("%s: Can't allocate memory for scheduler", __func__);
 		return -1;
 	}
 

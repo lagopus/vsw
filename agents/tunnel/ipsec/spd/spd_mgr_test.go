@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -608,11 +608,11 @@ func (suite *testSPDMgrTestSuite) TestMakeSPDError() {
 		},
 		mockcErr{
 			cspd: newMockCSPDMakeErr(),
-			err:  "make, mockCSPD: -1",
+			err:  "Make, mockCSPD Error",
 		},
 		mockcErr{
 			cspd: newMockCSPDSetRuleErr(),
-			err:  "Can't set rule for mockCSPD",
+			err:  "SetRule, mockCSPD Error",
 		},
 	}
 
@@ -712,11 +712,7 @@ func (suite *testSPDMgrTestSuite) TestGetStatsSPDv4() {
 
 	// exists entries.
 	expectedCount4 := mockCount{
-		callGetStatLiftimeCurrent: 4,
-	}
-
-	expectedSPStats4 := SPStats{
-		LifeTimeCurrent: dmspd4.dummyLifeTime(),
+		callGetStats: 4,
 	}
 
 	// statsSPD.
@@ -724,10 +720,6 @@ func (suite *testSPDMgrTestSuite) TestGetStatsSPDv4() {
 	suite.Empty(err)
 	suite.Equal(expectedCount4, dmspd4.mockCount)
 	suite.Equal(mockCount{}, dmspd6.mockCount)
-
-	for _, data := range testData {
-		suite.Equal(expectedSPStats4, data.value.SPStats)
-	}
 }
 
 func (suite *testSPDMgrTestSuite) TestGetStatsSPDv6() {
@@ -759,11 +751,7 @@ func (suite *testSPDMgrTestSuite) TestGetStatsSPDv6() {
 
 	// exists entries.
 	expectedCount6 := mockCount{
-		callGetStatLiftimeCurrent: 4,
-	}
-
-	expectedSPStats6 := SPStats{
-		LifeTimeCurrent: dmspd6.dummyLifeTime(),
+		callGetStats: 4,
 	}
 
 	// statsSPD.
@@ -771,10 +759,6 @@ func (suite *testSPDMgrTestSuite) TestGetStatsSPDv6() {
 	suite.Empty(err)
 	suite.Equal(mockCount{}, dmspd4.mockCount)
 	suite.Equal(expectedCount6, dmspd6.mockCount)
-
-	for _, data := range testData {
-		suite.Equal(expectedSPStats6, data.value.SPStats)
-	}
 }
 
 func (suite *testSPDMgrTestSuite) TestGetStatsSPDErr() {
@@ -788,8 +772,8 @@ func (suite *testSPDMgrTestSuite) TestGetStatsSPDErr() {
 
 	errs := []mockcErr{
 		mockcErr{
-			cspd: newMockCSPDGetStatErr(),
-			err:  "Stat, mockCSPD: -1",
+			cspd: newMockCSPDGetStatsErr(),
+			err:  "Stats, mockCSPD Error",
 		},
 	}
 

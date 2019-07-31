@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -70,7 +70,6 @@ func TestNormalFlow(t *testing.T) {
 func TestMain(m *testing.M) {
 	// Initialize DPDK
 	vswitch.Init("../../vsw.conf")
-	vswitch.EnableLog(true)
 	pool = vswitch.GetDpdkResource().Mempool
 
 	//
@@ -87,7 +86,7 @@ func TestMain(m *testing.M) {
 		}
 		bi, _ := br.Instance().(vswitch.BridgeInstance)
 		bi.SetMAT(mat.Input())
-		mat.Connect(br.Input(), vswitch.MATCH_VLAN_ID, vid)
+		mat.Connect(br.Input(), vswitch.MatchVID, vid)
 
 		br.Enable()
 
@@ -115,8 +114,6 @@ func TestMain(m *testing.M) {
 	}
 
 	mat.Enable()
-
-	vswitch.Dump(os.Stdout)
 
 	rc := m.Run()
 

@@ -1,3 +1,19 @@
+/*
+ * Copyright 2019 Nippon Telegraph and Telephone Corporation.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*-
  *   BSD LICENSE
  *
@@ -49,8 +65,11 @@
 #include <rte_esp.h>
 
 #include "ipsec.h"
+#include "esp.h"
 #include "sa.h"
 #include "ipip.h"
+#include "nat_t.h"
+#include "ifaces.h"
 
 #include "lagopus_apis.h"
 #include "ipsecvsw.h"
@@ -58,16 +77,20 @@
 static int
 esp_inbound(struct rte_mbuf *m, struct ipsec_sa *sa,
             struct rte_crypto_op *cop) {
+  struct ipsec_mbuf_metadata *priv;
   struct ip *ip4;
   struct rte_crypto_sym_op *sym_cop;
   int32_t payload_len, ip_hdr_len;
   struct cnt_blk *icb;
   uint8_t *aad;
   uint8_t *iv, *iv_ptr;
+  uint16_t nat_t_len;
 
   RTE_ASSERT(m != NULL);
   RTE_ASSERT(sa != NULL);
   RTE_ASSERT(cop != NULL);
+
+  priv = get_priv(m);
 
   ip4 = rte_pktmbuf_mtod(m, struct ip *);
   if (likely(ip4->ip_v == IPVERSION)) {
@@ -77,18 +100,24 @@ esp_inbound(struct rte_mbuf *m, struct ipsec_sa *sa,
   {
     ip_hdr_len = sizeof(struct ip6_hdr);
   } else {
-    lagopus_msg_error("invalid IP packet type %d\n",
-                      ip4->ip_v);
-    return -EINVAL;
+    TUNNEL_ERROR("invalid IP packet type %d",
+                 ip4->ip_v);
+    return -EPROTONOSUPPORT;
   }
 
-  payload_len = (int32_t)((uint64_t)rte_pktmbuf_pkt_len(m)
-                          - (uint64_t)ip_hdr_len - sizeof(struct esp_hdr)
-                          - (uint64_t)sa->iv_len - (uint64_t)sa->digest_len);
+  /* NAT-T length. */
+  nat_t_len = IPSEC_GET_NAT_T_LEN(priv);
+
+  payload_len = (int32_t)((uint64_t)rte_pktmbuf_pkt_len(m) -
+                          (uint64_t)ip_hdr_len -
+                          (uint64_t)nat_t_len -
+                          sizeof(struct esp_hdr) -
+                          (uint64_t)sa->iv_len -
+                          (uint64_t)sa->digest_len);
 
   if ((payload_len & (sa->block_size - 1)) || (payload_len <= 0)) {
-    lagopus_msg_debug(1, "payload %d not multiple of %u\n",
-                      payload_len, sa->block_size);
+    TUNNEL_DEBUG("payload %d not multiple of %u",
+                 payload_len, sa->block_size);
     return -EINVAL;
   }
 
@@ -96,11 +125,12 @@ esp_inbound(struct rte_mbuf *m, struct ipsec_sa *sa,
   sym_cop->m_src = m;
 
   if (sa->aead_algo == RTE_CRYPTO_AEAD_AES_GCM) {
-    sym_cop->aead.data.offset = ip_hdr_len + sizeof(struct esp_hdr) +
+    sym_cop->aead.data.offset = ip_hdr_len + nat_t_len +
+                                sizeof(struct esp_hdr) +
                                 sa->iv_len;
     sym_cop->aead.data.length = payload_len;
 
-    iv = RTE_PTR_ADD(ip4, ip_hdr_len + sizeof(struct esp_hdr));
+    iv = RTE_PTR_ADD(ip4, ip_hdr_len + nat_t_len + sizeof(struct esp_hdr));
 
     icb = get_cnt_blk(m);
     icb->salt = sa->salt;
@@ -122,15 +152,17 @@ esp_inbound(struct rte_mbuf *m, struct ipsec_sa *sa,
                               rte_pktmbuf_pkt_len(m) - sa->digest_len);
   } else {
     sym_cop->cipher.data.offset =
-      (uint32_t)((uint64_t)ip_hdr_len + sizeof(struct esp_hdr) + sa->iv_len);
+      (uint32_t)((uint64_t)ip_hdr_len + (uint64_t)nat_t_len +
+                 sizeof(struct esp_hdr) + sa->iv_len);
     sym_cop->cipher.data.length = (uint32_t)payload_len;
 
-    iv = RTE_PTR_ADD(ip4, (uint64_t)(ip_hdr_len) + sizeof(struct esp_hdr));
+    iv = RTE_PTR_ADD(ip4, ip_hdr_len + nat_t_len + sizeof(struct esp_hdr));
     iv_ptr = rte_crypto_op_ctod_offset(cop,
                                        uint8_t *, IV_OFFSET);
 
     switch (sa->cipher_algo) {
       case RTE_CRYPTO_CIPHER_NULL:
+      case RTE_CRYPTO_CIPHER_3DES_CBC:
       case RTE_CRYPTO_CIPHER_AES_CBC:
         /* Copy IV at the end of crypto operation */
         rte_memcpy(iv_ptr, iv, sa->iv_len);
@@ -142,8 +174,8 @@ esp_inbound(struct rte_mbuf *m, struct ipsec_sa *sa,
         icb->cnt = rte_cpu_to_be_32(1);
         break;
       default:
-        lagopus_msg_error("unsupported cipher algorithm %u\n",
-                          sa->cipher_algo);
+        TUNNEL_ERROR("unsupported cipher algorithm %u",
+                     sa->cipher_algo);
         return -EINVAL;
     }
 
@@ -151,13 +183,13 @@ esp_inbound(struct rte_mbuf *m, struct ipsec_sa *sa,
       case RTE_CRYPTO_AUTH_NULL:
       case RTE_CRYPTO_AUTH_SHA1_HMAC:
       case RTE_CRYPTO_AUTH_SHA256_HMAC:
-        sym_cop->auth.data.offset = (uint32_t) ip_hdr_len;
+        sym_cop->auth.data.offset = (uint32_t) ip_hdr_len + nat_t_len;
         sym_cop->auth.data.length = (uint32_t) (sizeof(struct esp_hdr) +
                                                 (uint64_t) (sa->iv_len + payload_len));
         break;
       default:
-        lagopus_msg_error("unsupported auth algorithm %u\n",
-                          sa->auth_algo);
+        TUNNEL_ERROR("unsupported auth algorithm %u",
+                     sa->auth_algo);
         return -EINVAL;
     }
 
@@ -175,20 +207,22 @@ esp_inbound(struct rte_mbuf *m, struct ipsec_sa *sa,
 static int
 esp_inbound_post(struct rte_mbuf *m, struct ipsec_sa *sa,
                  struct rte_crypto_op *cop) {
-  struct ip *ip4, *ip;
-  struct ip6_hdr *ip6;
-  uint8_t *nexthdr, *pad_len;
-  uint8_t *padding;
+  lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
+  struct ipsec_mbuf_metadata *priv;
+  uint8_t *nexthdr, *pad_len, *padding, upper_proto;
   uint16_t i;
+  uint32_t set_ecn, ip_len;
 
   RTE_ASSERT(m != NULL);
   RTE_ASSERT(sa != NULL);
   RTE_ASSERT(cop != NULL);
 
   if (cop->status != RTE_CRYPTO_OP_STATUS_SUCCESS) {
-    lagopus_msg_error("failed crypto op\n");
+    TUNNEL_ERROR("failed crypto op");
     return -1;
   }
+
+  priv = get_priv(m);
 
   nexthdr = rte_pktmbuf_mtod_offset(m, uint8_t *,
                                     rte_pktmbuf_pkt_len(m) - sa->digest_len - 1);
@@ -197,38 +231,65 @@ esp_inbound_post(struct rte_mbuf *m, struct ipsec_sa *sa,
   padding = pad_len - *pad_len;
   for (i = 0; i < *pad_len; i++) {
     if (padding[i] != i + 1) {
-      lagopus_msg_error("invalid padding\n");
+      TUNNEL_ERROR("invalid padding");
       return -EINVAL;
     }
   }
 
-  if (rte_pktmbuf_trim(m, (uint16_t)(*pad_len + 2 + sa->digest_len))) {
-    lagopus_msg_error("failed to remove pad_len + digest\n");
+  if (unlikely(rte_pktmbuf_trim(m, (uint16_t)(*pad_len + 2 + sa->digest_len)))) {
+    TUNNEL_ERROR("failed to remove pad_len + digest");
     return -EINVAL;
   }
 
-  if (unlikely(sa->flags == TRANSPORT)) {
-    ip = rte_pktmbuf_mtod(m, struct ip *);
-    ip4 = (struct ip *)rte_pktmbuf_adj(m,
-                                       (uint16_t)(sizeof(struct esp_hdr) + sa->iv_len));
-    if (likely(ip->ip_v == IPVERSION)) {
-      memmove(ip4, ip, (size_t)(ip->ip_hl * 4));
-      ip4->ip_p = *nexthdr;
-      ip4->ip_len = htons(rte_pktmbuf_data_len(m));
-    } else {
-      ip6 = (struct ip6_hdr *)ip4;
-      /* XXX No option headers supported */
-      memmove(ip6, ip, sizeof(struct ip6_hdr));
-      ip6->ip6_nxt = *nexthdr;
-      ip6->ip6_plen = htons(rte_pktmbuf_data_len(m) -
-                            sizeof(struct ip6_hdr));
-    }
-  } else {
-    if (unlikely(ipip_inbound(m,
-                              (uint32_t)(sizeof(struct esp_hdr) + sa->iv_len)) !=
+  if (likely(sa->flags != TRANSPORT)) {
+    /* Outer IP. */
+    if (unlikely(ipip_inbound_outer(m, 0, &set_ecn,
+                                    &ip_len, &upper_proto) !=
                  LAGOPUS_RESULT_OK)) {
       return -EINVAL;
     }
+  } else {
+    /* Unsupported TRANSPORT mode. */
+    TUNNEL_ERROR("Unsupported SA flags: 0x%x",
+                 sa->flags);
+    return -EINVAL;
+  }
+
+  if (SA_IS_NAT_T(sa)) {
+    if (likely(IPSEC_IS_NAT_T(priv))) {
+      /* Use NAT-T. */
+      /*
+        Defined "Non-IKE Marker" in draft-ietf-ipsec-udp-encaps-01.
+        Defined "Non-ESP Marker", undefined "Non-IKE Marker" in RFC3948.
+        Supported only "Non-ESP Marker".
+      */
+      ret = decap_nat_t(m, sa, upper_proto);
+      if (unlikely(ret != LAGOPUS_RESULT_OK)) {
+        if (ret == LAGOPUS_RESULT_UNKNOWN_PROTO) {
+          return -EPROTONOSUPPORT;
+        }
+        return -EINVAL;
+      }
+    } else {
+      TUNNEL_ERROR("Bad NAT-T packet.");
+      return -EINVAL;
+    }
+  }
+
+  /* ESP. */
+  if (unlikely(rte_pktmbuf_adj(m, (uint16_t)(sizeof(struct esp_hdr) +
+                               sa->iv_len)) == NULL)) {
+    TUNNEL_ERROR("rte_pktmbuf_adj failed");
+    return -EINVAL;
+  }
+
+  /* Inner IP. */
+  ret = ipip_inbound_inner(m, set_ecn, ip_len);
+  if (unlikely(ret != LAGOPUS_RESULT_OK)) {
+    if (ret == LAGOPUS_RESULT_UNKNOWN_PROTO) {
+      return -EPROTONOSUPPORT;
+    }
+    return -EINVAL;
   }
 
   return 0;
@@ -237,17 +298,18 @@ esp_inbound_post(struct rte_mbuf *m, struct ipsec_sa *sa,
 static int
 esp_outbound(struct rte_mbuf *m, struct ipsec_sa *sa,
              struct rte_crypto_op *cop) {
+  lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
   struct ip *ip4;
-  struct ip6_hdr *ip6;
   struct ipsec_mbuf_metadata *priv;
   struct esp_hdr *esp = NULL;
-  uint8_t *padding = NULL, *new_ip, nlp;
+  uint8_t *padding = NULL, nlp;
   struct rte_crypto_sym_op *sym_cop;
-  int32_t i;
-  uint16_t pad_payload_len, pad_len, ip_hdr_len;
-  uint8_t *aad;
   struct cnt_blk *icb;
+  int32_t i;
+  uint16_t pad_payload_len, pad_len, ip_hdr_len, nat_t_len;
+  uint8_t *aad;
   uint64_t *iv;
+  uint8_t proto = IPPROTO_ESP;
 
   RTE_ASSERT(m != NULL);
   RTE_ASSERT(sa != NULL);
@@ -256,27 +318,30 @@ esp_outbound(struct rte_mbuf *m, struct ipsec_sa *sa,
   priv = get_priv(m);
   ip_hdr_len = 0;
 
+  /* inner IP. */
   ip4 = rte_pktmbuf_mtod(m, struct ip *);
   if (likely(ip4->ip_v == IPVERSION)) {
-    if (unlikely(sa->flags == TRANSPORT)) {
-      ip_hdr_len = (uint16_t)(ip4->ip_hl * 4);
-      nlp = ip4->ip_p;
-    } else {
+    if (likely(sa->flags != TRANSPORT)) {
       nlp = IPPROTO_IPIP;
+    } else {
+      /* Unsupported TRANSPORT mode. */
+      TUNNEL_ERROR("Unsupported SA flags: 0x%x",
+                   sa->flags);
+      return -EINVAL;
     }
   } else if (ip4->ip_v == IP6_VERSION) {
-    if (unlikely(sa->flags == TRANSPORT)) {
-      /* XXX No option headers supported */
-      ip_hdr_len = sizeof(struct ip6_hdr);
-      ip6 = (struct ip6_hdr *)ip4;
-      nlp = ip6->ip6_nxt;
-    } else {
+    if (likely(sa->flags != TRANSPORT)) {
       nlp = IPPROTO_IPV6;
+    } else {
+      /* Unsupported TRANSPORT mode. */
+      TUNNEL_ERROR("Unsupported SA flags: 0x%x",
+                   sa->flags);
+      return -EINVAL;
     }
   } else {
-    lagopus_msg_error("invalid IP packet type %d\n",
-                      ip4->ip_v);
-    return -EINVAL;
+    TUNNEL_ERROR("invalid IP packet type %d",
+                 ip4->ip_v);
+    return -EPROTONOSUPPORT;
   }
 
   /* Padded payload length */
@@ -294,64 +359,74 @@ esp_outbound(struct rte_mbuf *m, struct ipsec_sa *sa,
   } else if (sa->flags == IP6_TUNNEL) {
     ip_hdr_len = sizeof(struct ip6_hdr);
   } else if (sa->flags != TRANSPORT) {
-    lagopus_msg_error("Unsupported SA flags: 0x%x\n",
-                      sa->flags);
+    TUNNEL_ERROR("Unsupported SA flags: 0x%x",
+                 sa->flags);
     return -EINVAL;
   }
 
+  /* NAT-T length. */
+  nat_t_len = nat_t_get_len_by_sa(sa);
+  IPSEC_SET_NAT_T_LEN(priv, nat_t_len);
+
   /* Check maximum packet size */
-  if (unlikely(ip_hdr_len + sizeof(struct esp_hdr) + sa->iv_len +
+  if (unlikely(ip_hdr_len + nat_t_len + sizeof(struct esp_hdr) + sa->iv_len +
                pad_payload_len + sa->digest_len > IP_MAXPACKET)) {
-    lagopus_msg_error("ipsec packet is too big, %lu > MAX(%d)\n",
-                      ip_hdr_len + sizeof(struct esp_hdr) + sa->iv_len + pad_payload_len +
-                      sa->digest_len, IP_MAXPACKET);
-    lagopus_msg_error("esp_hdr:%lu, iv_len:%d, pad_payload_len:%d, sa_digest_len:%d\n",
-                      sizeof(struct esp_hdr), sa->iv_len, pad_payload_len, sa->digest_len);
+    TUNNEL_ERROR("ipsec packet is too big, %lu > MAX(%d)",
+                 ip_hdr_len + nat_t_len + sizeof(struct esp_hdr) + sa->iv_len +
+                 pad_payload_len + sa->digest_len, IP_MAXPACKET);
+    TUNNEL_ERROR("esp_hdr:%lu, iv_len:%d, pad_payload_len:%d, sa_digest_len:%d",
+                 sizeof(struct esp_hdr), sa->iv_len, pad_payload_len, sa->digest_len);
     return -EINVAL;
   }
 
   padding = (uint8_t *)rte_pktmbuf_append(m,
                                           (uint16_t)(pad_len + sa->digest_len));
   if (unlikely(padding == NULL)) {
-    lagopus_msg_error("not enough mbuf trailing space\n");
+    TUNNEL_ERROR("not enough mbuf trailing space");
     return -ENOSPC;
   }
   rte_prefetch0(padding);
 
+  /* ESP. */
+  esp = (struct esp_hdr *) rte_pktmbuf_prepend(m,
+        sizeof(struct esp_hdr) + sa->iv_len);
+
+  if (IPSEC_IS_NAT_T(priv)) {
+    /* use NAT-T. */
+    /*
+      Defined "Non-IKE Marker" in draft-ietf-ipsec-udp-encaps-01.
+      Defined "Non-ESP Marker", undefined "Non-IKE Marker" in RFC3948.
+      Supported only "Non-ESP Marker".
+    */
+    proto = IPPROTO_UDP;
+    ret = encap_nat_t(m, sa);
+    if (unlikely(ret != LAGOPUS_RESULT_OK)) {
+      if (ret == LAGOPUS_RESULT_UNKNOWN_PROTO) {
+        return -EPROTONOSUPPORT;
+      }
+      return -EINVAL;
+    }
+  }
+
   switch (sa->flags) {
     case IP4_TUNNEL:
-      if (likely(ip4ip_outbound(m, (uint32_t)(sizeof(struct esp_hdr) + sa->iv_len),
-                                &sa->src, &sa->dst, priv->ttl,
-                                priv->tos, &ip4) == LAGOPUS_RESULT_OK)) {
-        esp = (struct esp_hdr *)(ip4 + 1);
-      } else {
+      if (unlikely(ip4ip_outbound(m, 0, proto, ip4, &sa->src, &sa->dst,
+                                  priv->ttl, priv->tos) != LAGOPUS_RESULT_OK)) {
         return -EINVAL;
       }
       break;
     case IP6_TUNNEL:
-      if (likely(ip6ip_outbound(m, (uint32_t)(sizeof(struct esp_hdr) + sa->iv_len),
-                                &sa->src, &sa->dst, priv->ttl,
-                                priv->tos, &ip6) == LAGOPUS_RESULT_OK)) {
-        esp = (struct esp_hdr *)(ip6 + 1);
-      } else {
+      if (unlikely(ip6ip_outbound(m, 0, proto, ip4, &sa->src, &sa->dst,
+                                  priv->ttl, priv->tos) != LAGOPUS_RESULT_OK)) {
         return -EINVAL;
       }
       break;
     case TRANSPORT:
-      new_ip = (uint8_t *)rte_pktmbuf_prepend(m,
-                                              (uint16_t)(sizeof(struct esp_hdr) + sa->iv_len));
-      memmove(new_ip, ip4, ip_hdr_len);
-      esp = (struct esp_hdr *)(new_ip + ip_hdr_len);
-      if (likely(ip4->ip_v == IPVERSION)) {
-        ip4 = (struct ip *)new_ip;
-        ip4->ip_p = IPPROTO_ESP;
-        ip4->ip_len = htons(rte_pktmbuf_data_len(m));
-      } else {
-        ip6 = (struct ip6_hdr *)new_ip;
-        ip6->ip6_nxt = IPPROTO_ESP;
-        ip6->ip6_plen = htons(rte_pktmbuf_data_len(m) -
-                              sizeof(struct ip6_hdr));
-      }
+    default:
+      // Unsupported TRANSPORT mode.
+      TUNNEL_ERROR("Unsupported SA flags: 0x%x",
+                   sa->flags);
+      return -EINVAL;
   }
 
   sa->seq++;
@@ -365,6 +440,7 @@ esp_outbound(struct rte_mbuf *m, struct ipsec_sa *sa,
   } else {
     switch (sa->cipher_algo) {
       case RTE_CRYPTO_CIPHER_NULL:
+      case RTE_CRYPTO_CIPHER_3DES_CBC:
       case RTE_CRYPTO_CIPHER_AES_CBC:
         memset(iv, 0, sa->iv_len);
         break;
@@ -372,8 +448,8 @@ esp_outbound(struct rte_mbuf *m, struct ipsec_sa *sa,
         *iv = rte_cpu_to_be_64(sa->seq);
         break;
       default:
-        lagopus_msg_error("unsupported cipher algorithm %u\n",
-                          sa->cipher_algo);
+        TUNNEL_ERROR("unsupported cipher algorithm %u",
+                     sa->cipher_algo);
         return -EINVAL;
     }
   }
@@ -383,6 +459,7 @@ esp_outbound(struct rte_mbuf *m, struct ipsec_sa *sa,
 
   if (sa->aead_algo == RTE_CRYPTO_AEAD_AES_GCM) {
     sym_cop->aead.data.offset = (uint32_t) (ip_hdr_len +
+                                            nat_t_len +
                                             sizeof(struct esp_hdr) +
                                             sa->iv_len);
     sym_cop->aead.data.length = pad_payload_len;
@@ -412,19 +489,20 @@ esp_outbound(struct rte_mbuf *m, struct ipsec_sa *sa,
   } else {
     switch (sa->cipher_algo) {
       case RTE_CRYPTO_CIPHER_NULL:
+      case RTE_CRYPTO_CIPHER_3DES_CBC:
       case RTE_CRYPTO_CIPHER_AES_CBC:
-        sym_cop->cipher.data.offset = (uint32_t) (ip_hdr_len +
+        sym_cop->cipher.data.offset = (uint32_t) (ip_hdr_len + nat_t_len +
                                       sizeof(struct esp_hdr));
         sym_cop->cipher.data.length = (uint32_t) (pad_payload_len + sa->iv_len);
         break;
       case RTE_CRYPTO_CIPHER_AES_CTR:
-        sym_cop->cipher.data.offset = (uint32_t) (ip_hdr_len +
+        sym_cop->cipher.data.offset = (uint32_t) (ip_hdr_len + nat_t_len +
                                       sizeof(struct esp_hdr) + sa->iv_len);
         sym_cop->cipher.data.length = pad_payload_len;
         break;
       default:
-        lagopus_msg_error("unsupported cipher algorithm %u\n",
-                          sa->cipher_algo);
+        TUNNEL_ERROR("unsupported cipher algorithm %u",
+                     sa->cipher_algo);
         return -EINVAL;
     }
 
@@ -444,13 +522,13 @@ esp_outbound(struct rte_mbuf *m, struct ipsec_sa *sa,
       case RTE_CRYPTO_AUTH_NULL:
       case RTE_CRYPTO_AUTH_SHA1_HMAC:
       case RTE_CRYPTO_AUTH_SHA256_HMAC:
-        sym_cop->auth.data.offset = ip_hdr_len;
+        sym_cop->auth.data.offset = ip_hdr_len + nat_t_len;
         sym_cop->auth.data.length = (uint32_t) (sizeof(struct esp_hdr) +
                                                 sa->iv_len + pad_payload_len);
         break;
       default:
-        lagopus_msg_error("unsupported auth algorithm %u\n",
-                          sa->auth_algo);
+        TUNNEL_ERROR("unsupported auth algorithm %u",
+                     sa->auth_algo);
         return -EINVAL;
     }
 
@@ -474,7 +552,7 @@ esp_outbound_post(struct rte_mbuf *m,
   RTE_ASSERT(cop != NULL);
 
   if (cop->status != RTE_CRYPTO_OP_STATUS_SUCCESS) {
-    lagopus_msg_error("Failed crypto op\n");
+    TUNNEL_ERROR("Failed crypto op");
     return -1;
   }
 
@@ -488,7 +566,8 @@ esp_outbound_post(struct rte_mbuf *m,
 uint16_t
 ipsec_esp_inbound(const pthread_t tid, struct sa_ctx *sad,
                   struct rte_mbuf *pkts[],
-                  size_t nb_pkts, const lagopus_chrono_t now, uint16_t len) {
+                  size_t nb_pkts, const lagopus_chrono_t now,
+                  uint16_t len, iface_stats_t *stats) {
   uint16_t ret = 0;
   lagopus_result_t r;
   ipsecvsw_session_ctx_t sctxs[nb_pkts];
@@ -500,11 +579,12 @@ ipsec_esp_inbound(const pthread_t tid, struct sa_ctx *sad,
 
   r = ipsecvsw_cdevq_put(tid, role,
                          esp_inbound, pkts, sctxs,
-                         nb_pkts);
+                         nb_pkts, stats);
   if (likely(r > 0)) {
     r = ipsecvsw_cdevq_get(tid, role,
                            esp_inbound_post,
-                           pkts, (size_t)len);
+                           pkts, (size_t)len,
+                           stats);
     if (likely(r > 0)) {
       ret = (uint16_t)r;
     }
@@ -516,7 +596,8 @@ ipsec_esp_inbound(const pthread_t tid, struct sa_ctx *sad,
 uint16_t
 ipsec_esp_outbound(const pthread_t tid, struct sa_ctx *sad,
                    struct rte_mbuf *pkts[], uint32_t sa_idx[],
-                   size_t nb_pkts, const lagopus_chrono_t now, uint16_t len) {
+                   size_t nb_pkts, const lagopus_chrono_t now,
+                   uint16_t len, iface_stats_t *stats) {
   uint16_t ret = 0;
   lagopus_result_t r;
   ipsecvsw_session_ctx_t sctxs[nb_pkts];
@@ -528,11 +609,11 @@ ipsec_esp_outbound(const pthread_t tid, struct sa_ctx *sad,
 
   r = ipsecvsw_cdevq_put(tid, role,
                          esp_outbound, pkts, sctxs,
-                         nb_pkts);
+                         nb_pkts, stats);
   if (likely(r > 0)) {
     r = ipsecvsw_cdevq_get(tid, role,
                            esp_outbound_post,
-                           pkts, (size_t)len);
+                           pkts, (size_t)len, stats);
     if (likely(r > 0)) {
       ret = (uint16_t)r;
     }

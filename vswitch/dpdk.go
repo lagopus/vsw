@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -79,7 +79,7 @@ type dpdkManager struct {
 	mutex sync.Mutex
 }
 
-var dpdkMgr *dpdkManager
+var dpdkMgr = &dpdkManager{}
 
 func searchDrivers(path string) []string {
 	prefixes := []string{
@@ -163,13 +163,13 @@ func initDpdk() error {
 		}
 		n++
 	}
-	Logger.Printf("core list: %v", lcores)
+	logger.Printf("core list: %v", lcores)
 
 	var defpool *dpdk.MemPool
 	pools := make(map[int]*dpdk.MemPool)
 	for sid := range sockets {
 		pool, err := dpdk.PktMbufPoolCreate(MemPoolName, config.Dpdk.NumElements, config.Dpdk.CacheSize,
-			C.sizeof_struct_lagopus_packet_metadata,
+			C.sizeof_struct_vsw_packet_metadata,
 			dataRoomSize, int(sid))
 
 		if err != nil {
@@ -294,8 +294,4 @@ func (d *DpdkResource) String() string {
 		str += ", "
 	}
 	return str
-}
-
-func init() {
-	dpdkMgr = &dpdkManager{}
 }

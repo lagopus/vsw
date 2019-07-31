@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -82,29 +82,39 @@ func (cs *CSPD6) FreeRules(rules CACLRules) {
 
 // Make Make ACL.
 func (cs *CSPD6) Make(spd CSPD, inRules CACLRules, inRulesSize uint32,
-	outRules CACLRules, outRulesSize uint32) LagopusResult {
+	outRules CACLRules, outRulesSize uint32) error {
 	s := cs.cspdTocStruct(spd)
 	ir := cs.cACLRulesTocStruct(inRules)
 	or := cs.cACLRulesTocStruct(outRules)
-	return LagopusResult(C.sp6_make_spd(s, ir, C.uint32_t(inRulesSize),
-		or, C.uint32_t(outRulesSize)))
+
+	if r := LagopusResult(C.sp6_make_spd(s, ir, C.uint32_t(inRulesSize),
+		or, C.uint32_t(outRulesSize))); r != LagopusResultOK {
+		return fmt.Errorf("Fail sp6_make_spd, %v", r)
+	}
+	return nil
 }
 
-// Stat Get stat.
-func (cs *CSPD6) Stat(spd CSPD, stat *CSPDStat,
-	spi uint32) LagopusResult {
+// Stats Get stats.
+func (cs *CSPD6) Stats(spd CSPD, spi uint32) (*CSPDStats, error) {
 	s := cs.cspdTocStruct(spd)
-	*stat = &C.struct_spd_stat{}
-	st := cs.cspdStatTocStruct(*stat)
-	return LagopusResult(C.sp6_get_stat(s, st, C.uint32_t(spi)))
+	st := C.struct_spd_stats{}
+	if r := LagopusResult(C.sp6_get_stats(s, &st, C.uint32_t(spi))); r != LagopusResultOK {
+		return nil, fmt.Errorf("Fail sp6_get_stats(), %v", r)
+	}
+	stats := CSPDStats(st)
+	return &stats, nil
 }
 
 // SetRule Set rule.
 func (cs *CSPD6) SetRule(index uint32, rules CACLRules,
-	params CACLParams) LagopusResult {
+	params CACLParams) error {
 	r := cs.cACLRulesTocStruct(rules)
 	p := cs.cACLParamsTocStruct(params)
-	return LagopusResult(C.sp6_set_rule(C.size_t(index), r, p))
+
+	if r := LagopusResult(C.sp6_set_rule(C.size_t(index), r, p)); r != LagopusResultOK {
+		return fmt.Errorf("Fail sp6_set_rule, %v", r)
+	}
+	return nil
 }
 
 // DumpRules Dump rules.

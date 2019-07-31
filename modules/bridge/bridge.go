@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@
 package bridge
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../include -I/usr/local/include/dpdk -m64 -pthread -O3 -msse4.2
-#cgo LDFLAGS: -Wl,-unresolved-symbols=ignore-all -L/usr/local/lib -ldpdk
+#cgo CFLAGS: -I${SRCDIR}/../../include -m64 -pthread -O3 -msse4.2
+#cgo LDFLAGS: -Wl,-unresolved-symbols=ignore-all
 
 #include "bridge.h"
 */
@@ -37,6 +37,7 @@ import (
 	"github.com/lagopus/vsw/utils/hashlist"
 	"github.com/lagopus/vsw/utils/ringpair"
 	"github.com/lagopus/vsw/vswitch"
+	vlog "github.com/lagopus/vsw/vswitch/log"
 )
 
 const (
@@ -70,20 +71,15 @@ type BridgeInstance struct {
 	agingTime     int
 	maxMACEntries int // Maximum MAC entries
 	macTableSize  int // Actual MAC table size (2^n)
-	vifs          map[vswitch.VIFIndex]*dpdk.Ring
-	static        map[macAddress]struct{}
+	vifs          map[vswitch.VIFIndex]*vswitch.VIF
 	macTable      *hashlist.HashList
 	ageOut        *hashlist.HashList
+	macTableCh    chan []vswitch.BridgeMACEntry
 }
 
 type MacEntry struct {
 	VifIndex   uint // Output VIF Index
 	MacAddress net.HardwareAddr
-}
-
-type macTableEntry struct {
-	macAddress macAddress
-	ring       *dpdk.Ring
 }
 
 type macAgeOut struct {
@@ -96,6 +92,7 @@ type bridgeService struct {
 	mutex           sync.Mutex
 	terminate       chan struct{}
 	disableLearning chan *BridgeInstance
+	dumpMACTable    chan *BridgeInstance
 	rp              *ringpair.RingPair
 	bridges         map[uint32]*BridgeInstance
 	running         bool
@@ -166,6 +163,7 @@ func getBridgeService() (*bridgeService, error) {
 		runtime:         rt,
 		terminate:       make(chan struct{}),
 		disableLearning: make(chan *BridgeInstance),
+		dumpMACTable:    make(chan *BridgeInstance),
 		rp:              rp,
 		bridges:         make(map[uint32]*BridgeInstance),
 		refcnt:          1,
@@ -226,7 +224,7 @@ func (s *bridgeService) doAgeOut() {
 			elem := alist.Front()
 			for elem != nil {
 				next := elem.Next()
-				ae := elem.Value.(macAgeOut)
+				ae := elem.Value.(*macAgeOut)
 				if ae.expire <= currentTime {
 					bridge.deleteMACEntry(ae.macAddress)
 				} else {
@@ -245,9 +243,9 @@ func (s *bridgeService) doAgeOut() {
 func (s *bridgeService) flushMACEntry(b *BridgeInstance) {
 	// Remove all learned entries
 	for _, e := range b.macTable.AllElements() {
-		entry := e.Value.(*macTableEntry)
-		if _, exists := b.static[entry.macAddress]; !exists {
-			b.deleteMACEntry(entry.macAddress)
+		entry := e.Value.(*vswitch.BridgeMACEntry)
+		if entry.EntryType == vswitch.EntryDynamic {
+			b.deleteMACEntry(ha2ma(entry.MACAddress))
 		}
 	}
 }
@@ -268,17 +266,12 @@ func (s *bridgeService) learn(l *C.struct_bridge_learn) {
 	srcmac := ha2ma(saddr)
 	vifidx := vswitch.VIFIndex(l.index)
 
-	if _, ok := bridge.static[srcmac]; ok {
-		// ignore MACs in the static entry
-		return
-	}
-
-	// Add to MAC Table
+	// Update FDB
 	bridge.addMACEntry(srcmac, vifidx)
+}
 
-	expire := time.Now().Unix() + int64(bridge.agingTime)
-	ageOutEntry := macAgeOut{macAddress: srcmac, expire: expire}
-	bridge.ageOut.Add(srcmac, ageOutEntry)
+func (s *bridgeService) sendMACTable(b *BridgeInstance) {
+	b.macTableCh <- b.dumpMACTable()
 }
 
 func (s *bridgeService) start() {
@@ -309,6 +302,9 @@ func (s *bridgeService) start() {
 				ticker.Stop()
 				s.stop()
 				return
+
+			case b := <-s.dumpMACTable:
+				s.sendMACTable(b)
 
 			default:
 				if n := learningRing.DequeueBurst(p, maxLearningBufs); n > 0 {
@@ -374,27 +370,27 @@ func newBridgeInstance(base *vswitch.BaseInstance, priv interface{}) (vswitch.In
 
 	// Create an instance
 	b := &BridgeInstance{
-		base:      base,
-		service:   s,
-		bridgeID:  bridgeID,
-		enabled:   false,
-		mtu:       vswitch.DefaultMTU,
-		learning:  true,
-		agingTime: defaultAgingTime,
-		vifs:      make(map[vswitch.VIFIndex]*dpdk.Ring),
-		static:    make(map[macAddress]struct{}),
-		macTable:  hashlist.New(),
-		ageOut:    hashlist.New(),
+		base:       base,
+		service:    s,
+		bridgeID:   bridgeID,
+		enabled:    false,
+		mtu:        vswitch.DefaultMTU,
+		learning:   true,
+		agingTime:  defaultAgingTime,
+		vifs:       make(map[vswitch.VIFIndex]*vswitch.VIF),
+		macTable:   hashlist.New(),
+		ageOut:     hashlist.New(),
+		macTableCh: make(chan []vswitch.BridgeMACEntry),
 	}
 
 	if err := s.registerBridge(b); err != nil {
 		return nil, err
 	}
 
-	b.param = (*C.struct_bridge_instance)(C.malloc(C.sizeof_struct_bridge_instance))
+	b.param = (*C.struct_bridge_instance)(C.calloc(1, C.sizeof_struct_bridge_instance))
 	b.param.base.name = C.CString(base.Name())
 	b.param.base.input = (*C.struct_rte_ring)(unsafe.Pointer(base.Input()))
-	b.param.base.outputs = (**C.struct_rte_ring)(C.malloc(C.size_t(unsafe.Sizeof(uintptr(0)))))
+	b.param.base.outputs = (**C.struct_rte_ring)(C.calloc(1, C.size_t(unsafe.Sizeof(uintptr(0)))))
 	b.param.domain_id = C.uint32_t(bridgeID)
 
 	bi, err := vswitch.NewRuntimeInstance((vswitch.LagopusInstance)(unsafe.Pointer(b.param)))
@@ -427,7 +423,6 @@ func (b *BridgeInstance) Free() {
 	b.service = nil
 	b.base = nil
 	b.vifs = nil
-	b.static = nil
 	b.macTable = nil
 	b.ageOut = nil
 }
@@ -458,6 +453,7 @@ const (
 	BRIDGE_CMD_VIF_DELETE      = bridgeCmd(C.BRIDGE_CMD_VIF_DELETE)
 	BRIDGE_CMD_MAC_ADD         = bridgeCmd(C.BRIDGE_CMD_MAC_ADD)
 	BRIDGE_CMD_MAC_DELETE      = bridgeCmd(C.BRIDGE_CMD_MAC_DELETE)
+	BRIDGE_CMD_SET_MTU         = bridgeCmd(C.BRIDGE_CMD_SET_MTU)
 	BRIDGE_CMD_SET_MAX_ENTRIES = bridgeCmd(C.BRIDGE_CMD_SET_MAX_ENTRIES)
 	BRIDGE_CMD_SET_MAT         = bridgeCmd(C.BRIDGE_CMD_SET_MAT)
 )
@@ -490,7 +486,7 @@ func (b *BridgeInstance) control(cmd bridgeCmd, ring *dpdk.Ring, mac *macAddress
 }
 
 func (b *BridgeInstance) AddVIF(vif *vswitch.VIF, mtu vswitch.MTU) error {
-	b.vifs[vif.Index()] = vif.Input()
+	b.vifs[vif.Index()] = vif
 	b.mtu = mtu
 	return b.control(BRIDGE_CMD_VIF_ADD, vif.Input(), nil, vif)
 	// TODO: Check if VIF is RIF. If so, add its MAC address as a static entry.
@@ -504,6 +500,11 @@ func (b *BridgeInstance) DeleteVIF(vif *vswitch.VIF, mtu vswitch.MTU) error {
 	return b.control(BRIDGE_CMD_VIF_DELETE, nil, nil, vif)
 	// TODO: Check if VIF is RIF. If so, delete its MAC address from FDB.
 	// b.control(BRIDGE_CMD_RIF_DELETE, nil, nil, vif)
+}
+
+func (b *BridgeInstance) SetMTU(mtu vswitch.MTU) {
+	b.mtu = mtu
+	b.control(BRIDGE_CMD_SET_MTU, nil, nil, nil)
 }
 
 func (b *BridgeInstance) SetMACAgingTime(agingTime int) {
@@ -530,6 +531,11 @@ func (b *BridgeInstance) SetMAT(matRing *dpdk.Ring) error {
 	return b.control(BRIDGE_CMD_SET_MAT, matRing, nil, nil)
 }
 
+func (b *BridgeInstance) MACTable() []vswitch.BridgeMACEntry {
+	b.service.dumpMACTable <- b
+	return <-b.macTableCh
+}
+
 //
 // FDB related internal API
 //
@@ -538,28 +544,75 @@ func (b *BridgeInstance) SetMAT(matRing *dpdk.Ring) error {
 // i.e. from bridgeService only.
 //
 func (b *BridgeInstance) addMACEntry(mac macAddress, vifidx vswitch.VIFIndex) {
-	ring, ok := b.vifs[vifidx]
-	if !ok {
-		log.Printf("%s: Unknown VIF %d.", b.base.Name(), vifidx)
-		return
-	}
-
-	// Add to hash lists
+	// Check if we already have an entry
 	if elem := b.macTable.Find(mac); elem != nil {
-		oldEntry := elem.Value.(*macTableEntry)
-		if oldEntry.ring == ring {
-			// no change. just push to the end of the list.
-			b.macTable.Add(mac, oldEntry)
+		entry := elem.Value.(*vswitch.BridgeMACEntry)
+
+		// Do not update static entry
+		if entry.EntryType == vswitch.EntryStatic {
+			return
+		}
+
+		// If the entry is the same, we just push them to the end
+		// of the list.
+		if entry.VIF.Index() == vifidx {
+			expire := time.Now().Unix() + int64(b.agingTime)
+			b.macTable.Add(mac, entry)
+			b.ageOut.Add(mac, &macAgeOut{mac, expire})
 			return
 		}
 	}
 
-	// Either new entry or VIF has changed
-	entry := &macTableEntry{macAddress: mac, ring: ring}
-	b.macTable.Add(mac, entry)
+	vif, ok := b.vifs[vifidx]
+	if !ok {
+		log.Err("%s: Unknown VIF %d. Ignore.", b.base.Name(), vifidx)
+		return
+	}
 
-	// Add to runtime instgance
-	b.control(BRIDGE_CMD_MAC_ADD, ring, &mac, nil)
+	// Either new entry or VIF has changed
+	now := time.Now().Unix()
+	entry := &vswitch.BridgeMACEntry{
+		MACAddress: mac.HardwareAddr(),
+		VIF:        vif,
+		Age:        uint64(now),
+		EntryType:  vswitch.EntryDynamic,
+	}
+
+	b.macTable.Add(mac, entry)
+	b.ageOut.Add(mac, &macAgeOut{mac, now + int64(b.agingTime)})
+	b.control(BRIDGE_CMD_MAC_ADD, vif.Input(), &mac, nil)
+}
+
+func (b *BridgeInstance) addStaticMACEntry(mac macAddress, vifidx vswitch.VIFIndex) {
+	// Ignore the existing static entry.
+	if elem := b.macTable.Find(mac); elem != nil {
+		entry := elem.Value.(*vswitch.BridgeMACEntry)
+
+		if entry.EntryType == vswitch.EntryDynamic {
+			b.ageOut.Remove(mac)
+		}
+
+		if entry.VIF.Index() == vifidx {
+			entry.EntryType = vswitch.EntryStatic
+			return
+		}
+	}
+
+	vif, ok := b.vifs[vifidx]
+	if !ok {
+		log.Err("%s: Unknown VIF %d. Ignore.", b.base.Name(), vifidx)
+		return
+	}
+
+	entry := &vswitch.BridgeMACEntry{
+		MACAddress: mac.HardwareAddr(),
+		VIF:        vif,
+		Age:        uint64(time.Now().Unix()),
+		EntryType:  vswitch.EntryDynamic,
+	}
+
+	b.macTable.Add(mac, entry)
+	b.control(BRIDGE_CMD_MAC_ADD, vif.Input(), &mac, nil)
 }
 
 func (b *BridgeInstance) deleteMACEntry(mac macAddress) {
@@ -571,21 +624,31 @@ func (b *BridgeInstance) deleteMACEntry(mac macAddress) {
 	b.control(BRIDGE_CMD_MAC_DELETE, nil, &mac, nil)
 }
 
-func (b *BridgeInstance) addStaticMACEntry(mac macAddress, vifidx vswitch.VIFIndex) {
-	// b.ageOut.Remove(mac)
-	// b.static[mac] = struct{}{}
-	// b.addMACEntry(mac, vifidx)
+func (b *BridgeInstance) deleteStaticMACEntry(mac macAddress) {
+	b.deleteMACEntry(mac)
 }
 
-func (b *BridgeInstance) deleteStaticMACEntry(mac macAddress) {
-	// delete(b.static, mac)
-	// b.deleteMACEntry(mac, vifidx)
+func (b *BridgeInstance) dumpMACTable() []vswitch.BridgeMACEntry {
+	now := uint64(time.Now().Unix())
+	mt := make([]vswitch.BridgeMACEntry, 0, b.macTable.List().Len())
+	for _, elem := range b.macTable.AllElements() {
+		entry := *elem.Value.(*vswitch.BridgeMACEntry)
+		entry.Age = now - entry.Age
+		mt = append(mt, entry)
+	}
+	return mt
 }
 
 /*
  * Do module set up here.
  */
 func init() {
+	if l, err := vlog.New(moduleName); err == nil {
+		log = l
+	} else {
+		log.Fatalf("Can't create logger: %s", moduleName)
+	}
+
 	rp := &vswitch.RingParam{
 		Count:    C.MAX_BRIDGE_MBUFS,
 		SocketId: dpdk.SOCKET_ID_ANY,

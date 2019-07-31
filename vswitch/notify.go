@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import (
 	"github.com/lagopus/vsw/utils/notifier"
 )
 
-var noti *notifier.Notifier
+var noti = notifier.NewNotifier(notificationBuffer)
 
 const notificationBuffer = 100
 
@@ -110,10 +110,16 @@ const notificationBuffer = 100
 //	Target: *VIF
 //	Value: net.HardwareAddr
 //
+// 11. PBR Entry added:
+//	Type: Notifier.Add
+//	Target: *VRF
+//	Value: PBREntry
+//
+// 12. PBR Entry deleted:
+//	Type: Notifier.Delete
+//	Target: *VRF
+//	Value: PBREntry
+//
 func GetNotifier() *notifier.Notifier {
 	return noti
-}
-
-func init() {
-	noti = notifier.NewNotifier(notificationBuffer)
 }

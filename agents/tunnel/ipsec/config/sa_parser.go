@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ package config
 
 import (
 	"fmt"
-	"net"
 	"strconv"
 
 	"github.com/lagopus/vsw/agents/tunnel/ipsec/sad"
@@ -27,12 +26,6 @@ import (
 )
 
 const (
-	// CipherAlgoTypeUnspec Unspec
-	CipherAlgoTypeUnspec = 0
-	// AuthAlgoTypeUnspec Unspec
-	AuthAlgoTypeUnspec = 0
-	// AeadAlgoTypeUnspec Unspec
-	AeadAlgoTypeUnspec = 0
 	// SAFlagUnspec Unspec
 	SAFlagUnspec = 0
 )
@@ -61,6 +54,7 @@ func newSAParser() *SAParser {
 	p.parserFuncs["src"] = p.parseSrcIP
 	p.parserFuncs["dst"] = p.parseDstIP
 	p.parserFuncs["vrf"] = p.parseVRF
+	p.parserFuncs["udp"] = p.parseUDP
 
 	return p
 }
@@ -77,16 +71,16 @@ func init() {
 		panic(err)
 	}
 
-	for algoType, value := range ipsec.SupportedCipherAlgo {
-		cipherAlgos[value.Keyword] = algoType
+	for algo, value := range ipsec.SupportedCipherAlgoByType {
+		cipherAlgos[value.Keyword] = algo
 	}
 
-	for algoType, value := range ipsec.SupportedAuthAlgo {
-		authAlgos[value.Keyword] = algoType
+	for algo, value := range ipsec.SupportedAuthAlgoByType {
+		authAlgos[value.Keyword] = algo
 	}
 
-	for algoType, value := range ipsec.SupportedAeadAlgo {
-		aeadAlgos[value.Keyword] = algoType
+	for algo, value := range ipsec.SupportedAeadAlgoByType {
+		aeadAlgos[value.Keyword] = algo
 	}
 }
 
@@ -122,10 +116,10 @@ func (p *SAParser) parseCipherAlgo(args *parseSAArgs,
 		return 0, fmt.Errorf("Bad format")
 	}
 
-	var algoValue ipsec.CipherAlgoValues
-	if algoType, ok := cipherAlgos[tokens[pos]]; ok {
-		args.value.CipherAlgo = algoType
-		if value, ok := ipsec.SupportedCipherAlgo[algoType]; ok {
+	var algoValue *ipsec.CipherAlgoValues
+	if algo, ok := cipherAlgos[tokens[pos]]; ok {
+		args.value.CipherAlgoType = algo
+		if value, ok := ipsec.SupportedCipherAlgoByType[algo]; ok {
 			algoValue = value
 		} else {
 			return 0, fmt.Errorf("unrecognizable input: %v", tokens[pos])
@@ -135,7 +129,7 @@ func (p *SAParser) parseCipherAlgo(args *parseSAArgs,
 	}
 
 	// Null Algo doesn't have AlgoKey.
-	if args.value.CipherAlgo == ipsec.CipherAlgoTypeNull {
+	if args.value.CipherAlgoType == ipsec.CipherAlgoTypeNull {
 		return pos, nil
 	}
 
@@ -148,7 +142,7 @@ func (p *SAParser) parseCipherAlgo(args *parseSAArgs,
 	var err error
 	switch tokens[pos] {
 	case "cipher_key":
-		if pos, err = p.parseCipherKey(args, &algoValue, tokens, pos); err != nil {
+		if pos, err = p.parseCipherKey(args, algoValue, tokens, pos); err != nil {
 			return 0, err
 		}
 	default:
@@ -190,10 +184,10 @@ func (p *SAParser) parseAuthAlgo(args *parseSAArgs,
 		return 0, fmt.Errorf("Bad format")
 	}
 
-	var algoValue ipsec.AuthAlgoValues
-	if algoType, ok := authAlgos[tokens[pos]]; ok {
-		args.value.AuthAlgo = algoType
-		if value, ok := ipsec.SupportedAuthAlgo[algoType]; ok {
+	var algoValue *ipsec.AuthAlgoValues
+	if algo, ok := authAlgos[tokens[pos]]; ok {
+		args.value.AuthAlgoType = algo
+		if value, ok := ipsec.SupportedAuthAlgoByType[algo]; ok {
 			algoValue = value
 		} else {
 			return 0, fmt.Errorf("unrecognizable input: %v", tokens[pos])
@@ -216,7 +210,7 @@ func (p *SAParser) parseAuthAlgo(args *parseSAArgs,
 	var err error
 	switch tokens[pos] {
 	case "auth_key":
-		if pos, err = p.parseAuthKey(args, &algoValue, tokens, pos); err != nil {
+		if pos, err = p.parseAuthKey(args, algoValue, tokens, pos); err != nil {
 			return 0, err
 		}
 	default:
@@ -258,10 +252,10 @@ func (p *SAParser) parseAeadAlgo(args *parseSAArgs,
 		return 0, fmt.Errorf("Bad format")
 	}
 
-	var algoValue ipsec.AeadAlgoValues
-	if algoType, ok := aeadAlgos[tokens[pos]]; ok {
-		args.value.AeadAlgo = algoType
-		if value, ok := ipsec.SupportedAeadAlgo[algoType]; ok {
+	var algoValue *ipsec.AeadAlgoValues
+	if algo, ok := aeadAlgos[tokens[pos]]; ok {
+		args.value.AeadAlgoType = algo
+		if value, ok := ipsec.SupportedAeadAlgoByType[algo]; ok {
 			algoValue = value
 		} else {
 			return 0, fmt.Errorf("unrecognizable input: %v", tokens[pos])
@@ -279,7 +273,7 @@ func (p *SAParser) parseAeadAlgo(args *parseSAArgs,
 	var err error
 	switch tokens[pos] {
 	case "aead_key":
-		if pos, err = p.parseAeadKey(args, &algoValue, tokens, pos); err != nil {
+		if pos, err = p.parseAeadKey(args, algoValue, tokens, pos); err != nil {
 			return 0, err
 		}
 	default:
@@ -332,11 +326,7 @@ func (p *SAParser) parseSrcIP(args *parseSAArgs,
 	}
 
 	if ip, err := args.rp.ParseIP(tokens[pos], isIPv4); err == nil {
-		args.value.LocalEPIP = net.IPNet{
-			IP: ip,
-			// Mask is unused.
-			Mask: net.CIDRMask(len(ip)*8, len(ip)*8),
-		}
+		args.value.LocalEPIP = ip
 	} else {
 		return 0, err
 	}
@@ -364,11 +354,7 @@ func (p *SAParser) parseDstIP(args *parseSAArgs,
 	}
 
 	if ip, err := args.rp.ParseIP(tokens[pos], isIPv4); err == nil {
-		args.value.RemoteEPIP = net.IPNet{
-			IP: ip,
-			// Mask is unused.
-			Mask: net.CIDRMask(len(ip)*8, len(ip)*8),
-		}
+		args.value.RemoteEPIP = ip
 	} else {
 		return 0, err
 	}
@@ -390,6 +376,31 @@ func (p *SAParser) parseVRF(args *parseSAArgs,
 	} else {
 		return 0, err
 	}
+
+	return pos, nil
+}
+
+func (p *SAParser) parseUDP(args *parseSAArgs,
+	tokens []string,
+	pos int) (int, error) {
+	var ports [2]uint16 // 0: src port, 1: dst port
+
+	for i := 0; i < 2; i++ {
+		pos++
+		if pos >= len(tokens) {
+			return 0, fmt.Errorf("Bad format")
+		}
+
+		if port, err := strconv.ParseUint(tokens[pos], 10, 16); err == nil {
+			ports[i] = uint16(port)
+		} else {
+			return 0, err
+		}
+	}
+	args.value.EncapSrcPort = ports[0]
+	args.value.EncapDstPort = ports[1]
+	args.value.EncapProtocol = ipsec.EncapProtoUDP
+	args.value.EncapType = ipsec.UDPEncapESPinUDP
 
 	return pos, nil
 }
@@ -440,25 +451,25 @@ func (p *SAParser) Parse(tokens []string) error {
 		}
 	}
 
-	if args.value.CipherAlgo != CipherAlgoTypeUnspec ||
-		args.value.AuthAlgo != AuthAlgoTypeUnspec {
+	if args.value.CipherAlgoType != ipsec.CipherAlgoTypeUnknown ||
+		args.value.AuthAlgoType != ipsec.AuthAlgoTypeUnknown {
 		// check set cipherAlgo.
-		if args.value.CipherAlgo == CipherAlgoTypeUnspec {
+		if args.value.CipherAlgoType == ipsec.CipherAlgoTypeUnknown {
 			return fmt.Errorf("missing cipher options")
 		}
 
 		// check set authAlgo.
-		if args.value.AuthAlgo == AuthAlgoTypeUnspec {
+		if args.value.AuthAlgoType == ipsec.AuthAlgoTypeUnknown {
 			return fmt.Errorf("missing auth options")
 		}
 
 		// check set aeadAlgo.
-		if args.value.AeadAlgo != AeadAlgoTypeUnspec {
+		if args.value.AeadAlgoType != ipsec.AeadAlgoTypeUnknown {
 			return fmt.Errorf("missing aead options")
 		}
 	} else {
 		// check set aeadAlgo.
-		if args.value.AeadAlgo == AeadAlgoTypeUnspec {
+		if args.value.AeadAlgoType == ipsec.AeadAlgoTypeUnknown {
 			return fmt.Errorf("missing aead options")
 		}
 	}

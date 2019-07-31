@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -51,12 +51,12 @@ func listener(t *testing.T, ch chan notifier.Notification) {
 	}
 }
 
-type testIP struct {
-	expect bool
-	addr   IPAddr
-}
-
 func TestIPAddr(t *testing.T) {
+	type testIP struct {
+		expect bool
+		addr   IPAddr
+	}
+
 	ip := IPAddr{net.IPv4(192, 168, 1, 1), net.CIDRMask(24, 32)}
 	target := []testIP{
 		{true, IPAddr{net.IPv4(192, 168, 1, 1), net.CIDRMask(24, 32)}},
@@ -71,6 +71,38 @@ func TestIPAddr(t *testing.T) {
 		} else {
 			t.Errorf("Should return %v for %v == %v\n", test.expect, ip, test.addr)
 		}
+	}
+}
+
+func TestIPAddrParseCIDR(t *testing.T) {
+	type tests struct {
+		cidr   string
+		result IPAddr
+	}
+
+	testCases := []tests{
+		{
+			cidr:   "0.0.0.0/0",
+			result: IPAddr{[]byte{0, 0, 0, 0}, []byte{0, 0, 0, 0}},
+		},
+		{
+			cidr:   "192.168.2.0/24",
+			result: IPAddr{[]byte{192, 168, 2, 0}, []byte{0xff, 0xff, 0xff, 0}},
+		},
+	}
+
+	for _, test := range testCases {
+		t.Logf("ParseCIDR(\"%s\")", test.cidr)
+		ip, err := ParseCIDR(test.cidr)
+		if err != nil {
+			t.Errorf("ParseCIDR failed: %v", err)
+			continue
+		}
+		if !ip.Equal(test.result) {
+			t.Errorf("Unexpected result: %v", ip)
+			continue
+		}
+		t.Logf("Result: %v. ok.", ip)
 	}
 }
 

@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Nippon Telegraph and Telephone Corporation.
+// Copyright 2018-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,4 +24,6 @@ import "C"
 const (
 	MaxVRF      = C.VRF_MAX_ENTRY // Maximum number of VRF
 	MaxVIFIndex = C.VIF_MAX_INDEX // Maximum VIF Index
+
+	InvalidVIFIndex = VIFIndex(C.VIF_INVALID_INDEX) // Invalid VIF Index
 )

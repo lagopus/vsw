@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,16 +22,18 @@ load_sa_atomically(const sad_t sad, const uint32_t spi,
                    time_t *lifetime, uint64_t *byte) {
   bool ret = false;
   if (unlikely(lifetime == NULL || byte == NULL)) {
-    lagopus_msg_error("NULL argument, lifetime:%p, byte:%p", lifetime, byte);
+    TUNNEL_ERROR("NULL argument, lifetime:%p, byte:%p", lifetime, byte);
   } else if (unlikely(spi == INVALID_SPI)) {
-    lagopus_msg_error("invalid spi\n");
+    TUNNEL_ERROR("invalid spi");
   } else if (unlikely(sad == NULL)) {
-    lagopus_msg_error("sad is NULL\n");
+    TUNNEL_ERROR("sad is NULL");
   } else {
     const size_t sa_idx = SPI2IDX(spi);
     *lifetime = sad->lifetime[sa_idx].time_current / 1000LL / 1000LL / 1000LL;
     *byte = sad->lifetime[sa_idx].byte_current;
-    lagopus_msg_debug(200, "pull SA(%u) %ld %lu\n", spi, *lifetime, *byte);
+
+    /* For debug */
+    /* TUNNEL_DEBUG("pull SA(%u) %ld %lu", spi, *lifetime, *byte); */
     ret = true;
   }
   return ret;
@@ -48,15 +50,15 @@ get_acquires(sad_t sad) {
               sizeof(struct sadb_acquire));
     if (likely(acquire != NULL)) {
       if (likely((ret = sad_get_acquires(sad, acquire)) != LAGOPUS_RESULT_OK)) {
-        lagopus_perror(ret);
+        TUNNEL_PERROR(ret);
         free(acquire);
         acquire = NULL;
       }
     } else {
-      lagopus_msg_error("cannot allocate return value\n");
+      TUNNEL_ERROR("cannot allocate return value");
     }
   } else {
-    lagopus_msg_error("sad is NULL\n");
+    TUNNEL_ERROR("sad is NULL");
   }
 
   return acquire;

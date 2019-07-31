@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -43,6 +43,8 @@
 #include <rte_mbuf.h>
 #include <rte_cryptodev.h>
 #include <rte_crypto_sym.h>
+#include <rte_security.h>
+#include <rte_version.h>
 
 #define DPDK_MAX_PORTS	256
 

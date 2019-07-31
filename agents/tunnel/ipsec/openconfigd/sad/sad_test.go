@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -35,11 +35,12 @@ func (suite *testSADTestSuite) TestAddDeleteSA() {
 	vrf := &vswitch.VRF{}
 	spi := uint32(1)
 	vSA := &vswitch.SA{
-		SPI:        spi,
-		Mode:       vswitch.ModeTunnel,
-		RemotePeer: net.ParseIP("127.0.0.1"),
-		Encrypt:    vswitch.EncryptNULL,
-		Auth:       vswitch.AuthNULL,
+		SPI:           spi,
+		Mode:          vswitch.ModeTunnel,
+		RemotePeer:    net.ParseIP("127.0.0.1"),
+		Encrypt:       vswitch.EncryptNULL,
+		Auth:          vswitch.AuthNULL,
+		EncapProtocol: vswitch.IPP_NONE,
 	}
 
 	// Add: OK.
@@ -56,10 +57,10 @@ func (suite *testSADTestSuite) TestAddDeleteSA() {
 		suite.Empty(err)
 		suite.NotEmpty(sa)
 		// check field val.
-		suite.Equal(vSA.RemotePeer, sa.RemoteEPIP.IP)
+		suite.Equal(vSA.RemotePeer, sa.RemoteEPIP)
 	}
 
-	// Update.
+	// Update: OK.
 	vSA.RemotePeer = net.ParseIP("127.0.0.2")
 	UpdateSA(vrf, vSA)
 
@@ -69,7 +70,7 @@ func (suite *testSADTestSuite) TestAddDeleteSA() {
 		suite.Empty(err)
 		suite.NotEmpty(sa)
 		// check field val.
-		suite.Equal(vSA.RemotePeer, sa.RemoteEPIP.IP)
+		suite.Equal(vSA.RemotePeer, sa.RemoteEPIP)
 	}
 
 	// Delete: OK.
@@ -80,6 +81,47 @@ func (suite *testSADTestSuite) TestAddDeleteSA() {
 		_, err := mgr.FindSA(selector)
 		suite.NotEmpty(err)
 	}
+}
+
+func (suite *testSADTestSuite) TestEncap() {
+	// data.
+	spi := uint32(1)
+
+	// data.
+	srcPort := uint16(1)
+	dstPort := uint16(2)
+	vSA := &vswitch.SA{
+		SPI:           spi,
+		EncapProtocol: vswitch.IPP_UDP,
+		EncapSrcPort:  srcPort,
+		EncapDstPort:  dstPort,
+	}
+	saValue := &sad.SAValue{}
+
+	// convert Encap: OK.
+	err := vSA2SAvEncap(vSA, saValue)
+	suite.Empty(err)
+	suite.Equal(ipsec.EncapProtoUDP, saValue.EncapProtocol)
+	suite.Equal(ipsec.UDPEncapESPinUDP, saValue.EncapType)
+	suite.Equal(srcPort, saValue.EncapSrcPort)
+	suite.Equal(dstPort, saValue.EncapDstPort)
+}
+
+func (suite *testSADTestSuite) TestEncapError() {
+	// data.
+	spi := uint32(1)
+
+	// data.
+	vSA := &vswitch.SA{
+		SPI:           spi,
+		EncapProtocol: vswitch.IPP_IP,
+	}
+	saValue := &sad.SAValue{}
+
+	// convert Encap: NG.
+	// Bad encap protocol.
+	err := vSA2SAvEncap(vSA, saValue)
+	suite.NotEmpty(err)
 }
 
 func (suite *testSADTestSuite) TestMode() {
@@ -99,12 +141,8 @@ func (suite *testSADTestSuite) TestMode() {
 		}
 		saValue := &sad.SAValue{
 			CSAValue: ipsec.CSAValue{
-				LocalEPIP: net.IPNet{
-					IP: vSA.LocalPeer,
-				},
-				RemoteEPIP: net.IPNet{
-					IP: vSA.RemotePeer,
-				},
+				LocalEPIP:  vSA.LocalPeer,
+				RemoteEPIP: vSA.RemotePeer,
 			},
 		}
 
@@ -128,6 +166,24 @@ func (suite *testSADTestSuite) TestModeError() {
 	// Bad Mode.
 	err := vSA2SAvMode(vSA, saValue)
 	suite.NotEmpty(err)
+
+	vSA = &vswitch.SA{
+		SPI:        spi,
+		Mode:       vswitch.ModeTunnel,
+		RemotePeer: net.ParseIP("127.0.0.1"),
+		LocalPeer:  net.ParseIP("::1"),
+	}
+	saValue = &sad.SAValue{
+		CSAValue: ipsec.CSAValue{
+			LocalEPIP:  vSA.LocalPeer,
+			RemoteEPIP: vSA.RemotePeer,
+		},
+	}
+
+	// convert Mode: NG.
+	// Bad IP version.
+	err = vSA2SAvMode(vSA, saValue)
+	suite.NotEmpty(err)
 }
 
 func (suite *testSADTestSuite) TestCipherAlgo() {
@@ -135,7 +191,7 @@ func (suite *testSADTestSuite) TestCipherAlgo() {
 	spi := uint32(1)
 	algos := map[vswitch.ESPEncrypt]ipsec.CipherAlgoType{
 		vswitch.EncryptNULL: ipsec.CipherAlgoTypeNull,
-		vswitch.EncryptAES:  ipsec.CipherAlgoTypeAesCbc,
+		vswitch.EncryptAES:  ipsec.CipherAlgoTypeAes128Cbc,
 	}
 	keys := map[vswitch.ESPEncrypt]string{
 		vswitch.EncryptNULL: "",
@@ -154,7 +210,40 @@ func (suite *testSADTestSuite) TestCipherAlgo() {
 		// convert CipherAlgo: OK.
 		err := vSA2SAvCipherAlgo(vSA, saValue)
 		suite.Empty(err)
-		suite.Equal(sAlgo, saValue.CipherAlgo)
+		suite.Equal(sAlgo, saValue.CipherAlgoType)
+	}
+}
+
+func (suite *testSADTestSuite) TestCipherAlgoGCM() {
+	// data.
+	spi := uint32(1)
+	algos := map[vswitch.ESPEncrypt]ipsec.AeadAlgoType{
+		vswitch.EncryptGCM: ipsec.AeadAlgoTypeAes128Gcm,
+	}
+	keys := map[vswitch.ESPEncrypt]string{
+		vswitch.EncryptGCM: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+	}
+
+	for vAlgo, sAlgo := range algos {
+		// data.
+		vSA := &vswitch.SA{
+			SPI:     spi,
+			Encrypt: vAlgo,
+			EncKey:  keys[vAlgo],
+		}
+		saValue := &sad.SAValue{}
+
+		// convert CipherAlgo: OK.
+		err := vSA2SAvCipherAlgo(vSA, saValue)
+		suite.Empty(err)
+		suite.Equal(sAlgo, saValue.AeadAlgoType)
+
+		// convert AuthAlgo: OK.
+		// AeadAlgo doesn't have to specify AuthAlgo.
+		err = vSA2SAvAuthAlgo(vSA, saValue)
+		suite.Empty(err)
+		suite.Equal(ipsec.AuthAlgoTypeUnknown,
+			saValue.AuthAlgoType)
 	}
 }
 
@@ -218,7 +307,7 @@ func (suite *testSADTestSuite) TestAuthAlgo() {
 		// convert AuthAlgo: OK.
 		err := vSA2SAvAuthAlgo(vSA, saValue)
 		suite.Empty(err)
-		suite.Equal(sAlgo, saValue.AuthAlgo)
+		suite.Equal(sAlgo, saValue.AuthAlgoType)
 	}
 }
 
@@ -270,9 +359,7 @@ func (suite *testSADTestSuite) TestLocalEPIP() {
 	// convert LocalEPIP: OK.
 	err := vSA2SAvLocalEPIP(vSA, saValue)
 	suite.Empty(err)
-	suite.Equal(vSA.LocalPeer, saValue.LocalEPIP.IP)
-	suite.Equal(net.CIDRMask(len(vSA.LocalPeer)*8, len(vSA.LocalPeer)*8),
-		saValue.LocalEPIP.Mask)
+	suite.Equal(vSA.LocalPeer, saValue.LocalEPIP)
 }
 
 func (suite *testSADTestSuite) TestRmoteEPIP() {
@@ -287,9 +374,7 @@ func (suite *testSADTestSuite) TestRmoteEPIP() {
 	// convert RemoteEPIP: OK.
 	err := vSA2SAvRemoteEPIP(vSA, saValue)
 	suite.Empty(err)
-	suite.Equal(vSA.RemotePeer, saValue.RemoteEPIP.IP)
-	suite.Equal(net.CIDRMask(len(vSA.RemotePeer)*8, len(vSA.RemotePeer)*8),
-		saValue.RemoteEPIP.Mask)
+	suite.Equal(vSA.RemotePeer, saValue.RemoteEPIP)
 }
 
 func (suite *testSADTestSuite) TestLifeTimeHard() {

@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,6 @@
 
 package ipsec
 
-// #cgo LDFLAGS: -L/usr/local/lib -ldpdk -llagopus_util -lnuma -Wl,-unresolved-symbols=ignore-in-object-files
-// #cgo CFLAGS: -I ${SRCDIR} -I ${SRCDIR}/.. -I /usr/local/include -I /usr/local/include/dpdk -I ${SRCDIR}/../../../include -D_GNU_SOURCE -m64 -pthread -O3 -msse4.2
+// #cgo LDFLAGS: -llagopus_util -lnuma -Wl,-unresolved-symbols=ignore-in-object-files
+// #cgo CFLAGS: -I ${SRCDIR} -I ${SRCDIR}/.. -I ${SRCDIR}/../hash -I ${SRCDIR}/../log -I /usr/local/include -I ${SRCDIR}/../../../include -D_GNU_SOURCE -m64 -pthread -O3 -msse4.2
 import "C"

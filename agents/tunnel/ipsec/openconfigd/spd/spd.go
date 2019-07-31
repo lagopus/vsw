@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,16 +18,18 @@ package spd
 
 import (
 	"fmt"
-	"log"
+	"sync"
 
 	"github.com/lagopus/vsw/agents/tunnel/ipsec/spd"
 	"github.com/lagopus/vsw/modules/tunnel/ipsec"
+	"github.com/lagopus/vsw/modules/tunnel/log"
 	"github.com/lagopus/vsw/vswitch"
 )
 
 var (
-	mgr *spd.Mgr
-	db  map[string]*spd.SPValue
+	mgr  *spd.Mgr
+	db   map[string]*spd.SPValue
+	lock sync.Mutex
 )
 
 func init() {
@@ -37,7 +39,7 @@ func init() {
 
 func vSP2SPvSPI(sp *vswitch.SP, spv *spd.SPValue) error {
 	if sp.SPI == 0 {
-		return fmt.Errorf("Bad SPI: %v\n", sp.SPI)
+		return fmt.Errorf("Bad SPI: %v", sp.SPI)
 	}
 
 	spv.SPI = sp.SPI
@@ -52,7 +54,7 @@ func vSP2SPvDirection(sp *vswitch.SP, spv *spd.SPValue) error {
 	case vswitch.Outbound:
 		spv.Direction = ipsec.DirectionTypeOut
 	default:
-		return fmt.Errorf("Unsupported direction: %v\n", sp.Direction)
+		return fmt.Errorf("Unsupported direction: %v", sp.Direction)
 	}
 
 	return nil
@@ -63,7 +65,7 @@ func vSP2SPvProtocol(sp *vswitch.SP, spv *spd.SPValue) error {
 	case vswitch.IPP_ESP:
 		spv.Protocol = ipsec.SecurityProtocolTypeESP
 	default:
-		return fmt.Errorf("Unsupported protocol: %v\n", sp.SecurityProtocol)
+		return fmt.Errorf("Unsupported protocol: %v", sp.SecurityProtocol)
 	}
 
 	return nil
@@ -78,7 +80,7 @@ func vSP2SPvPolicy(sp *vswitch.SP, spv *spd.SPValue) error {
 	case vswitch.Protect:
 		spv.Policy = ipsec.PolicyTypeProtect
 	default:
-		return fmt.Errorf("Unsupported policy: %v\n", sp.Policy)
+		return fmt.Errorf("Unsupported policy: %v", sp.Policy)
 	}
 
 	return nil
@@ -105,7 +107,7 @@ func vSP2SPvRemoteIP(sp *vswitch.SP, spv *spd.SPValue) error {
 }
 
 func vSP2SPvUpperProtocol(sp *vswitch.SP, spv *spd.SPValue) error {
-	if sp.UpperProtocol == 0 {
+	if sp.UpperProtocol == vswitch.IPP_ANY {
 		spv.UpperProtocol = ipsec.UpperProtocolTypeAny
 	} else {
 		spv.UpperProtocol = ipsec.UpperProtocolType(sp.UpperProtocol)
@@ -196,14 +198,12 @@ func vSP2SPv(sp *vswitch.SP, spv *spd.SPValue) error {
 	return nil
 }
 
-// public.
-
-// AddSP Addd SP.
-func AddSP(vrf *vswitch.VRF, sp *vswitch.SP) {
-	log.Printf("Add SP: %v", sp)
+// no lock.
+func addSPNoLock(vrf *vswitch.VRF, sp *vswitch.SP) {
+	log.Logger.Info("Add SP: %v", sp)
 
 	if _, ok := db[sp.Name]; ok {
-		log.Printf("Add SP: Error: already exists: %v\n", sp.Name)
+		log.Logger.Err("Add SP: Error: already exists: %v", sp.Name)
 	}
 
 	value := &spd.SPValue{
@@ -211,7 +211,7 @@ func AddSP(vrf *vswitch.VRF, sp *vswitch.SP) {
 	}
 
 	if err := vSP2SPv(sp, value); err != nil {
-		log.Printf("Add SP: Error: %v\n", err)
+		log.Logger.Err("Add SP: Error: %v", err)
 		return
 	}
 
@@ -221,51 +221,79 @@ func AddSP(vrf *vswitch.VRF, sp *vswitch.SP) {
 	if _, err := mgr.AddSP(value.Direction,
 		&value.SPSelector,
 		value); err != nil {
-		log.Printf("Add SP: Error: %v\n", err)
+		log.Logger.Err("Add SP: Error: %v", err)
 		return
 	}
 	db[sp.Name] = value
 }
 
-// DeleteSP Delete SP.
-func DeleteSP(vrf *vswitch.VRF, sp *vswitch.SP) {
-	log.Printf("Delete SP: %v", sp)
+// no lock.
+func deleteSPNoLock(vrf *vswitch.VRF, sp *vswitch.SP) {
+	log.Logger.Info("Delete SP: %v", sp)
 
 	if spv, ok := db[sp.Name]; ok {
 		mgr.DeleteSP(spv.Direction, &spv.SPSelector)
 		delete(db, sp.Name)
 	} else {
-		log.Printf("Add SP: Error: not found: %v\n", sp.Name)
+		log.Logger.Err("Delete SP: Error: not found: %v", sp.Name)
 	}
 }
 
-// UpdateSP Update SP.
-func UpdateSP(vrf *vswitch.VRF, sp *vswitch.SP) {
-	log.Printf("Update SP: %v", sp)
+// no lock.
+func updateSPNoLock(vrf *vswitch.VRF, sp *vswitch.SP) {
+	log.Logger.Info("Update SP: %v", sp)
 
 	if spv, ok := db[sp.Name]; ok {
 		value := &spd.SPValue{
 			SPSelector: spd.SPSelector{},
 		}
 		if err := vSP2SPv(sp, value); err != nil {
-			log.Printf("Update SP: Error: %v\n", err)
+			log.Logger.Err("Update SP: Error: %v", err)
 			return
 		}
 
 		if (spv.Direction != value.Direction) ||
 			spv.SPSelector.Modified(value.SPSelector) {
 			// Update selector.
-			DeleteSP(vrf, sp)
-			AddSP(vrf, sp)
+			deleteSPNoLock(vrf, sp)
+			addSPNoLock(vrf, sp)
 		} else {
 			value.State = spd.Completed
 			if err := mgr.UpdateSP(value.Direction,
 				&value.SPSelector,
 				value); err != nil {
-				log.Printf("Update SP: Error: %v\n", err)
+				log.Logger.Err("Update SP: Error: %v", err)
 				return
 			}
-			spv = value
+			*spv = *value
 		}
+	} else {
+		log.Logger.Err("Update SP: Error: not found: %v", sp.Name)
 	}
+}
+
+// public.
+
+// AddSP Addd SP.
+func AddSP(vrf *vswitch.VRF, sp *vswitch.SP) {
+	lock.Lock()
+	defer lock.Unlock()
+
+	addSPNoLock(vrf, sp)
+}
+
+// DeleteSP Delete SP.
+func DeleteSP(vrf *vswitch.VRF, sp *vswitch.SP) {
+	lock.Lock()
+	defer lock.Unlock()
+
+	deleteSPNoLock(vrf, sp)
+}
+
+// UpdateSP Update SP.
+func UpdateSP(vrf *vswitch.VRF, sp *vswitch.SP) {
+	lock.Lock()
+	defer lock.Unlock()
+
+	updateSPNoLock(vrf, sp)
 }

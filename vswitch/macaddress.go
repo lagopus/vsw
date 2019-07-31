@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Nippon Telegraph and Telephone Corporation.
+// Copyright 2018-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -96,7 +96,7 @@ func init() {
 
 	// Generate MAC Address prefix
 	if _, err := rand.Read(macMgr.prefix); err != nil {
-		Logger.Panicf("Can't generate random number: %v", err)
+		logger.Panicf("Can't generate random number: %v", err)
 	}
 	macMgr.prefix[0] &= 0xfe
 	macMgr.prefix[0] |= 0x02

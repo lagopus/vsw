@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Nippon Telegraph and Telephone Corporation.
+// Copyright 2018-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -530,10 +530,12 @@ func TestInterfaceBasic(t *testing.T) {
 
 	t.Logf("Try chainging to ACCESS Mode")
 	if err := p.ifmode(if0, AccessMode, true); err != nil {
-		t.Fatalf("SetInterfaceMode(%v) should succeed.", AccessMode)
+		p.free(if0)
+		t.Fatalf("SetInterfaceMode(%v) should succeed: %v", AccessMode, err)
 	}
 	ivids := if0.VID()
 	if len(ivids) != 0 {
+		p.free(if0)
 		t.Fatalf("VID should have been cleared after changing to ACCESS mode: %v", ivids)
 	}
 	t.Logf("SetInterfaceMode(%v) ok.", AccessMode)

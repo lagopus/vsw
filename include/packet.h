@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef LAGOPUS_PACKET_H_
-#define LAGOPUS_PACKET_H_
+#ifndef VSW_PACKET_H_
+#define VSW_PACKET_H_
 
 #include <stdbool.h>
 #include <rte_mbuf.h>
@@ -38,34 +38,31 @@ typedef uint16_t vrfindex_t;
 #define BRIDGE_INVALID_ID	0
 #define BRIDGE_MAX_ID		1023	   // Valid Bridge ID is from 1 to BRIDGE_MAX_ID
 
-#define MAX_PACKET_SZ 4096
+#define MAX_PACKET_SZ 2048
 #define PACKET_METADATA_SIZE (RTE_MBUF_PRIV_ALIGN << 6)	// Shall be a multiple of RTE_MBUF_PRIV_ALIGN
 
-#define LAGOPUS_MBUF_METADATA(mbuf) (struct lagopus_packet_metadata*)((void*)(mbuf) + sizeof(struct rte_mbuf))
+#define VSW_MBUF_METADATA(mbuf) (struct vsw_packet_metadata*)((void*)(mbuf) + sizeof(struct rte_mbuf))
 
 typedef enum {
-	// The packet is sent to the router itself.
-	LAGOPUS_MD_SELF			= (1 << 0),
-
 	// The packet should be processed by MAT. Used by bridge module only.
-	LAGOPUS_MD_MAT			= (1 << 1),
-} lagopus_md_flag_t;
+	VSW_MD_MAT			= (1 << 1),
+} vsw_md_flag_t;
 
-struct lagopus_packet_metadata {
-	struct vif_metadata {
-		uint64_t vrf;			// DEPRECATED. WILL BE REMOVED.
+struct vsw_packet_metadata {
+	struct vsw_common_metadata {
 		vifindex_t in_vif;
 		vifindex_t out_vif;
 
-		lagopus_md_flag_t flags;	// Or'd LAGOPUS_MD_*
+		vsw_md_flag_t flags;	// Or'd VSW_MD_*
 
 		bool local;			// True if the packet is originated locally. False otherwise.
-	} md_vif;
-	uint8_t udata[PACKET_METADATA_SIZE - sizeof(struct vif_metadata)];
+		bool to_tap;			// If True, send this packet to the TAP.
+	} common;
+	uint8_t udata[PACKET_METADATA_SIZE - sizeof(struct vsw_common_metadata)];
 };
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // LAGOPUS_PACKET_H_
+#endif // VSW_PACKET_H_

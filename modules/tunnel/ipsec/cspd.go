@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,7 +22,9 @@ import "C"
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"net"
+	"time"
 	"unsafe"
 
 	"github.com/lagopus/vsw/vswitch"
@@ -37,8 +39,16 @@ type CACLRules interface{}
 // CACLParams ACLParams for C.
 type CACLParams interface{}
 
-// CSPDStat struct spd_stat.
-type CSPDStat *C.struct_spd_stat
+// CSPDStats struct spd_stats.
+type CSPDStats C.struct_spd_stats
+
+// LifeTimeCurrent Get LifeTimeCurrent.
+func (s *CSPDStats) LifeTimeCurrent() time.Time {
+	lifeTime := int64(s.lifetime_current)
+	sec := lifeTime / int64(time.Second)
+	nsec := lifeTime - (sec * int64(time.Second))
+	return time.Unix(sec, nsec)
+}
 
 // CSPSelector Selector for CSP.
 type CSPSelector struct {
@@ -53,7 +63,7 @@ type CSPSelector struct {
 }
 
 // Modified Is Modified.
-func (s CSPSelector) Modified(newS CSPSelector) bool {
+func (s *CSPSelector) Modified(newS CSPSelector) bool {
 	return (s.VRFIndex != newS.VRFIndex) ||
 		!bytes.Equal(s.LocalIP.IP, newS.LocalIP.IP) ||
 		!bytes.Equal(s.LocalIP.Mask, newS.LocalIP.Mask) ||
@@ -85,23 +95,17 @@ type SPD interface {
 	AllocRules(size uint32) CACLRules
 	FreeRules(rules CACLRules)
 	Make(spd CSPD, inRules CACLRules, inRulesSize uint32,
-		outRules CACLRules, outRulesSize uint32) LagopusResult
-	Stat(spd CSPD, stat *CSPDStat,
-		spi uint32) LagopusResult
-	StatLiftimeCurrent(stat CSPDStat) int64
+		outRules CACLRules, outRulesSize uint32) error
+	Stats(spd CSPD, spi uint32) (*CSPDStats, error)
 	SetRule(index uint32, rules CACLRules,
-		params CACLParams) LagopusResult
+		params CACLParams) error
 	DumpRules(rules CACLRules, size uint32)
 	NewParams(args *CACLParamsArgs) CACLParams
 	ModuleCSPD(vrfIndex vswitch.VRFIndex, direction DirectionType) (CSPD, error)
-	String() string
+	fmt.Stringer
 }
 
 type baseCSPD struct{}
-
-func (cs *baseCSPD) cspdStatTocStruct(stat CSPDStat) *C.struct_spd_stat {
-	return (*C.struct_spd_stat)((unsafe.Pointer(stat)))
-}
 
 func (cs *baseCSPD) ipv4ToCUint32(ip net.IP) C.uint32_t {
 	return C.uint32_t(binary.LittleEndian.Uint32(
@@ -127,10 +131,4 @@ func (cs *baseCSPD) cModule(direction DirectionType) *Module {
 	}
 
 	return nil
-}
-
-// StatLiftimeCurrent Get liftime (current).
-func (cs *baseCSPD) StatLiftimeCurrent(stat CSPDStat) int64 {
-	s := cs.cspdStatTocStruct(stat)
-	return int64(s.lifetime_current)
 }

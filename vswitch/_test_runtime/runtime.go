@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ package runtime
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../../include -I/usr/local/include/dpdk -m64 -pthread -O3 -msse4.2
-#cgo LDFLAGS: -Wl,-unresolved-symbols=ignore-all -L/usr/local/lib -ldpdk
+#cgo LDFLAGS: -Wl,-unresolved-symbols=ignore-all
 
 #include <stdlib.h>
 #include "runtime.h"
@@ -28,11 +28,11 @@ package runtime
 
 struct test_runtime {
 	char *name;
-	struct lagopus_instance *instances[MAX_INSTANCE];
+	struct vsw_instance *instances[MAX_INSTANCE];
 };
 
 struct test_instance {
-	struct lagopus_instance base;
+	struct vsw_instance base;
 	struct rte_ring *o[1];
 };
 
@@ -40,7 +40,7 @@ static void*
 test_init(void *param) {
 	struct test_runtime *r = calloc(1, sizeof(struct test_runtime));
 	r->name = param;
-	_lagopus_printf("%s: %s", __func__, r->name);
+	vsw_printf("%s: %s", __func__, r->name);
 	return r;
 }
 
@@ -49,11 +49,11 @@ test_process(void *priv) {
 	static int x = 0;
 	struct test_runtime *r = priv;
 	if (x == 0)
-		_lagopus_printf("%s: %s: called", __func__, r->name);
+		vsw_printf("%s: %s: called", __func__, r->name);
 	for (int n = 0; n < MAX_INSTANCE; n++) {
-		struct lagopus_instance *i =  r->instances[n];
+		struct vsw_instance *i =  r->instances[n];
 		if (i && i->enabled && x == 0) {
-			_lagopus_printf("%s: %s: %s", __func__, r->name, i->name);
+			vsw_printf("%s: %s: %s", __func__, r->name, i->name);
 		}
 	}
 	x = (x + 1) % 100000;
@@ -63,15 +63,15 @@ test_process(void *priv) {
 static void
 test_deinit(void *priv) {
 	struct test_runtime *r = priv;
-	_lagopus_printf("%s: %s", __func__, r->name);
+	vsw_printf("%s: %s", __func__, r->name);
 	free(r);
 }
 
 static bool
-test_register_instance(void *priv, struct lagopus_instance *instance) {
+test_register_instance(void *priv, struct vsw_instance *instance) {
 	struct test_runtime *r = priv;
 	char *name = priv;
-	_lagopus_printf("%s: %s (%s)", __func__, r->name, instance->name);
+	vsw_printf("%s: %s (%s)", __func__, r->name, instance->name);
 
 	for (int n = 0; n < MAX_INSTANCE; n++) {
 		if (r->instances[n] == 0) {
@@ -84,10 +84,10 @@ test_register_instance(void *priv, struct lagopus_instance *instance) {
 }
 
 static bool
-test_unregister_instance(void *priv, struct lagopus_instance *instance) {
+test_unregister_instance(void *priv, struct vsw_instance *instance) {
 	struct test_runtime *r = priv;
 	char *name = priv;
-	_lagopus_printf("%s: %s (%s)", __func__, r->name, instance->name);
+	vsw_printf("%s: %s (%s)", __func__, r->name, instance->name);
 
 	for (int n = 0; n < MAX_INSTANCE; n++) {
 		if (r->instances[n] == instance) {
@@ -100,14 +100,14 @@ test_unregister_instance(void *priv, struct lagopus_instance *instance) {
 }
 
 static bool
-test_control_instance(void *priv, struct lagopus_instance *instance, void *param) {
+test_control_instance(void *priv, struct vsw_instance *instance, void *param) {
 	struct test_runtime *r = priv;
 	char *name = priv;
-	_lagopus_printf("%s: %s (%s)", __func__, r->name, instance->name);
+	vsw_printf("%s: %s (%s)", __func__, r->name, instance->name);
 	return true;
 }
 
-struct lagopus_runtime_ops test_ops = {
+struct vsw_runtime_ops test_ops = {
 	.init = test_init,
 	.process = test_process,
 	.deinit = test_deinit,
@@ -119,8 +119,9 @@ struct lagopus_runtime_ops test_ops = {
 import "C"
 
 import (
-	"github.com/lagopus/vsw/dpdk"
 	"unsafe"
+
+	"github.com/lagopus/vsw/dpdk"
 )
 
 func GetRuntimeParams(name string) (unsafe.Pointer, unsafe.Pointer) {
@@ -137,7 +138,7 @@ func NewRuntimeInstance(name string, input, output *dpdk.Ring) unsafe.Pointer {
 }
 
 func FreeRuntimeInstance(p unsafe.Pointer) {
-	x := (*C.struct_lagopus_instance)(p)
+	x := (*C.struct_vsw_instance)(p)
 	C.free(unsafe.Pointer(x.name))
 	C.free(p)
 }

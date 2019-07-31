@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,13 +18,13 @@ package sad
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"time"
 
 	"github.com/lagopus/vsw/agents/tunnel/ipsec/config"
 	"github.com/lagopus/vsw/agents/tunnel/ipsec/sad"
 	"github.com/lagopus/vsw/modules/tunnel/ipsec"
+	"github.com/lagopus/vsw/modules/tunnel/log"
 	"github.com/lagopus/vsw/vswitch"
 )
 
@@ -39,6 +39,21 @@ func init() {
 	}
 }
 
+func vSA2SAvEncap(sa *vswitch.SA, sav *sad.SAValue) error {
+	switch sa.EncapProtocol {
+	case vswitch.IPP_UDP:
+		sav.EncapProtocol = ipsec.EncapProtoUDP
+		sav.EncapType = ipsec.UDPEncapESPinUDP
+		sav.EncapSrcPort = sa.EncapSrcPort
+		sav.EncapDstPort = sa.EncapDstPort
+	case vswitch.IPP_NONE:
+		sav.EncapProtocol = ipsec.EncapProtoNone
+	default:
+		return fmt.Errorf("Bad encap protocol: %v", sa.EncapProtocol)
+	}
+	return nil
+}
+
 func vSA2SAvMode(sa *vswitch.SA, sav *sad.SAValue) error {
 	// Precondition: LocalEPIP, RemoteEPIP converted before Mode.
 	isIPv4Fn := func(ip net.IP) bool {
@@ -47,107 +62,125 @@ func vSA2SAvMode(sa *vswitch.SA, sav *sad.SAValue) error {
 
 	switch sa.Mode {
 	case vswitch.ModeTunnel:
-		if isIPv4Fn(sav.LocalEPIP.IP) && isIPv4Fn(sav.RemoteEPIP.IP) {
+		if isIPv4Fn(sav.LocalEPIP) && isIPv4Fn(sav.RemoteEPIP) {
 			sav.Flags = ipsec.IP4Tunnel
-		} else {
+		} else if !isIPv4Fn(sav.LocalEPIP) && !isIPv4Fn(sav.RemoteEPIP) {
 			sav.Flags = ipsec.IP6Tunnel
+		} else {
+			return fmt.Errorf("Bad IP version: local: %v, remote: %v",
+				sav.LocalEPIP, sav.RemoteEPIP)
 		}
 	default:
-		return fmt.Errorf("Unsupported mode: %v\n", sa.Mode)
+		return fmt.Errorf("Unsupported mode: %v", sa.Mode)
 	}
 
 	return nil
 }
 
-var cipherAlgos = map[vswitch.ESPEncrypt]string{
-	vswitch.EncryptNULL: "null",
-	vswitch.EncryptAES:  "aes-128-cbc",
+// Convert map for Cipher algos.
+var cipherAlgos = map[vswitch.ESPEncrypt]ipsec.CipherAlgoType{
+	vswitch.EncryptNULL: ipsec.CipherAlgoTypeNull,
+	vswitch.EncryptAES:  ipsec.CipherAlgoTypeAes128Cbc,
+}
+
+// Convert map for AEAD algos.
+var aeadAlgos = map[vswitch.ESPEncrypt]ipsec.AeadAlgoType{
+	vswitch.EncryptGCM: ipsec.AeadAlgoTypeAes128Gcm,
 }
 
 func vSA2SAvCipherAlgo(sa *vswitch.SA, sav *sad.SAValue) error {
-	if algoStr, ok := cipherAlgos[sa.Encrypt]; ok {
-		algos := config.CipherAlgos()
-		if a, ok := algos[algoStr]; ok {
-			// algo type.
-			sav.CipherAlgo = a
+	var savKey *[]byte
+	var algoKeyLen uint16
 
-			var algoValue ipsec.CipherAlgoValues
-			if value, ok := ipsec.SupportedCipherAlgo[a]; ok {
-				algoValue = value
-			} else {
-				return fmt.Errorf("Unsupported CipherAlgo: %v\n", sa.Encrypt)
-			}
+	if a, ok := cipherAlgos[sa.Encrypt]; ok {
+		// Cipher algo type.
+		sav.CipherAlgoType = a
 
-			// Null Algo doesn't have AlgoKey.
-			if sav.CipherAlgo == ipsec.CipherAlgoTypeNull {
-				if len(sa.EncKey) != 0 {
-					return fmt.Errorf("Bad CipherAlgo key length: %v\n", sa.EncKey)
-				}
-				return nil
-			}
-
-			// key
-			if key, err := config.ParseHexKey(sa.EncKey, ""); err == nil {
-				sav.CipherKey = key
-			} else {
-				return err
-			}
-
-			if uint16(len(sav.CipherKey)) != algoValue.KeyLen {
-				return fmt.Errorf("Bad CipherAlgo key length: %v\n", sa.EncKey)
-			}
+		if value, ok := ipsec.SupportedCipherAlgoByType[a]; ok {
+			savKey = &sav.CipherKey
+			algoKeyLen = value.KeyLen
 		} else {
-			return fmt.Errorf("Unsupported CipherAlgo: %v\n", sa.Encrypt)
+			return fmt.Errorf("Unsupported Cipher algo: %v", sa.Encrypt)
+		}
+	} else if a, ok := aeadAlgos[sa.Encrypt]; ok {
+		// AEAD algo type.
+		sav.AeadAlgoType = a
+
+		if value, ok := ipsec.SupportedAeadAlgoByType[a]; ok {
+			savKey = &sav.AeadKey
+			algoKeyLen = value.KeyLen
+		} else {
+			return fmt.Errorf("Unsupported AEAD algo: %v", sa.Encrypt)
 		}
 	} else {
-		return fmt.Errorf("Unsupported CipherAlgo: %v\n", sa.Encrypt)
+		return fmt.Errorf("Unsupported Cipher/AEAD algo: %v", sa.Encrypt)
+	}
+
+	// Null Algo doesn't have AlgoKey.
+	if sav.CipherAlgoType == ipsec.CipherAlgoTypeNull {
+		if len(sa.EncKey) != 0 {
+			return fmt.Errorf("Bad Cipher algo key length: %v", sa.EncKey)
+		}
+		return nil
+	}
+
+	// key
+	if key, err := config.ParseHexKey(sa.EncKey, ""); err == nil {
+		*savKey = key
+	} else {
+		return err
+	}
+
+	if uint16(len(*savKey)) != algoKeyLen {
+		return fmt.Errorf("Bad Cipher/AEAD algo key length: %v", sa.EncKey)
 	}
 
 	return nil
 }
 
-var authAlgos = map[vswitch.ESPAuth]string{
-	vswitch.AuthNULL: "null",
-	vswitch.AuthSHA1: "sha1-hmac",
+// Convert map for Auth algos.
+var authAlgos = map[vswitch.ESPAuth]ipsec.AuthAlgoType{
+	vswitch.AuthNULL: ipsec.AuthAlgoTypeNull,
+	vswitch.AuthSHA1: ipsec.AuthAlgoTypeSha1Hmac,
 }
 
 func vSA2SAvAuthAlgo(sa *vswitch.SA, sav *sad.SAValue) error {
-	if algoStr, ok := authAlgos[sa.Auth]; ok {
-		algos := config.AuthAlgos()
-		if a, ok := algos[algoStr]; ok {
-			// algo type.
-			sav.AuthAlgo = a
+	if sav.AeadAlgoType != ipsec.AeadAlgoTypeUnknown {
+		// AeadAlgo doesn't have to specify AuthAlgo.
+		return nil
+	}
 
-			var algoValue ipsec.AuthAlgoValues
-			if value, ok := ipsec.SupportedAuthAlgo[a]; ok {
-				algoValue = value
-			} else {
-				return fmt.Errorf("Unsupported AuthAlgo: %v\n", sa.Auth)
-			}
+	if a, ok := authAlgos[sa.Auth]; ok {
+		// algo type.
+		sav.AuthAlgoType = a
 
-			// Null Algo doesn't have AlgoKey.
-			if sav.AuthAlgo == ipsec.AuthAlgoTypeNull {
-				if len(sa.AuthKey) != 0 {
-					return fmt.Errorf("Bad AuthAlgo key length: %v\n", sa.AuthKey)
-				}
-				return nil
-			}
-
-			// key.
-			if key, err := config.ParseHexKey(sa.AuthKey, ""); err == nil {
-				sav.AuthKey = key
-			} else {
-				return err
-			}
-
-			if uint16(len(sav.AuthKey)) != algoValue.KeyLen {
-				return fmt.Errorf("Bad AuthAlgo key length: %v\n", sa.EncKey)
-			}
+		var algoValue *ipsec.AuthAlgoValues
+		if value, ok := ipsec.SupportedAuthAlgoByType[a]; ok {
+			algoValue = value
 		} else {
-			return fmt.Errorf("Unsupported AuthAlgo: %v\n", sa.Encrypt)
+			return fmt.Errorf("Unsupported AuthAlgo: %v", sa.Auth)
+		}
+
+		// Null Algo doesn't have AlgoKey.
+		if sav.AuthAlgoType == ipsec.AuthAlgoTypeNull {
+			if len(sa.AuthKey) != 0 {
+				return fmt.Errorf("Bad AuthAlgo key length: %v", sa.AuthKey)
+			}
+			return nil
+		}
+
+		// key.
+		if key, err := config.ParseHexKey(sa.AuthKey, ""); err == nil {
+			sav.AuthKey = key
+		} else {
+			return err
+		}
+
+		if uint16(len(sav.AuthKey)) != algoValue.KeyLen {
+			return fmt.Errorf("Bad AuthAlgo key length: %v", sa.EncKey)
 		}
 	} else {
-		return fmt.Errorf("Unsupported AuthAlgo: %v\n", sa.Encrypt)
+		return fmt.Errorf("Unsupported AuthAlgo: %v", sa.Encrypt)
 	}
 
 	return nil
@@ -162,12 +195,8 @@ func vSA2SAvLocalEPIP(sa *vswitch.SA, sav *sad.SAValue) error {
 		return nil
 	}
 
-	ip := sa.LocalPeer
-	sav.LocalEPIP = net.IPNet{
-		IP: ip,
-		// Mask is unused.
-		Mask: net.CIDRMask(len(ip)*8, len(ip)*8),
-	}
+	sav.LocalEPIP = sa.LocalPeer
+
 	return nil
 }
 
@@ -176,12 +205,8 @@ func vSA2SAvRemoteEPIP(sa *vswitch.SA, sav *sad.SAValue) error {
 		return nil
 	}
 
-	ip := sa.RemotePeer
-	sav.RemoteEPIP = net.IPNet{
-		IP: ip,
-		// Mask is unused.
-		Mask: net.CIDRMask(len(ip)*8, len(ip)*8),
-	}
+	sav.RemoteEPIP = sa.RemotePeer
+
 	return nil
 }
 
@@ -209,36 +234,47 @@ func vSA2SAvProtocol(sa *vswitch.SA, sav *sad.SAValue) error {
 }
 
 func vSA2SAv(sa *vswitch.SA, sav *sad.SAValue) error {
-	// Cipher algo.
+	// Cipher/AEAD algo.
 	if err := vSA2SAvCipherAlgo(sa, sav); err != nil {
 		return err
 	}
+
+	// Precondition: CipherAlgo converted before AuthAlgo.
 	// Auth algo.
 	if err := vSA2SAvAuthAlgo(sa, sav); err != nil {
 		return err
 	}
-	// TODO: Aead algo.
 
 	// LocalEPIP.
 	if err := vSA2SAvLocalEPIP(sa, sav); err != nil {
 		return err
 	}
+
 	// RemoteEPIP.
 	if err := vSA2SAvRemoteEPIP(sa, sav); err != nil {
 		return err
 	}
+
 	// Protocol.
 	if err := vSA2SAvProtocol(sa, sav); err != nil {
 		return err
 	}
+
+	// Encap (NAT-T).
+	if err := vSA2SAvEncap(sa, sav); err != nil {
+		return err
+	}
+
 	// LifeTimeHard.
 	if err := vSA2SAvLifeTimeHard(sa, sav); err != nil {
 		return err
 	}
+
 	// LifeTimeByteHard.
 	if err := vSA2SAvLifeTimeByteHard(sa, sav); err != nil {
 		return err
 	}
+
 	// Mode. Precondition: LocalEPIP, RemoteEPIP converted before Mode.
 	if err := vSA2SAvMode(sa, sav); err != nil {
 		return err
@@ -251,7 +287,7 @@ func vSA2SAv(sa *vswitch.SA, sav *sad.SAValue) error {
 
 // AddSA Addd SA.
 func AddSA(vrf *vswitch.VRF, sa *vswitch.SA) {
-	log.Printf("Add SA: %v", sa)
+	log.Logger.Info("Add SA: %v", sa)
 
 	selector := &sad.SASelector{
 		VRFIndex: vrf.Index(),
@@ -259,17 +295,17 @@ func AddSA(vrf *vswitch.VRF, sa *vswitch.SA) {
 	}
 	value := &sad.SAValue{}
 	if err := vSA2SAv(sa, value); err != nil {
-		log.Printf("SA: Error: %v\n", err)
+		log.Logger.Err("SA: Error: %v", err)
 		return
 	}
 
 	for _, mgr := range mgrs {
 		if err := mgr.AddSA(selector, value); err != nil {
-			log.Printf("Add SA: Error: %v\n", err)
+			log.Logger.Err("Add SA: Error: %v", err)
 			return
 		}
 		if err := mgr.EnableSA(selector); err != nil {
-			log.Printf("Enable SA: Error: %v\n", err)
+			log.Logger.Err("Enable SA: Error: %v", err)
 			return
 		}
 	}
@@ -277,7 +313,7 @@ func AddSA(vrf *vswitch.VRF, sa *vswitch.SA) {
 
 // DeleteSA Delete SA.
 func DeleteSA(vrf *vswitch.VRF, sa *vswitch.SA) {
-	log.Printf("Delete SA: %v", sa)
+	log.Logger.Info("Delete SA: %v", sa)
 
 	selector := &sad.SASelector{
 		VRFIndex: vrf.Index(),
@@ -286,7 +322,7 @@ func DeleteSA(vrf *vswitch.VRF, sa *vswitch.SA) {
 
 	for _, mgr := range mgrs {
 		if err := mgr.DeleteSA(selector); err != nil {
-			log.Printf("Delete SA: Error: %v\n", err)
+			log.Logger.Err("Delete SA: Error: %v", err)
 			return
 		}
 	}
@@ -294,7 +330,7 @@ func DeleteSA(vrf *vswitch.VRF, sa *vswitch.SA) {
 
 // UpdateSA Update SA.
 func UpdateSA(vrf *vswitch.VRF, sa *vswitch.SA) {
-	log.Printf("Update SA: %v", sa)
+	log.Logger.Info("Update SA: %v", sa)
 
 	selector := &sad.SASelector{
 		VRFIndex: vrf.Index(),
@@ -302,17 +338,17 @@ func UpdateSA(vrf *vswitch.VRF, sa *vswitch.SA) {
 	}
 	value := &sad.SAValue{}
 	if err := vSA2SAv(sa, value); err != nil {
-		log.Printf("SA: Error: %v\n", err)
+		log.Logger.Err("SA: Error: %v", err)
 		return
 	}
 
 	for _, mgr := range mgrs {
 		if err := mgr.UpdateSA(selector, value); err != nil {
-			log.Printf("Update SA: Error: %v\n", err)
+			log.Logger.Err("Update SA: Error: %v", err)
 			return
 		}
 		if err := mgr.EnableSA(selector); err != nil {
-			log.Printf("Enable SA: Error: %v\n", err)
+			log.Logger.Err("Enable SA: Error: %v", err)
 			return
 		}
 	}

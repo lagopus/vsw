@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,269 +16,367 @@
 
 package tunnel
 
-// #include "ip_id.h"
-import "C"
-
 import (
 	"fmt"
 	"net"
 	"sync"
 
-	"github.com/lagopus/vsw/dpdk"
+	"github.com/lagopus/vsw/modules/tunnel/log"
 	"github.com/lagopus/vsw/vswitch"
 )
 
-var log = vswitch.Logger
-var factories = make(map[ProtocolType]ConcreteIFFactory)
-
-// ConcreteIF Concrete interface.
-type ConcreteIF interface {
+type concreteIF interface {
 	vswitch.Instance
-	NewVIF(*vswitch.VIF) (vswitch.VIFInstance, error)
+	inboundInstance() vswitch.LagopusInstance
+	outboundInstance() vswitch.LagopusInstance
+	setInboundRti(*vswitch.RuntimeInstance)
+	setOutboundRti(*vswitch.RuntimeInstance)
+	interfaceMode() vswitch.VLANMode
+	setInterfaceMode(vswitch.VLANMode) error
+	setAddressType(vswitch.AddressFamily)
+	setHopLimit(uint8)
+	setLocalAddress(net.IP)
+	setRemoteAddresses([]net.IP)
+	setVNI(uint32)
+	setL2TOS(uint8)
+	newVIF(*vswitch.VIF) (vswitch.VIFInstance, error)
+	updateCounter()
+	resetCounter()
 }
 
-func newConcreteIF(w *WrapperIF, factory ConcreteIFFactory) (ConcreteIF, error) {
-	if w == nil {
-		return nil, fmt.Errorf("base tunnel interface is nil")
-	}
-
-	iface, err := factory(w.base, w.priv, w.config)
-	if err != nil {
-		return nil, fmt.Errorf("factory execution failed: %v", err)
-	}
-
-	return iface, nil
+type tunnelIF struct {
+	base       *vswitch.BaseInstance
+	priv       interface{}
+	moduleConf *ModuleConfig
+	iface      concreteIF
+	mac        net.HardwareAddr
+	mtu        vswitch.MTU
+	mode       vswitch.VLANMode
+	state      interfaceState
+	lock       sync.Mutex
 }
 
-func getProtocolType(vif *vswitch.VIF) (ProtocolType, error) {
-	proto := Unknown
-
-	if vif == nil {
-		return proto, fmt.Errorf("vif is nil")
-	}
-
-	tunnel := vif.Tunnel()
-	if tunnel == nil {
-		return proto, fmt.Errorf("tunnel is nil")
-	}
-
-	switch tunnel.EncapsMethod() {
-	case vswitch.EncapsMethodDirect:
-		switch tunnel.Security() {
-		case vswitch.SecurityNone:
-			proto = IPIP
-		case vswitch.SecurityIPSec:
-			proto = IPsec
-		default:
-			return proto, fmt.Errorf("invalid security: %d", tunnel.Security())
-		}
-	case vswitch.EncapsMethodGRE:
-		proto = GRE
-	default:
-		return proto, fmt.Errorf("invalid encaps-method: %d", tunnel.EncapsMethod())
-	}
-
-	return proto, nil
-}
-
-// WrapperIF Wrapper interface.
-type WrapperIF struct {
-	base   *vswitch.BaseInstance
-	priv   interface{}
-	config *ModuleConfig
-	iface  ConcreteIF
-	mac    net.HardwareAddr
-	mtu    vswitch.MTU
-	state  interfaceState
-	lock   sync.Mutex
-}
-
-func newWrapperIF(base *vswitch.BaseInstance, priv interface{}) *WrapperIF {
-	return &WrapperIF{
-		base:   base,
-		priv:   priv,
-		config: nil,
-		iface:  nil,
-		mac:    nil,
-		mtu:    vswitch.DefaultMTU,
-		state:  initialized,
+func newTunnelIF(base *vswitch.BaseInstance, priv interface{}) *tunnelIF {
+	return &tunnelIF{
+		base:       base,
+		priv:       priv,
+		moduleConf: nil,
+		iface:      nil,
+		mac:        nil,
+		mtu:        vswitch.DefaultMTU,
+		mode:       vswitch.AccessMode,
+		state:      initialized,
 	}
 }
 
-// Free Free for instance.
-func (w *WrapperIF) Free() {
-	w.lock.Lock()
-	defer w.lock.Unlock()
-
-	if w.iface == nil {
-		w.state = freed
-	} else {
-		w.iface.Free()
-	}
-}
+//
+// Instance interface
+//
 
 // Enable Enable for instance.
-func (w *WrapperIF) Enable() error {
-	w.lock.Lock()
-	defer w.lock.Unlock()
+func (t *tunnelIF) Enable() error {
+	t.lock.Lock()
+	defer t.lock.Unlock()
 
-	if w.iface == nil {
-		if w.state != freed {
-			w.state = enabled
+	if t.iface == nil {
+		if t.state != freed {
+			t.state = enabled
 		}
 	} else {
-		return w.iface.Enable()
+		return t.iface.Enable()
 	}
 
 	return nil
 }
 
 // Disable Disable for instance.
-func (w *WrapperIF) Disable() {
-	w.lock.Lock()
-	defer w.lock.Unlock()
+func (t *tunnelIF) Disable() {
+	t.lock.Lock()
+	defer t.lock.Unlock()
 
-	if w.iface == nil {
-		if w.state != freed {
-			w.state = disabled
+	if t.iface == nil {
+		if t.state != freed {
+			t.state = disabled
 		}
 	} else {
-		w.iface.Disable()
+		t.iface.Disable()
 	}
 }
 
+// Free Free for instance.
+func (t *tunnelIF) Free() {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	if t.iface == nil {
+		t.state = freed
+	} else {
+		t.iface.Free()
+	}
+}
+
+//
+// InterfaceInstance interface
+//
+
 // NewVIF Create VIF.
-func (w *WrapperIF) NewVIF(vif *vswitch.VIF) (vswitch.VIFInstance, error) {
-	w.lock.Lock()
-	defer w.lock.Unlock()
+func (t *tunnelIF) NewVIF(vif *vswitch.VIF) (vswitch.VIFInstance, error) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	log.Logger.Info("[%s][%s] new Tunnel VIF: index=%d", t.base.Name(), vif.Name(), vif.Index())
 
 	if vif == nil {
-		return nil, fmt.Errorf("[%s] VIF is nil", ModuleName)
+		return nil, fmt.Errorf("VIF is nil")
 	}
 
-	if w.iface == nil {
+	if t.iface == nil {
 		var err error
 
 		var proto ProtocolType
-		if proto, err = getProtocolType(vif); err != nil {
-			return nil, fmt.Errorf("[%s] get protocol type failed: %v", ModuleName, err)
+		if proto, err = getProtocolType(t.priv, vif); err != nil {
+			return nil, fmt.Errorf("get protocol type failed: %v", err)
 		}
-		log.Printf("[%s] protocol type: %s", ModuleName, proto.String())
+		log.Logger.Info("[%s][%s] protocol: %s", t.base.Name(), vif.Name(), proto)
 
-		w.config = getModuleConfig(proto)
-		log.Printf("[%s] config: %#v", ModuleName, w.config)
-
-		var factory ConcreteIFFactory
-		var ok bool
-		if factory, ok = factories[proto]; !ok {
-			return nil, fmt.Errorf("[%s] factory doesn't exist: %v", ModuleName, proto)
+		if t.moduleConf, err = GetModuleConfig(proto); err != nil {
+			return nil, fmt.Errorf("module config decode failed: %v", err)
 		}
+		log.Logger.Info("[%s][%s] module config: %#v", t.base.Name(), vif.Name(), t.moduleConf)
 
-		if w.iface, err = newConcreteIF(w, factory); err != nil {
-			return nil, fmt.Errorf("[%s] create IF failed: %v", ModuleName, err)
+		accessor := newIfParam(proto, t)
+
+		if t.iface, err = mgr.newConcreteIF(accessor); err != nil {
+			return nil, fmt.Errorf("create IF failed: %v", err)
 		}
 
-		switch w.state {
+		switch t.state {
 		case initialized:
 			// do nothing.
 		case enabled:
-			if err = w.iface.Enable(); err != nil {
-				return nil, fmt.Errorf("[%s] IF enable failed: %v", ModuleName, err)
+			if err = t.iface.Enable(); err != nil {
+				return nil, fmt.Errorf("IF enable failed: %v", err)
 			}
 		case disabled:
-			w.iface.Disable()
+			t.iface.Disable()
 		case freed:
-			w.iface.Free()
+			t.iface.Free()
 		default:
-			return nil, fmt.Errorf("[%s] invalid IF state: %d", ModuleName, w.state)
+			return nil, fmt.Errorf("invalid IF state: %d", t.state)
 		}
 	}
 
-	tvif, err := w.iface.NewVIF(vif)
+	tvif, err := t.iface.newVIF(vif)
 	if err != nil {
-		return nil, fmt.Errorf("[%s] create VIF failed: %v", ModuleName, err)
+		return nil, fmt.Errorf("create VIF failed: %v", err)
 	}
 
 	return tvif, nil
 }
 
 // MACAddress MACAddress.
-func (w *WrapperIF) MACAddress() net.HardwareAddr {
-	return w.mac
+func (t *tunnelIF) MACAddress() net.HardwareAddr {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	return t.mac
 }
 
 // SetMACAddress SetMACAddress.
-func (w *WrapperIF) SetMACAddress(mac net.HardwareAddr) error {
-	w.mac = mac
+func (t *tunnelIF) SetMACAddress(mac net.HardwareAddr) error {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	t.mac = mac
 	return nil
 }
 
 // MTU MTU.
-func (w *WrapperIF) MTU() vswitch.MTU {
-	return w.mtu
+func (t *tunnelIF) MTU() vswitch.MTU {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	return t.mtu
 }
 
 // SetMTU SetMTU.
-func (w *WrapperIF) SetMTU(mtu vswitch.MTU) error {
-	w.mtu = mtu
+func (t *tunnelIF) SetMTU(mtu vswitch.MTU) error {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	t.mtu = mtu
 	return nil
 }
 
 // InterfaceMode InterfaceMode.
-func (w *WrapperIF) InterfaceMode() vswitch.VLANMode {
-	return vswitch.AccessMode
+func (t *tunnelIF) InterfaceMode() vswitch.VLANMode {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	if t.iface != nil {
+		return t.iface.interfaceMode()
+	}
+
+	return t.mode
 }
 
 // SetInterfaceMode SetInterfaceMode.
-func (w *WrapperIF) SetInterfaceMode(mode vswitch.VLANMode) error {
-	return fmt.Errorf("[%s] SetInterfaceMode unsupported", ModuleName)
-}
+func (t *tunnelIF) SetInterfaceMode(mode vswitch.VLANMode) error {
+	t.lock.Lock()
+	defer t.lock.Unlock()
 
-// AddVID AddVID.
-func (w *WrapperIF) AddVID(vid vswitch.VID) error {
-	return fmt.Errorf("[%s] AddVID unsupported", ModuleName)
-}
-
-// DeleteVID DeleteVID.
-func (w *WrapperIF) DeleteVID(vid vswitch.VID) error {
-	return fmt.Errorf("[%s] DeleteVID unsupported", ModuleName)
-}
-
-// SetNativeVID SetNativeVID.
-func (w *WrapperIF) SetNativeVID(vid vswitch.VID) error {
-	return fmt.Errorf("[%s] SetNativeVID unsupported", ModuleName)
-}
-
-// RegisterConcreteIF Register TunnelIF factory.
-func RegisterConcreteIF(protocolType ProtocolType, factory ConcreteIFFactory) error {
-	if factory == nil {
-		return fmt.Errorf("[%s] invalid argument", ModuleName)
+	if t.iface != nil {
+		t.iface.setInterfaceMode(mode)
 	}
 
-	if factories[protocolType] != nil {
-		return fmt.Errorf("[%s] already exists: %d", ModuleName, protocolType)
-	}
-
-	factories[protocolType] = factory
+	t.mode = mode
 
 	return nil
 }
 
-func newModule(base *vswitch.BaseInstance, priv interface{}) (vswitch.Instance, error) {
-	return newWrapperIF(base, priv), nil
+// AddVID AddVID.
+func (t *tunnelIF) AddVID(vid vswitch.VID) error {
+	return nil
 }
 
-func init() {
-	C.ip_init_id()
+// DeleteVID DeleteVID.
+func (t *tunnelIF) DeleteVID(vid vswitch.VID) error {
+	return nil
+}
 
-	rp := &vswitch.RingParam{
-		Count:          MaxPktBurst,
-		SocketId:       dpdk.SOCKET_ID_ANY,
-		SecondaryInput: true,
+// SetNativeVID SetNativeVID.
+func (t *tunnelIF) SetNativeVID(vid vswitch.VID) error {
+	// TODO: set native VID
+	return nil
+}
+
+//
+// CounterUpdater interface
+//
+func (t *tunnelIF) UpdateCounter() {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	if t.iface != nil {
+		t.iface.updateCounter()
+	}
+}
+
+func (t *tunnelIF) ResetCounter() {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	if t.iface != nil {
+		t.iface.resetCounter()
+	}
+}
+
+//
+// L2TunnelNotify interface
+//
+
+// AddressTypeUpdated Update address type.
+func (t *tunnelIF) AddressTypeUpdated(addressType vswitch.AddressFamily) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	if t.iface != nil {
+		t.iface.setAddressType(addressType)
+	}
+}
+
+// HopLimitUpdated Update HopLimit.
+func (t *tunnelIF) HopLimitUpdated(hopLimit uint8) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	if t.iface != nil {
+		t.iface.setHopLimit(hopLimit)
+	}
+}
+
+// LocalAddressUpdated Update local IP addr.
+func (t *tunnelIF) LocalAddressUpdated(localAddr net.IP) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	if t.iface != nil {
+		t.iface.setLocalAddress(localAddr)
+	}
+}
+
+// RemoteAddressesUpdated Update remote IP addrs.
+func (t *tunnelIF) RemoteAddressesUpdated(remoteAddrs []net.IP) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	if t.iface != nil {
+		t.iface.setRemoteAddresses(remoteAddrs)
+	}
+}
+
+// VRFUpdated Update VRF.
+func (t *tunnelIF) VRFUpdated(vrf *vswitch.VRF) {
+	// do nothing.
+}
+
+// VNIUpdated Update VNI
+func (t *tunnelIF) VNIUpdated(vni uint32) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	if t.iface != nil {
+		t.iface.setVNI(vni)
+	}
+}
+
+// L2TOSUpdated Update TOS.
+func (t *tunnelIF) L2TOSUpdated(tos uint8) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	if t.iface != nil {
+		t.iface.setL2TOS(tos)
+	}
+}
+
+func getProtocolType(priv interface{}, vif *vswitch.VIF) (ProtocolType, error) {
+	proto := Unknown
+
+	if vif == nil {
+		return proto, fmt.Errorf("vif is nil")
 	}
 
-	if err := vswitch.RegisterModule(ModuleName, newModule, rp, vswitch.TypeInterface); err != nil {
-		log.Fatalf("Failed to register a module '%s': %v", ModuleName, err)
-		return
+	if l2tunnel, ok := priv.(*vswitch.L2Tunnel); ok {
+		switch l2tunnel.EncapsMethod() {
+		case vswitch.EncapsMethodGRE:
+			proto = L2GRE
+		case vswitch.EncapsMethodVxLAN:
+			proto = VXLAN
+		default:
+			return proto, fmt.Errorf("invalid encaps-method: %d", l2tunnel.EncapsMethod())
+		}
+	} else {
+		if l3tunnel := vif.Tunnel(); l3tunnel != nil {
+			switch l3tunnel.EncapsMethod() {
+			case vswitch.EncapsMethodDirect:
+				switch l3tunnel.Security() {
+				case vswitch.SecurityNone:
+					proto = IPIP
+				case vswitch.SecurityIPSec:
+					proto = IPsec
+				default:
+					return proto, fmt.Errorf("invalid security: %d", l3tunnel.Security())
+				}
+			case vswitch.EncapsMethodGRE:
+				proto = GRE
+			default:
+				return proto, fmt.Errorf("invalid encaps-method: %d", l3tunnel.EncapsMethod())
+			}
+		} else {
+			return proto, fmt.Errorf("L3 tunnel is nil")
+		}
 	}
+
+	return proto, nil
 }

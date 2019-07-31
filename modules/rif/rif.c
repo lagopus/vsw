@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,6 @@
 #include <rte_mbuf.h>
 #include <rte_ether.h>
 
-//#define DEBUG
 #include "logger.h"
 #include "rif.h"
 #include "packet.h"
@@ -32,6 +31,14 @@ static void rif_proc_access(struct rte_mempool *, struct rif_instance *, struct 
 
 #define RIF_DEFAULT_RIFS_CAP 256
 
+static uint32_t rif_log_id = 0;
+
+#define RIF_DEBUG(fmt, x...)	vsw_msg_debug(rif_log_id, 0, fmt, ## x)
+#define RIF_INFO(fmt, x...)	vsw_msg_info(rif_log_id, fmt, ## x)
+#define RIF_WARNING(fmt, x...)	vsw_msg_warning(rif_log_id, fmt, ## x)
+#define RIF_ERROR(fmt, x...)	vsw_msg_error(rif_log_id, fmt, ## x)
+#define RIF_FATAL(fmt, x...)	vsw_msg_fatal(rif_log_id, fmt, ## x)
+
 struct rif_runtime {
 	struct rif_instance **rifs;
 	struct rte_mempool *pool;
@@ -40,7 +47,7 @@ struct rif_runtime {
 };
 
 static bool
-rif_register_instance(void *p, struct lagopus_instance *base)
+rif_register_instance(void *p, struct vsw_instance *base)
 {
 	struct rif_runtime *r = p;
 	struct rif_instance *i = (struct rif_instance*)base;
@@ -51,7 +58,7 @@ rif_register_instance(void *p, struct lagopus_instance *base)
 		struct rif_instance **rifs = calloc(1, sizeof(struct rif_instance*) * cap);
 
 		if (rifs == NULL) {
-			LAGOPUS_DEBUG("RIF: Failed to resize rif_instance place holder");
+			RIF_DEBUG("RIF: Failed to resize rif_instance place holder");
 			return false;
 		}
 
@@ -63,11 +70,11 @@ rif_register_instance(void *p, struct lagopus_instance *base)
 	r->rifs[r->rifs_len] = i;
 	r->rifs_len++;
 
-	for (int n = 0; n < MAX_VID; n++)
+	for (int n = 0; n < MAX_VID; n++) {
 		i->index[n] = VIF_INVALID_INDEX;
-
-	memset(i->fwd, 0, sizeof(i->fwd));
-	memset(i->fwd_type, 0, sizeof(i->fwd_type));
+		i->fwd[n] = NULL;
+		i->fwd_type[n] = VSW_ETHER_DST_UNKNOWN;
+	}
 
 	i->proc = rif_proc_access;
 
@@ -75,7 +82,7 @@ rif_register_instance(void *p, struct lagopus_instance *base)
 }
 
 static bool
-rif_unregister_instance(void *p, struct lagopus_instance *base)
+rif_unregister_instance(void *p, struct vsw_instance *base)
 {
 	struct rif_runtime *r = p;
 	struct rif_instance *i = (struct rif_instance*)base;
@@ -92,7 +99,7 @@ rif_unregister_instance(void *p, struct lagopus_instance *base)
 }
 
 static inline bool
-rif_update_forward_table(struct rif_instance *i, struct rif_control_param *ep, fwd_type_t type) {
+rif_update_forward_table(struct rif_instance *i, struct rif_control_param *ep, vsw_ether_dst_t type) {
 	if (ep->output != NULL) {
 		// Any matching packets shall be forwarded to the same ring (e.g. router)
 		if (!i->fwd[ep->vid]) {
@@ -104,30 +111,31 @@ rif_update_forward_table(struct rif_instance *i, struct rif_control_param *ep, f
 		i->fwd_type[ep->vid] |= type;
 	} else {
 		i->fwd_type[ep->vid] &= ~type;
-		if (i->fwd_type[ep->vid] == RIF_FWD_TYPE_DEFAULT)
+		if (i->fwd_type[ep->vid] == VSW_ETHER_DST_UNKNOWN)
 			i->fwd[ep->vid] = NULL;
 	}
 	return true;
 }
 
 static bool
-rif_control_instance(void *p, struct lagopus_instance *base, void *param)
+rif_control_instance(void *p, struct vsw_instance *base, void *param)
 {
-	struct rif_runtime *r = p;
 	struct rif_control_param *ep = param;
 	struct rif_instance *i = (struct rif_instance*)base;
 
-	LAGOPUS_DEBUG("%s: name=%s cmd=%d vid=%d output=%p\n", __func__, base->name, ep->cmd, ep->vid, ep->output);
+	RIF_DEBUG("%s: name=%s cmd=%d vid=%d output=%p\n", __func__, base->name, ep->cmd, ep->vid, ep->output);
 
 	switch (ep->cmd) {
 	case RIF_CMD_ADD_VID:
 		i->base.outputs[ep->vid] = ep->output;
+		i->counters[ep->vid] = ep->counter;
 		i->index[ep->vid] = ep->index;
 		if (!i->trunk)
 			i->vid = ep->vid;
 		return true;
 	case RIF_CMD_DELETE_VID:
 		i->base.outputs[ep->vid] = NULL;
+		i->counters[ep->vid] = NULL;
 		i->index[ep->vid] = VIF_INVALID_INDEX;
 		if (!i->trunk)
 			i->vid = 0;
@@ -147,11 +155,11 @@ rif_control_instance(void *p, struct lagopus_instance *base, void *param)
 		i->trunk = false;
 		return true;
 	case RIF_CMD_SET_DST_SELF_FORWARD:
-		return rif_update_forward_table(i, ep, RIF_FWD_TYPE_SELF);
+		return rif_update_forward_table(i, ep, VSW_ETHER_DST_SELF);
 	case RIF_CMD_SET_DST_BC_FORWARD:
-		return rif_update_forward_table(i, ep, RIF_FWD_TYPE_BC);
+		return rif_update_forward_table(i, ep, VSW_ETHER_DST_BROADCAST);
 	case RIF_CMD_SET_DST_MC_FORWARD:
-		return rif_update_forward_table(i, ep, RIF_FWD_TYPE_MC);
+		return rif_update_forward_table(i, ep, VSW_ETHER_DST_MULTICAST);
 	}
 	return false;
 }
@@ -162,7 +170,7 @@ dup_mbuf(struct rte_mempool *mp, struct rte_mbuf *mbuf)
 	struct rte_mbuf *new_mbuf = rte_pktmbuf_alloc(mp);
 
 	// copy common metadata section
-	memcpy(LAGOPUS_MBUF_METADATA(new_mbuf), LAGOPUS_MBUF_METADATA(mbuf), sizeof(struct vif_metadata));
+	memcpy(VSW_MBUF_METADATA(new_mbuf), VSW_MBUF_METADATA(mbuf), sizeof(struct vsw_common_metadata));
 
 	// attach to the original mbuf
 	rte_pktmbuf_attach(new_mbuf, mbuf);
@@ -171,45 +179,15 @@ dup_mbuf(struct rte_mempool *mp, struct rte_mbuf *mbuf)
 	return new_mbuf;
 }
 
-static inline fwd_type_t
-rif_mark_and_check_next_module(struct rte_mbuf *mbuf, struct ether_addr *self, vifindex_t index)
-{
-	struct lagopus_packet_metadata *md = LAGOPUS_MBUF_METADATA(mbuf);
-	vifindex_t out_vif = md->md_vif.out_vif;
-
-	md->md_vif.in_vif  = index;
-	md->md_vif.out_vif = VIF_INVALID_INDEX;
-
-	if (out_vif == index)
-		return RIF_FWD_TYPE_DEFAULT;
-
-	// check if the packet is sent to me
-	fwd_type_t fwd = RIF_FWD_TYPE_DROP;
-	struct ether_hdr *hdr = rte_pktmbuf_mtod(mbuf, struct ether_hdr *);
-
-	if (is_same_ether_addr(&hdr->d_addr, self)) {
-		md->md_vif.flags |= LAGOPUS_MD_SELF;
-		fwd = RIF_FWD_TYPE_SELF;
-	} else {
-		md->md_vif.flags &= ~LAGOPUS_MD_SELF;
-
-		if (is_multicast_ether_addr(&hdr->d_addr))
-			fwd = RIF_FWD_TYPE_MC;
-		else if (is_broadcast_ether_addr(&hdr->d_addr))
-			fwd = RIF_FWD_TYPE_BC;
-	}
-
-	return fwd;
-}
-
 static void
 rif_proc_trunk(struct rte_mempool *mp, struct rif_instance *e, struct rte_mbuf **mbufs, int count)
 {
-	uint16_t vid = e->vid;
 	vifindex_t *index = e->index;
 	struct rte_ring **outputs = e->base.outputs;
 	struct rte_ring **fwd = e->fwd;
-	fwd_type_t *ft = e->fwd_type;
+	vsw_ether_dst_t *ft = e->fwd_type;
+	struct vsw_counter *c = e->counter;
+	struct vsw_counter **counters = e->counters;
 
 	struct ether_addr *self_addr = &e->self_addr;
 
@@ -217,134 +195,238 @@ rif_proc_trunk(struct rte_mempool *mp, struct rif_instance *e, struct rte_mbuf *
 	for (int i = 0; i < count; i++) {
 		struct rte_mbuf *mbuf = mbufs[i];
 		uint16_t vlan_id = mbuf->vlan_tci & 0xfff;
-		struct rte_ring *output = outputs[vlan_id];
-		bool enqueued = false;
+		vifindex_t vifidx = index[vlan_id];
+
+		if (vifidx == VIF_INVALID_INDEX) {
+			struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
+			if (md->common.out_vif == VIF_INVALID_INDEX) {
+				c->in_errors++;
+			} else {
+				c->out_errors++;
+			}
+			rte_pktmbuf_free(mbuf);
+			continue;
+		}
+
+		struct vsw_counter *vc = counters[vlan_id];
 
 		// XXX: We shall optimize packets forwarding. Queueing packets one-by-one
 		// is not optimal.
-		if ((mbuf->pkt_len <= e->mtu) && (output)) {
+		if (mbuf->pkt_len <= e->mtu) {
 			if (rte_mbuf_refcnt_read(mbuf) > 1)
 				mbuf = dup_mbuf(mp, mbuf);
 
-			fwd_type_t t = rif_mark_and_check_next_module(mbuf, self_addr, index[vlan_id]);
-			if (t & ft[vlan_id])
-				output = fwd[vlan_id];
-			if (t != RIF_FWD_TYPE_DROP)
-				enqueued = (rte_ring_enqueue(output, mbuf) == 0);
-		}
+			struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
 
-		if (enqueued) {
-			e->count++;
+			// If out_vif is set to the VIF index of RIF, then the packet should
+			// be sent out from RIF to VSI, i.e. outgoing packet.
+			// In_vif is set to VIF index of RIF, so that VSI will not send back
+			// the packet during flooding.
+			vifindex_t out_vif = md->common.out_vif;
+			md->common.in_vif  = vifidx;
+			md->common.out_vif = VIF_INVALID_INDEX;
+
+			if (out_vif == vifidx) {
+				// VRF -> VSI
+				VSW_ETHER_UPDATE_OUT_COUNTER2(c, vc, vsw_check_ether_dst(mbuf));
+
+				if (rte_ring_enqueue(outputs[vlan_id], mbuf) == 0) {
+					c->out_octets += mbuf->pkt_len;
+					vc->out_octets += mbuf->pkt_len;
+				} else {
+					rte_pktmbuf_free(mbuf);
+					c->out_discards++;
+					vc->out_discards++;
+				}
+			} else {
+				// VSI -> VRF
+				vsw_ether_dst_t d = vsw_check_ether_dst_and_self(mbuf, self_addr);
+				VSW_ETHER_UPDATE_IN_COUNTER2(c, vc, d);
+
+				if (d & ft[vlan_id]) {
+					if (rte_ring_enqueue(fwd[vlan_id], mbuf) == 0) {
+						c->in_octets += mbuf->pkt_len;
+						vc->in_octets += mbuf->pkt_len;
+					} else {
+						rte_pktmbuf_free(mbuf);
+						c->in_discards++;
+						vc->in_discards++;
+					}
+				}
+			}
 		} else {
-			rte_pktmbuf_free(mbuf);
-			e->dropped++;
-		}
-	}
-}
+			struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
 
-static inline void
-rif_free_mbufs(struct rte_mbuf **mbufs, unsigned count, unsigned sent)
-{
-	while (unlikely (sent < count)) {
-		rte_pktmbuf_free(mbufs[sent]);
-		sent++;
+			if (md->common.out_vif == vifidx) {
+				c->out_errors++;
+				vc->out_errors++;
+			} else {
+				c->in_errors++;
+				vc->in_errors++;
+			}
+
+			rte_pktmbuf_free(mbuf);
+		}
 	}
 }
 
 static void
 rif_proc_access(struct rte_mempool *mp, struct rif_instance *e, struct rte_mbuf **mbufs, int count)
 {
-	struct rte_mbuf *any_mbufs[RIF_MBUF_LEN]; // FIXME
-	struct rte_mbuf *fwd_mbufs[RIF_MBUF_LEN]; // FIXME
+	struct rte_mbuf *outbound_mbufs[RIF_MBUF_LEN]; // FIXME
+	struct rte_mbuf *inbound_mbufs[RIF_MBUF_LEN]; // FIXME
 
 	uint16_t vid = e->vid;
 	vifindex_t index = e->index[vid];
-	struct rte_ring *output = e->base.outputs[vid];
-	struct rte_ring *fwd_output = e->fwd[vid];
-	fwd_type_t ft = e->fwd_type[vid];
+	struct rte_ring *outbound_output = e->base.outputs[vid];
+	struct rte_ring *inbound_output = e->fwd[vid];
+	vsw_ether_dst_t ft = e->fwd_type[vid];
+	struct vsw_counter *c = e->counter;
 
 	struct ether_addr *self_addr = &e->self_addr;
 
-	unsigned any_count = 0;
-	unsigned fwd_count = 0;
+	unsigned outbound_count = 0;
+	unsigned inbound_count = 0;
+
+	if (index == VIF_INVALID_INDEX) {
+		for (int i = 0; i < count; i++) {
+			struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbufs[i]);
+			if (md->common.out_vif == VIF_INVALID_INDEX) {
+				c->in_errors++;
+			} else {
+				c->out_errors++;
+			}
+			rte_pktmbuf_free(mbufs[i]);
+		}
+		return;
+	}
 
 	for (int i = 0; i < count; i++) {
 		struct rte_mbuf *mbuf = mbufs[i];
-		struct ether_hdr *eh = rte_pktmbuf_mtod(mbuf, struct ether_hdr *);
 
 		// drop following packets
 		// - w/o appropriate VLAN ID
 		// - exceeding MTU
 		if ((mbuf->pkt_len > e->mtu) ||
-		    (mbuf->vlan_tci & 0xfff != vid)) {
+		    ((mbuf->vlan_tci & 0xfff) != vid)) {
+			struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
+
+			if (md->common.out_vif == index) {
+				c->out_errors++;
+			} else {
+				c->in_errors++;
+			}
+
 			rte_pktmbuf_free(mbuf);
-			e->dropped++;
 			continue;
 		}
 
 		if (rte_mbuf_refcnt_read(mbuf) > 1)
 			mbuf = dup_mbuf(mp, mbuf);
 
-		fwd_type_t t = rif_mark_and_check_next_module(mbuf, self_addr, index);
-		if (t == RIF_FWD_TYPE_DEFAULT)  {
-			// router -> bridge
-			any_mbufs[any_count++] = mbuf;
-		} else if (t & ft) {
-			// bridge -> router
-			fwd_mbufs[fwd_count++] = mbuf;
+		struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
+		vsw_ether_dst_t *dst = (vsw_ether_dst_t*)md->udata;
+
+		// If out_vif is set to the VIF index of RIF, then the packet should
+		// be sent out from RIF to VSI, i.e. outgoing packet.
+		// In_vif is set to VIF index of RIF, so that VSI will not send back
+		// the packet during flooding.
+		vifindex_t out_vif = md->common.out_vif;
+		md->common.in_vif  = index;
+		md->common.out_vif = VIF_INVALID_INDEX;
+
+		if (out_vif == index) {
+			// VRF -> VSI
+			*dst = vsw_check_ether_dst(mbuf);
+			VSW_ETHER_UPDATE_OUT_COUNTER(c, *dst);
+
+			outbound_mbufs[outbound_count++] = mbuf;
+			c->out_octets += mbuf->pkt_len;
 		} else {
-			// drop
-			rte_pktmbuf_free(mbuf);
-			e->dropped++;
+			// VSI -> VRF
+			*dst = vsw_check_ether_dst_and_self(mbuf, self_addr);
+			VSW_ETHER_UPDATE_IN_COUNTER(c, *dst);
+
+			if (*dst & ft) {
+				inbound_mbufs[inbound_count++] = mbuf;
+				c->in_octets += mbuf->pkt_len;
+			} else {
+				rte_pktmbuf_free(mbuf);
+				c->in_discards++;
+			}
 		}
 	}
 
 	// Queue incoming packets at once for ACCESS Mode
-	unsigned any_sent = 0;
-	unsigned fwd_sent = 0;
+	unsigned outbound_sent = 0;
+	unsigned inbound_sent = 0;
 
-	if ((output) && any_count > 0)
-		any_sent = rte_ring_enqueue_burst(output, (void * const*)any_mbufs, any_count, NULL);
-	if ((fwd_output) && fwd_count > 0)
-		fwd_sent = rte_ring_enqueue_burst(fwd_output, (void * const*)fwd_mbufs, fwd_count, NULL);
+	if ((outbound_output) && outbound_count > 0)
+		outbound_sent = rte_ring_enqueue_burst(outbound_output, (void * const*)outbound_mbufs, outbound_count, NULL);
 
-	unsigned total_sent = any_sent + fwd_sent;
+	if ((inbound_output) && inbound_count > 0)
+		inbound_sent = rte_ring_enqueue_burst(inbound_output, (void * const*)inbound_mbufs, inbound_count, NULL);
 
-	LAGOPUS_DEBUG("RIF: Rcv'd %d/%d packets.", total_sent, count);
+	while (unlikely(outbound_sent < outbound_count)) {
+		struct rte_mbuf *mbuf = mbufs[outbound_sent];
+		struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
 
-	e->count += total_sent;
-	e->dropped += count - total_sent;
+		vsw_ether_dst_t *dst = (vsw_ether_dst_t*)md->udata;
+		c->out_octets -= mbuf->pkt_len;
+		VSW_ETHER_DEC_OUT_COUNTER(c, *dst);
 
-	rif_free_mbufs(any_mbufs, any_count, any_sent);
-	rif_free_mbufs(fwd_mbufs, fwd_count, fwd_sent);
+		rte_pktmbuf_free(mbuf);
+		outbound_sent++;
+	}
+
+	while (unlikely(inbound_sent < inbound_count)) {
+		struct rte_mbuf *mbuf = mbufs[inbound_sent];
+		struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
+
+		vsw_ether_dst_t *dst = (vsw_ether_dst_t*)md->udata;
+		c->in_octets -= mbuf->pkt_len;
+		VSW_ETHER_DEC_IN_COUNTER(c, *dst);
+
+		rte_pktmbuf_free(mbuf);
+		inbound_sent++;
+	}
+}
+
+static void
+update_logid()
+{
+	int id = vsw_log_getid("rif");
+	if (id >= 0)
+		rif_log_id = (uint32_t)id;
 }
 
 static void*
 rif_init(void *param)
 {
 	struct rif_runtime *r;
-	struct rif_runtime_param *p = param;
 	char pool_name[RTE_MEMZONE_NAMESIZE];
 
+	update_logid();
+
 	if (!(r = calloc(1, sizeof(struct rif_runtime)))) {
-		LAGOPUS_DEBUG("RIF: calloc() failed. Can't start.");
+		RIF_DEBUG("RIF: calloc() failed. Can't start.");
 		return NULL;
 	}
 
 	r->rifs_cap = RIF_DEFAULT_RIFS_CAP;
 	if (!(r->rifs = calloc(1, sizeof(struct rif_instance*) * r->rifs_cap))) {
-		LAGOPUS_DEBUG("RIF: calloc() failed. Can't start.");
+		RIF_DEBUG("RIF: calloc() failed. Can't start.");
 		goto error;
 	}
 
 	snprintf(pool_name, RTE_MEMZONE_NAMESIZE, "rif-md-pool-%d", rte_lcore_id());
 	r->pool = rte_pktmbuf_pool_create(pool_name, RIF_MBUF_LEN, 32, PACKET_METADATA_SIZE, 0, rte_socket_id());
 	if (r->pool == NULL) {
-		LAGOPUS_DEBUG("RIF: rte_pktmbuf_pool_create() failed. Can't start.");
+		RIF_DEBUG("RIF: rte_pktmbuf_pool_create() failed. Can't start.");
 		goto error;
 	}
 
-	LAGOPUS_DEBUG("RIF: Starting bridge backend on slave core %u", rte_lcore_id());
+	RIF_DEBUG("RIF: Starting bridge backend on slave core %u", rte_lcore_id());
 
 	return r;
 
@@ -384,7 +466,7 @@ rif_deinit(void *p)
 	free(r);
 }
 
-struct lagopus_runtime_ops rif_runtime_ops = {
+struct vsw_runtime_ops rif_runtime_ops = {
 	.init = rif_init,
 	.process = rif_process,
 	.deinit = rif_deinit,

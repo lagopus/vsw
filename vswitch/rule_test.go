@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -53,31 +53,32 @@ func showRules(t *testing.T, r *Rules) {
 }
 
 const (
-	target_match  = MATCH_ANY
-	invalid_match = MATCH_ETH_DST_SELF
-	vif_match     = MATCH_OUT_VIF
+	target_match  = MatchAny
+	invalid_match = MatchEthDstSelf
+	vif_match     = MatchOutVIF
 	num_vifs      = 5
 )
 
 var testParams = map[VswMatch]interface{}{
-	MATCH_ANY:           nil,
-	MATCH_IN_VIF:        &VIF{index: 1},
-	MATCH_OUT_VIF:       &VIF{index: 2},
-	MATCH_ETH_DST:       &net.HardwareAddr{},
-	MATCH_ETH_DST_SELF:  nil,
-	MATCH_ETH_DST_MC:    nil,
-	MATCH_ETH_SRC:       &net.HardwareAddr{},
-	MATCH_ETH_TYPE_IPV4: nil,
-	MATCH_ETH_TYPE_IPV6: nil,
-	MATCH_ETH_TYPE_ARP:  nil,
-	MATCH_ETH_TYPE:      dpdk.EtherType(0),
-	MATCH_VLAN_ID:       VID(0),
-	MATCH_IPV4_PROTO:    IPP_ESP,
-	MATCH_IPV4_SRC:      &net.IP{},
-	MATCH_IPV4_SRC_NET:  &IPAddr{},
-	MATCH_IPV4_DST:      &net.IP{},
-	MATCH_IPV4_DST_NET:  &IPAddr{},
-	MATCH_IPV4_DST_SELF: nil,
+	MatchAny:         nil,
+	MatchInVIF:       &VIF{index: 1},
+	MatchOutVIF:      &VIF{index: 2},
+	MatchEthDst:      &net.HardwareAddr{},
+	MatchEthDstSelf:  nil,
+	MatchEthDstMC:    nil,
+	MatchEthSrc:      &net.HardwareAddr{},
+	MatchEthTypeIPv4: nil,
+	MatchEthTypeIPv6: nil,
+	MatchEthTypeARP:  nil,
+	MatchEthType:     dpdk.EtherType(0),
+	MatchVID:         VID(0),
+	MatchIPv4Proto:   IPP_ESP,
+	MatchIPv4Src:     &net.IP{},
+	MatchIPv4SrcNet:  &IPAddr{},
+	MatchIPv4Dst:     &net.IP{},
+	MatchIPv4DstNet:  &IPAddr{},
+	MatchIPv4DstSelf: nil,
+	Match5Tuple:      NewFiveTuple(),
 }
 
 // A place holder for a dummy ring used through out the tests
@@ -152,21 +153,40 @@ func TestRule(t *testing.T) {
 }
 
 func checkNotification(ch chan notifier.Notification, t notifier.Type, target *Rules, expect Rule) error {
-	timer := time.NewTimer(3 * time.Second)
+	timer := time.NewTimer(100 * time.Millisecond)
 
 	select {
-	case n := <-ch:
+	case n, ok := <-ch:
 		timer.Stop()
-		if t != n.Type || target != n.Target || expect != n.Value {
-			return fmt.Errorf("Expected: %v(%v, %v), Actual: %v(%v, %v)",
-				t, target, expect, n.Type, n.Target, n.Value)
+		if ok {
+			if t != n.Type || target != n.Target || expect != n.Value {
+				return fmt.Errorf("Expected: %v(%v, %v), Actual: %v(%v, %v)",
+					t, target, expect, n.Type, n.Target, n.Value)
+			}
+			return nil
+		} else {
+			return fmt.Errorf("Channel closed.")
+		}
+	case <-timer.C:
+		return fmt.Errorf("Timed out. No notification.")
+	}
+}
+
+func checkNotification2(ch chan *ruleMsg, added bool, expect *Rule) error {
+	timer := time.NewTimer(100 * time.Millisecond)
+
+	select {
+	case m := <-ch:
+		timer.Stop()
+		if m.added != added || *m.rule != *expect {
+			return fmt.Errorf("Expected: added=%v(%v), Actual: %v(%v)",
+				added, expect, m.added, m.rule)
 		}
 		return nil
 	case <-timer.C:
 		return fmt.Errorf("Timed out. No notification.")
 	}
 }
-
 func TestRuleNotify(t *testing.T) {
 	r := newRules()
 
@@ -178,17 +198,74 @@ func TestRuleNotify(t *testing.T) {
 	if err := checkNotification(ch, notifier.Add, r, Rule{target_match, nil, ruleRing}); err != nil {
 		t.Fatalf("Add notification failed: %v", err)
 	}
+	t.Logf("ok")
 
 	t.Logf("Check remove notification")
 	r.remove(target_match, nil)
 	if err := checkNotification(ch, notifier.Delete, r, Rule{target_match, nil, ruleRing}); err != nil {
 		t.Fatalf("Delete notification failed: %v", err)
 	}
+	t.Logf("ok")
 
 	t.Logf("Check add after uninstalling watcher")
+	r.Notifier().Close(ch)
 	r.add(target_match, nil, ruleRing)
-	if err := checkNotification(ch, notifier.Add, r, Rule{target_match, nil, ruleRing}); err != nil {
+	if err := checkNotification(ch, notifier.Add, r, Rule{target_match, nil, ruleRing}); err == nil {
+		t.Fatalf("Add notification called after uninstalling listener.")
+	} else {
+		t.Logf("ok: %v", err)
+	}
+}
+
+type ruleMsg struct {
+	rule  *Rule
+	added bool
+}
+
+type ruleTest struct {
+	ch chan *ruleMsg
+	t  *testing.T
+}
+
+func (rt *ruleTest) RuleAdded(r Rule) {
+	rt.t.Logf("Add: %v", r)
+	rt.ch <- &ruleMsg{&r, true}
+}
+
+func (rt *ruleTest) RuleDeleted(r Rule) {
+	rt.t.Logf("Delete: %v", r)
+	rt.ch <- &ruleMsg{&r, false}
+}
+
+func TestRuleNotify2(t *testing.T) {
+	rt := &ruleTest{make(chan *ruleMsg, 1), t}
+
+	r := newRules()
+
+	t.Logf("RulesNotify test. installing observer")
+	r.setRulesNotify(rt)
+
+	t.Logf("Check add notification")
+	r.add(target_match, nil, ruleRing)
+	if err := checkNotification2(rt.ch, true, &Rule{target_match, nil, ruleRing}); err != nil {
 		t.Fatalf("Add notification failed: %v", err)
+	}
+	t.Logf("ok")
+
+	t.Logf("Check remove notification")
+	r.remove(target_match, nil)
+	if err := checkNotification2(rt.ch, false, &Rule{target_match, nil, ruleRing}); err != nil {
+		t.Fatalf("Delete notification failed: %v", err)
+	}
+	t.Logf("ok")
+
+	t.Logf("Check add after uninstalling watcher")
+	r.setRulesNotify(nil)
+	r.add(target_match, nil, ruleRing)
+	if err := checkNotification2(rt.ch, true, &Rule{target_match, nil, ruleRing}); err == nil {
+		t.Fatalf("Add notification called.")
+	} else {
+		t.Logf("ok: %v", err)
 	}
 }
 

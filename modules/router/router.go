@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@
 package router
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../include -I/usr/local/include/dpdk -m64 -pthread -O3 -msse4.2
-#cgo LDFLAGS: -Wl,-unresolved-symbols=ignore-all -L/usr/local/lib -ldpdk
+#cgo CFLAGS: -I${SRCDIR}/../../include -m64 -pthread -O3 -msse4.2
+#cgo LDFLAGS: -Wl,-unresolved-symbols=ignore-all
 
 #include "router_common.h"
 
@@ -26,24 +26,32 @@ package router
 import "C"
 
 import (
-	"bytes"
-	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
+	"reflect"
+	"sync"
+	"syscall"
+	"unsafe"
+
 	"github.com/lagopus/vsw/dpdk"
-	"github.com/lagopus/vsw/utils/hashlist"
 	"github.com/lagopus/vsw/utils/notifier"
 	"github.com/lagopus/vsw/utils/ringpair"
 	"github.com/lagopus/vsw/vswitch"
-	"net"
-	"sync"
-	"unsafe"
+	vlog "github.com/lagopus/vsw/vswitch/log"
 )
 
 const (
 	moduleName        = "router"
 	maxRouterRequests = 1024
 )
+
+// package private: read only
+var pbrAction map[vswitch.PBRAction]C.pbr_action_t = map[vswitch.PBRAction]C.pbr_action_t{
+	vswitch.PBRActionNone:    C.PBRACTION_NONE,
+	vswitch.PBRActionDrop:    C.PBRACTION_DROP,
+	vswitch.PBRActionPass:    C.PBRACTION_PASS,
+	vswitch.PBRActionForward: C.PBRACTION_FORWARD}
 
 type RouterInstance struct {
 	base       *vswitch.BaseInstance
@@ -54,54 +62,16 @@ type RouterInstance struct {
 	enabled    bool
 	mtu        vswitch.MTU
 	vifs       map[vswitch.VIFIndex]*dpdk.Ring
-	arpTable   *hashlist.HashList
+	addrsCount uint
 	notifyRule chan notifier.Notification
+	pbr        map[string]int
+	ctrls      uint
+	ctrlsErr   uint
 }
 
 /*
  * Each informations are managed by VRF.
  */
-// for management MAC address of the interface(vif).
-type InterfaceEntry struct {
-	VRFIdx     uint64
-	VIFId      uint32
-	VID        uint16
-	MACAddress net.HardwareAddr
-	IPAddress  vswitch.IPAddr
-	MTU        uint16
-	Tunnel     bool
-	Error      int
-}
-
-// for management IP address of the interface(vif).
-type InterfaceIpEntry struct {
-	VRFIdx           uint64
-	VIFId            uint32
-	IPAddress        vswitch.IPAddr
-	BroadcastAddress net.IP
-	MTU              uint16
-}
-
-// route entry for routing table.
-type RouteEntry struct {
-	VRFIdx    uint64 // VRF ID
-	BridgeId  uint32
-	Interface uint32
-	Prefix    uint32
-	DestAddr  net.IP
-	NextHop   net.IP
-	Metric    uint32
-	Scope     uint32
-	Recurse   bool
-}
-
-// arp entry for arp table.
-type ArpEntry struct {
-	VRFIdx     uint64 // VRF ID
-	Interface  uint32
-	IPAddress  net.IP
-	MACAddress net.HardwareAddr
-}
 
 // Backend Manager
 type routerService struct {
@@ -126,12 +96,53 @@ type routerConfigSection struct {
 }
 
 type routerConfig struct {
-	SlaveCore uint `toml:"core"`
+	SlaveCore     uint   `toml:"core"`
+	RRProcessMode string `toml:"rr_process_mode"`
 }
 
 var config routerConfig
 var defaultConfig = routerConfig{
-	SlaveCore: 2,
+	SlaveCore:     2,
+	RRProcessMode: "disable",
+}
+
+//Match rule parameter
+type routerMatchParam struct {
+	Ring       *dpdk.Ring
+	Index      int
+	Priority   int
+	SrcAddr    net.IP
+	SrcMask    net.IPMask
+	DstAddr    net.IP
+	DstMask    net.IPMask
+	SrcPort    uint16
+	SrcPortEnd uint16
+	DstPort    uint16
+	DstPortEnd uint16
+	VNI        uint32
+	Proto      vswitch.IPProto
+	Interface  vswitch.VIFIndex
+}
+
+func (m C.struct_ether_addr) equal(n *C.struct_ether_addr) bool {
+	for i := 0; i < C.ETHER_ADDR_LEN; i++ {
+		if m.addr_bytes[i] != n.addr_bytes[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func createStructEtherAddr(m net.HardwareAddr) C.struct_ether_addr {
+	r := C.struct_ether_addr{}
+	for i := 0; i < C.ETHER_ADDR_LEN; i++ {
+		r.addr_bytes[i] = C.uint8_t(m[i])
+	}
+	return r
+}
+
+func (n *C.struct_neighbor_entry) equal(m *C.struct_neighbor_entry) bool {
+	return n.ifindex == m.ifindex && n.mac.equal(&m.mac)
 }
 
 // --- router module manager --- //
@@ -180,7 +191,10 @@ func getRouterService() (*routerService, error) {
 		notify:    vswitch.GetNotifier().Listen(),
 	}
 
-	// Start Rou/er Service
+	// register to debugsh
+	rs.registerDebugsh()
+
+	// Start Router Service
 	rs.start()
 
 	return rs, nil
@@ -219,10 +233,6 @@ func (s *routerService) unregisterRouter(r *RouterInstance) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	if _, exists := s.routers[r.vrfidx]; exists {
-		return
-	}
-
 	delete(s.routers, r.vrfidx)
 
 }
@@ -255,71 +265,71 @@ func (s *routerService) stop() {
 }
 
 func (s *routerService) listen() {
-	for {
-		select {
-		case notify, ok := <-s.notify:
-			if !ok {
-				// notification error.
-				fmt.Errorf("notification failed.")
-				return
+	for notify := range s.notify {
+		if vif, ok := notify.Target.(*vswitch.VIF); ok {
+			if vif.VRF() == nil {
+				continue
+			}
+			// VIF informations.
+			vrfidx := uint64(vif.VRF().Index())
+			router := s.routers[vrfidx]
+			if router == nil {
+				continue
 			}
 
-			if vif, ok := notify.Target.(*vswitch.VIF); ok {
-				if !ok {
-					fmt.Errorf("notification failed.")
+			switch val := notify.Value.(type) {
+			case nil:
+				log.Printf("RS:[nil]")
+			case vswitch.MTU:
+				log.Printf("RS:[MTU] mtu(%v)", val)
+				if err := router.updateInterfaceMTU(notify.Type, vif.Index(), val); err != nil {
+					log.Err("RS: updateInterfaceMTU failed: %v", err)
 				}
-				if vif.VRF() == nil {
-					continue
+			case vswitch.IPAddr:
+				log.Printf("RS:[IPAddr] vif: %v, val: %v\n", vif, val)
+				if err := router.updateInterfaceIpEntry(notify.Type, vif.Index(), val); err != nil {
+					log.Err("RS: updateInterfaceIpEntry failed: %v", err)
 				}
-				// VIF informations.
-				vrfidx := uint64(vif.VRF().Index())
-				router := s.routers[vrfidx]
-				if router == nil {
-					continue
+			case bool:
+				log.Printf("RS:[VIF enabled] %v", val)
+			case vswitch.Neighbour:
+				if err := router.updateNeighborEntry(notify.Type, vif.Index(), val); err != nil {
+					log.Err("RS: updateNeighborEntry failed: %v", err)
 				}
+			}
+		} else if vrf, ok := notify.Target.(*vswitch.VRF); ok {
+			/// VRF informations.
+			vrfidx := uint64(vrf.Index())
+			router := s.routers[vrfidx]
+			if router == nil {
+				continue
+			}
 
-				switch val := notify.Value.(type) {
-				case nil:
-					log.Printf("RS:[nil]")
-				case vswitch.MTU:
-					log.Printf("RS:[MTU] mtu(%v)", val)
-				case vswitch.IPAddr:
-					log.Printf("RS:[IPAddr] vif: %v, val: %v\n", vif, val)
-					router.updateInterfaceIpEntry(
-						notify.Type, vrfidx, uint32(vif.Index()), val)
-				case bool:
-					log.Printf("RS:[VIF enabled] %v", val)
-				case vswitch.Neighbour:
-					router.updateArpEntry(notify.Type, vrfidx, vif.Index(), val)
+			switch val := notify.Value.(type) {
+			case nil:
+				//TODO: VRF created and deleted.
+				log.Printf("RS:[VRF] vrf(%v) type(%v)",
+					vrf.Name(), notify.Type)
+			case vswitch.Route:
+				// Route added and deleted.
+				if err := router.updateRouteEntry(notify.Type, val); err != nil {
+					log.Err("RS: updateRouteEntry failed: %v", err)
 				}
-			} else if vrf, ok := notify.Target.(*vswitch.VRF); ok {
-				/// VRF informations.
-				vrfidx := uint64(vrf.Index())
-				router := s.routers[vrfidx]
-				if router == nil {
-					continue
+			case vswitch.VIF:
+				//TODO: VIF added to vrf.
+				log.Printf("RS:[VIF] vrf(%v) type(%v) vif(%v)",
+					vrf.Name(), notify.Type, val.Name())
+			case vswitch.PBREntry:
+				if err := router.updatePBREntry(notify.Type, val); err != nil {
+					log.Err("RS: updatePBREntry failed: %v", err)
 				}
-
-				switch val := notify.Value.(type) {
-				case nil:
-					//TODO: VRF created and deleted.
-					log.Printf("RS:[VRF] vrf(%v) type(%v)",
-						vrf.Name(), notify.Type)
-				case vswitch.Route:
-					// Route added and deleted.
-					router.updateRouteEntry(notify.Type, vrfidx, val)
-				case vswitch.VIF:
-					//TODO: VIF added to vrf.
-					log.Printf("RS:[VIF] vrf(%v) type(%v) vif(%v)",
-						vrf.Name(), notify.Type, val.Name())
-				default:
-					vif, _ := val.(*vswitch.VIF)
+			default:
+				vif, _ := val.(*vswitch.VIF)
+				if vif != nil {
 					log.Printf("RS: vrf(%v) not supported vif(%v)",
 						vrf.Name(), vif.Name())
 				}
 			}
-		default:
-			// not supported.
 		}
 	}
 }
@@ -328,41 +338,88 @@ func (r *RouterInstance) listenRules() {
 	for n := range r.notifyRule {
 		rule, ok := n.Value.(vswitch.Rule)
 		if !ok {
+			log.Err("Unknown value received (Expecting vswitch.Rule): %v", reflect.TypeOf(n.Value))
 			continue
 		}
 
 		switch rule.Match {
-		case vswitch.MATCH_ANY:
+		case vswitch.MatchAny:
 			// Default Output (The same as Output())
 
-		case vswitch.MATCH_IPV4_DST_SELF:
+		case vswitch.MatchIPv4DstSelf:
 			// to Tap module
-			if err := r.control(ROUTER_CMD_CONFIG_RING_TAP, rule.Ring, nil); err != nil {
+			if err := r.control(ROUTER_CMD_CONFIG_TAP, unsafe.Pointer(rule.Ring)); err != nil {
 				log.Printf("Config ring failed: %v", err)
 			}
 
-		case vswitch.MATCH_IPV4_DST:
+		case vswitch.MatchIPv4Dst:
 			// hostif
-			if err := r.control(ROUTER_CMD_CONFIG_RING_HOSTIF, rule.Ring, nil); err != nil {
-				log.Printf("Config ring failed: %v", err)
-			}
+			// TODO: set routerMatchParam
+			// if err := r.control(ROUTER_CMD_CONFIG_RULE, rule.Ring, nil); err != nil {
+			// 	log.Printf("Config ring failed: %v", err)
+			// }
 
-		case vswitch.MATCH_IPV4_PROTO:
-			val, ok := rule.Param.(vswitch.IPProto)
+		case vswitch.Match5Tuple:
+			val, ok := rule.Param.(*vswitch.FiveTuple)
 			if !ok {
+				log.Err("Unknown value received (Expecting *vswitch.FiveTyple): %v",
+					reflect.TypeOf(rule.Param))
 				continue
 			}
-			var cmd routerCmd
-			switch val {
-			case vswitch.IPP_IPIP:
-				cmd = ROUTER_CMD_CONFIG_RING_IPIP
-			case vswitch.IPP_ESP:
-				cmd = ROUTER_CMD_CONFIG_RING_ESP
-			case vswitch.IPP_GRE:
-				cmd = ROUTER_CMD_CONFIG_RING_GRE
+
+			crule := C.struct_rule{
+				srcip:   ipv4toCuint32(val.SrcIP.IP),
+				dstip:   ipv4toCuint32(val.DstIP.IP),
+				dstport: C.uint16_t(val.DstPort.Start),
+				proto:   C.uint8_t(val.Proto),
 			}
-			if err := r.control(cmd, rule.Ring, nil); err != nil {
-				log.Printf("Config ring failed: %v", err)
+
+			info := &C.struct_router_rule{
+				rule: crule,
+				ring: (*C.struct_rte_ring)(unsafe.Pointer(rule.Ring)),
+			}
+
+			cmd := ROUTER_CMD_RULE_ADD
+			if n.Type == notifier.Delete {
+				cmd = ROUTER_CMD_RULE_DELETE
+			}
+
+			if err := r.control(cmd, unsafe.Pointer(info)); err == nil {
+				log.Info("Config 5-tuple rule succeeded (%v): %#v", n.Type, crule)
+			} else {
+				log.Err("Config 5-tuple rule failed (%v): %#v: %v", n.Type, crule, err)
+			}
+
+		case vswitch.MatchVxLAN:
+			val, ok := rule.Param.(*vswitch.VxLAN)
+			if !ok {
+				log.Err("Unknown value received (Expecting *vswitch.VxLAN): %v",
+					reflect.TypeOf(rule.Param))
+				continue
+			}
+
+			crule := C.struct_rule{
+				srcip:   ipv4toCuint32(val.Src),
+				dstip:   ipv4toCuint32(val.Dst),
+				dstport: C.uint16_t(val.DstPort),
+				proto:   C.uint8_t(vswitch.IPP_UDP),
+				vni:     C.uint32_t(val.VNI),
+			}
+
+			info := &C.struct_router_rule{
+				rule: crule,
+				ring: (*C.struct_rte_ring)(unsafe.Pointer(rule.Ring)),
+			}
+
+			cmd := ROUTER_CMD_RULE_ADD
+			if n.Type == notifier.Delete {
+				cmd = ROUTER_CMD_RULE_DELETE
+			}
+
+			if err := r.control(cmd, unsafe.Pointer(info)); err == nil {
+				log.Info("Config VxLAN rule succeeded (%v): %#v", n.Type, crule)
+			} else {
+				log.Err("Config VxLAN rule failed (%v): %#v: %v", n.Type, crule, err)
 			}
 		}
 	}
@@ -408,7 +465,6 @@ func newRouterInstance(base *vswitch.BaseInstance, priv interface{}) (vswitch.In
 		enabled:    false,
 		mtu:        vswitch.DefaultMTU,
 		vifs:       make(map[vswitch.VIFIndex]*dpdk.Ring),
-		arpTable:   hashlist.New(),
 		notifyRule: base.Rules().Notifier().Listen(),
 	}
 
@@ -417,11 +473,24 @@ func newRouterInstance(base *vswitch.BaseInstance, priv interface{}) (vswitch.In
 	}
 
 	// r.param
-	r.param = (*C.struct_router_instance)(C.malloc(C.sizeof_struct_router_instance))
+	r.param = (*C.struct_router_instance)(C.calloc(1, C.sizeof_struct_router_instance))
+	// check name
+	if len(base.Name()) > C.ROUTER_NAME_SIZE {
+		return nil, fmt.Errorf("Invalid router name(too long).")
+	}
 	r.param.base.name = C.CString(base.Name())
 	r.param.base.input = (*C.struct_rte_ring)(unsafe.Pointer(base.Input()))
-	r.param.base.outputs = (**C.struct_rte_ring)(C.malloc(C.size_t(unsafe.Sizeof(uintptr(0)))))
-	r.param.vrfidx = C.uint64_t(vrf.Index())
+	switch config.RRProcessMode {
+	case "disable":
+		r.param.rr_mode = C.RECORDROUTE_DISABLE
+	case "ignore":
+		r.param.rr_mode = C.RECORDROUTE_IGNORE
+	case "enable":
+		r.param.rr_mode = C.RECORDROUTE_ENABLE
+	default:
+		log.Printf("RI: invalid record route process mode, set default \"disable\"\n")
+		r.param.rr_mode = C.RECORDROUTE_DISABLE
+	}
 
 	ri, err := vswitch.NewRuntimeInstance((vswitch.LagopusInstance)(unsafe.Pointer(r.param)))
 	if err != nil {
@@ -450,13 +519,10 @@ func (r *RouterInstance) Free() {
 	r.service.unregisterRouter(r)
 
 	C.free(unsafe.Pointer(r.param.base.name))
-	C.free(unsafe.Pointer(r.param.base.outputs))
 	C.free(unsafe.Pointer(r.param))
 
 	r.service = nil
 	r.base = nil
-	r.vifs = nil
-	r.arpTable = nil
 }
 
 func (r *RouterInstance) Enable() error {
@@ -479,347 +545,300 @@ func (r *RouterInstance) Disable() {
 }
 
 // for listen
-func (r *RouterInstance) updateRouteEntry(cmdType notifier.Type, idx uint64, route vswitch.Route) error {
-	ones, _ := route.Dst.Mask.Size()
-	if route.Dst.IP.To4() == nil {
-		return errors.New("not supported ip address.")
+func (r *RouterInstance) updatePBREntry(cmdType notifier.Type, pbr vswitch.PBREntry) error {
+	// Management pbr index
+	smask, _ := pbr.SrcIP.Mask.Size()
+	dmask, _ := pbr.DstIP.Mask.Size()
+	inif := C.vifindex_t(C.VIF_INVALID_INDEX)
+	if pbr.InputVIF != nil {
+		inif = C.vifindex_t(pbr.InputVIF.Index())
 	}
-	re := RouteEntry{
-		VRFIdx:    idx,
-		Prefix:    uint32(ones),
-		DestAddr:  route.Dst.IP,
-		NextHop:   route.Gw,
-		Interface: uint32(route.VIFIndex),
-		Scope:     uint32(route.Scope),
-		Metric:    uint32(route.Metrics),
+	sp := C.struct_range{
+		from: C.uint16_t(pbr.SrcPort.Start),
+		to:   C.uint16_t(pbr.SrcPort.End),
 	}
-
-	var t routerCmd
-	if cmdType == notifier.Add {
-		t = ROUTER_CMD_ROUTE_ADD
-	} else {
-		t = ROUTER_CMD_ROUTE_DELETE
+	dp := C.struct_range{
+		from: C.uint16_t(pbr.DstPort.Start),
+		to:   C.uint16_t(pbr.DstPort.End),
 	}
-	r.control(t, nil, re)
-	return nil
-}
-
-func Ipv4ToHashkey(ip net.IP) uint32 {
-	ip = ip.To4()
-	if ip == nil {
-		log.Printf("RI: ERROR: Invalid ip address\n")
-		return 0
+	pe := &C.struct_pbr_entry{
+		priority: C.int(pbr.Priority),
+		in_vif:   inif,
+		src_addr: ipv4toCuint32(pbr.SrcIP.IP),
+		src_mask: C.uint8_t(smask),
+		dst_addr: ipv4toCuint32(pbr.DstIP.IP),
+		dst_mask: C.uint8_t(dmask),
+		src_port: sp,
+		dst_port: dp,
+		protocol: C.uint8_t(pbr.Proto),
 	}
-	return binary.LittleEndian.Uint32(ip)
-}
-
-func (r *RouterInstance) updateArpEntry(cmdType notifier.Type, idx uint64, index vswitch.VIFIndex, arp vswitch.Neighbour) error {
-	// convert net.IP to uint32 to use as hashmap key.
-	key := Ipv4ToHashkey(arp.Dst)
-
-	// create entry.
-	ae := ArpEntry{
-		VRFIdx:     idx,
-		Interface:  uint32(index),
-		IPAddress:  arp.Dst,
-		MACAddress: arp.LinkLocalAddr,
+	// no nexthop is drop
+	length := len(pbr.NextHops)
+	if length == 0 {
+		// for drop action
+		length = 1
 	}
-
-	// check if the entry exists.
-	if entry := r.arpTable.Find(key); entry != nil {
-		old := entry.Value.(*ArpEntry)
-		if cmdType == notifier.Add {
-			// entry information has been updated.
-			if old.Interface == ae.Interface &&
-				(bytes.Compare(old.MACAddress, ae.MACAddress) == 0) {
-				// no change, nothing to do.
-				//log.Printf("RI: [ARP: ADD] no changed.")
-			} else {
-				// changed, so update backend.
-				log.Printf("RI: [ARP: UPDATE] changed and notify backend.")
-				r.arpTable.Add(key, &ae)
-				r.control(ROUTER_CMD_ARP_ADD, nil, ae)
-			}
-		} else if cmdType == notifier.Delete {
-			// remove entry from hashmap n frontend.
-			log.Printf("RI: [ARP: DELETE] delete and notify backend.")
-			r.arpTable.Remove(key)
-			r.control(ROUTER_CMD_ARP_DELETE, nil, ae)
+	// set nexthop
+	pe.nexthop_num = C.uint32_t(length)
+	size := length * C.sizeof_struct_nexthop
+	pe.nexthops = (*C.struct_nexthop)(C.calloc(1, C.ulong(size)))
+	nexthops := (*[1 << 30]C.struct_nexthop)(unsafe.Pointer(pe.nexthops))[:length:length]
+	i := 0 // index of array
+	// If there is no nexthop, the action is DROP
+	nexthops[i].action = C.PBRACTION_DROP
+	for _, nh := range pbr.NextHops {
+		if nh.Dev != nil {
+			nexthops[i].ifindex = C.uint16_t(nh.Dev.VIFIndex())
+		} else {
+			nexthops[i].ifindex = C.VIF_INVALID_INDEX
 		}
+		nexthops[i].gw = ipv4toCuint32(nh.Gw)
+		nexthops[i].weight = C.uint32_t(nh.Weight)
+		nexthops[i].broadcast_type = C.IPV4_NO_BROADCAST
+		// Action NONE is not used in PBR
+		if nh.Action == C.PBRACTION_PASS {
+			nexthops[i].action = C.PBRACTION_PASS
+		} else {
+			nexthops[i].action = C.PBRACTION_FORWARD
+		}
+		i++
 	}
 
-	// add new entry.
 	if cmdType == notifier.Add {
-		log.Printf("RI: [ARP: ADD] add and notify backend.")
-		r.arpTable.Add(key, &ae)
-		r.control(ROUTER_CMD_ARP_ADD, nil, ae)
+		return r.control(ROUTER_CMD_PBRRULE_ADD, unsafe.Pointer(pe))
+	}
+	return r.control(ROUTER_CMD_PBRRULE_DELETE, unsafe.Pointer(pe))
+}
+
+func (r *RouterInstance) updateRouteEntry(cmdType notifier.Type, route vswitch.Route) error {
+	info, err := allocRouteEntry(&route)
+	if err != nil {
+		return err
+	}
+
+	if cmdType == notifier.Add {
+		return r.control(ROUTER_CMD_ROUTE_ADD, unsafe.Pointer(info))
+	}
+	return r.control(ROUTER_CMD_ROUTE_DELETE, unsafe.Pointer(info))
+}
+
+func (r *RouterInstance) updateNeighborEntry(cmdType notifier.Type, index vswitch.VIFIndex, neighbor vswitch.Neighbour) error {
+	// create entry.
+	ne := &C.struct_neighbor_entry{
+		ifindex: C.int(index),
+		ip:      ipv4toCuint32(neighbor.Dst),
+		mac:     createStructEtherAddr(neighbor.LinkLocalAddr),
+		state:   C.int(neighbor.State),
+	}
+
+	switch cmdType {
+	case notifier.Add, notifier.Update:
+		// Add neighbor entry to backend hash table.
+		// And addition processing and update processing are the same processing.
+		return r.control(ROUTER_CMD_NEIGH_ADD, unsafe.Pointer(ne))
+
+	case notifier.Delete:
+		// Remove neighbor entry from bakend hash table.
+		return r.control(ROUTER_CMD_NEIGH_DELETE, unsafe.Pointer(ne))
+
+	default:
+		return fmt.Errorf("Unknown cmdType: %v", cmdType)
 	}
 
 	return nil
 }
 
-func (r *RouterInstance) updateInterfaceIpEntry(cmdType notifier.Type, idx uint64, vifindex uint32, ip vswitch.IPAddr) error {
-	ie := InterfaceEntry{
-		VRFIdx:    idx,
-		VIFId:     vifindex,
-		IPAddress: ip,
+func (r *RouterInstance) updateInterfaceIpEntry(cmdType notifier.Type, vifindex vswitch.VIFIndex, ip vswitch.IPAddr) error {
+	var cmd routerCmd
+	if cmdType == notifier.Add {
+		if r.addrsCount == C.IPADDR_MAX_NUM {
+			return errors.New("Number of self IP addresses exceeded the limit")
+		}
+		cmd = ROUTER_CMD_VIF_ADD_IP
+		r.addrsCount++
+	} else {
+		cmd = ROUTER_CMD_VIF_DELETE_IP
+		r.addrsCount--
+	}
+
+	plen, _ := ip.Mask.Size()
+	ie := &C.struct_interface_addr_entry{
+		addr:      ipv4toCuint32(ip.IP),
+		ifindex:   C.uint32_t(vifindex),
+		prefixlen: C.uint32_t(plen),
 	}
 
 	// update interface table.
-	var t routerCmd
-	if cmdType == notifier.Add {
-		t = ROUTER_CMD_VIF_ADD_IP
-	} else {
-		t = ROUTER_CMD_VIF_DELETE_IP
-	}
-	r.control(t, nil, ie)
+	return r.control(cmd, unsafe.Pointer(ie))
+}
 
-	return nil
+func (r *RouterInstance) updateInterfaceMTU(cmtType notifier.Type, vifindex vswitch.VIFIndex, mtu vswitch.MTU) error {
+	ie := &C.struct_interface_entry{
+		ifindex: C.uint32_t(vifindex),
+		mtu:     C.uint16_t(mtu),
+	}
+
+	// MTU only supports Notifier.Update
+	return r.control(ROUTER_CMD_VIF_UPDATE_MTU, unsafe.Pointer(ie))
 }
 
 // for control
 type routerCmd int
 
 const (
-	ROUTER_CMD_CONFIG_RING_TAP    = routerCmd(C.ROUTER_CMD_CONFIG_RING_TAP)
-	ROUTER_CMD_CONFIG_RING_HOSTIF = routerCmd(C.ROUTER_CMD_CONFIG_RING_HOSTIF)
-	ROUTER_CMD_CONFIG_RING_IPIP   = routerCmd(C.ROUTER_CMD_CONFIG_RING_IPIP)
-	ROUTER_CMD_CONFIG_RING_ESP    = routerCmd(C.ROUTER_CMD_CONFIG_RING_ESP)
-	ROUTER_CMD_CONFIG_RING_GRE    = routerCmd(C.ROUTER_CMD_CONFIG_RING_GRE)
-	ROUTER_CMD_VIF_ADD            = routerCmd(C.ROUTER_CMD_VIF_ADD)
-	ROUTER_CMD_VIF_DELETE         = routerCmd(C.ROUTER_CMD_VIF_DELETE)
-	ROUTER_CMD_VIF_ADD_IP         = routerCmd(C.ROUTER_CMD_VIF_ADD_IP)
-	ROUTER_CMD_VIF_DELETE_IP      = routerCmd(C.ROUTER_CMD_VIF_DELETE_IP)
-	ROUTER_CMD_ROUTE_ADD          = routerCmd(C.ROUTER_CMD_ROUTE_ADD)
-	ROUTER_CMD_ROUTE_DELETE       = routerCmd(C.ROUTER_CMD_ROUTE_DELETE)
-	ROUTER_CMD_ARP_ADD            = routerCmd(C.ROUTER_CMD_ARP_ADD)
-	ROUTER_CMD_ARP_DELETE         = routerCmd(C.ROUTER_CMD_ARP_DELETE)
+	ROUTER_CMD_CONFIG_TAP     = routerCmd(C.ROUTER_CMD_CONFIG_TAP)
+	ROUTER_CMD_RULE_ADD       = routerCmd(C.ROUTER_CMD_RULE_ADD)
+	ROUTER_CMD_RULE_DELETE    = routerCmd(C.ROUTER_CMD_RULE_DELETE)
+	ROUTER_CMD_VIF_ADD        = routerCmd(C.ROUTER_CMD_VIF_ADD)
+	ROUTER_CMD_VIF_DELETE     = routerCmd(C.ROUTER_CMD_VIF_DELETE)
+	ROUTER_CMD_VIF_ADD_IP     = routerCmd(C.ROUTER_CMD_VIF_ADD_IP)
+	ROUTER_CMD_VIF_DELETE_IP  = routerCmd(C.ROUTER_CMD_VIF_DELETE_IP)
+	ROUTER_CMD_VIF_UPDATE_MTU = routerCmd(C.ROUTER_CMD_VIF_UPDATE_MTU)
+	ROUTER_CMD_ROUTE_ADD      = routerCmd(C.ROUTER_CMD_ROUTE_ADD)
+	ROUTER_CMD_ROUTE_DELETE   = routerCmd(C.ROUTER_CMD_ROUTE_DELETE)
+	ROUTER_CMD_NEIGH_ADD      = routerCmd(C.ROUTER_CMD_NEIGH_ADD)
+	ROUTER_CMD_NEIGH_DELETE   = routerCmd(C.ROUTER_CMD_NEIGH_DELETE)
+	ROUTER_CMD_NAPT_ENABLE    = routerCmd(C.ROUTER_CMD_NAPT_ENABLE)
+	ROUTER_CMD_NAPT_DISABLE   = routerCmd(C.ROUTER_CMD_NAPT_DISABLE)
+	ROUTER_CMD_PBRRULE_ADD    = routerCmd(C.ROUTER_CMD_PBRRULE_ADD)
+	ROUTER_CMD_PBRRULE_DELETE = routerCmd(C.ROUTER_CMD_PBRRULE_DELETE)
 )
 
 // static functions for control
-func createEntry(cmd C.router_cmd_t, idx uint64) *C.struct_router_information {
-	r := (*C.struct_router_information)(C.malloc(C.sizeof_struct_router_information))
-	if r == nil {
-		return nil
-	}
-	r.cmd = cmd
-	r.vrfidx = C.uint64_t(idx)
-	return r
-}
-
 func ipv4toCuint32(ip net.IP) C.uint32_t {
 	ip = ip.To4()
 	if ip == nil {
 		return 0
 	}
-	return C.uint32_t(binary.LittleEndian.Uint32(ip))
+	addr := int(ip[0])<<24 | int(ip[1])<<16 | int(ip[2])<<8 | int(ip[3])
+	return C.uint32_t(addr)
+
 }
 
-type macAddress [6]byte
-
-func hardwareAddrToMacAddress(ha net.HardwareAddr) macAddress {
-	var ma macAddress
-	copy(ma[:], []byte(ha))
-	return ma
-}
-
-func allocInterfaceEntry(cmd C.router_cmd_t, v InterfaceEntry) *C.struct_router_information {
-	info := createEntry(cmd, v.VRFIdx)
-	if info == nil {
-		return nil
+func allocRouteEntry(rt *vswitch.Route) (*C.struct_route_entry, error) {
+	// route.Dst == nil is defaut gateway.
+	prefixlen := 0
+	dst := net.IPv4(0, 0, 0, 0)
+	if rt.Dst != nil {
+		prefixlen, _ = rt.Dst.Mask.Size()
+		dst = rt.Dst.IP
+		if dst.To4() == nil {
+			return nil, fmt.Errorf("not supported ip addresss(%v).", rt.Dst)
+		}
 	}
-	mac := hardwareAddrToMacAddress(v.MACAddress)
-	macp := (*C.struct_ether_addr)(C.CBytes((mac)[:]))
-	C.memcpy(unsafe.Pointer(&info.vif.mac), unsafe.Pointer(macp), C.sizeof_struct_ether_addr)
-	info.vif.ifindex = C.uint32_t(v.VIFId)
-	info.vif.mtu = C.uint16_t(v.MTU)
-	info.vif.vid = C.uint16_t(v.VID)
-	info.vif.tunnel = C.bool(v.Tunnel)
-	return info
-}
+	dstip := ipv4toCuint32(dst)
 
-func allocInterfaceIPAddressEntry(cmd C.router_cmd_t, v InterfaceEntry) *C.struct_router_information {
-	info := createEntry(cmd, v.VRFIdx)
-	if info == nil {
-		return nil
-	}
-	if v.IPAddress.IP.To4() == nil {
-		return nil
-	}
-	info.addr.addr = ipv4toCuint32(v.IPAddress.IP)
-	info.addr.ifindex = C.uint32_t(v.VIFId)
-	plen, _ := v.IPAddress.Mask.Size()
-	info.addr.prefixlen = C.uint32_t(plen)
-	return info
-}
-
-func allocRouteEntry(cmd C.router_cmd_t, v RouteEntry) *C.struct_router_information {
-	info := createEntry(cmd, v.VRFIdx)
-	if info == nil {
-		return nil
-	}
-	info.route.prefixlen = C.uint32_t(v.Prefix)
-	info.route.network = C.uint32_t(v.Prefix)
-	info.route.dst = ipv4toCuint32(v.DestAddr)
-	info.route.gw = ipv4toCuint32(v.NextHop)
-	info.route.ifindex = C.uint32_t(v.Interface)
-	info.route.scope = C.uint32_t(v.Scope)
-	info.route.metric = C.uint32_t(v.Metric)
-
-	return info
-}
-
-func allocArpEntry(cmd C.router_cmd_t, v ArpEntry) *C.struct_router_information {
-	info := createEntry(cmd, v.VRFIdx)
-	if info == nil {
-		return nil
-	}
-	mac := hardwareAddrToMacAddress(v.MACAddress)
-	macp := (*C.struct_ether_addr)(C.CBytes((mac)[:]))
-	C.memcpy(unsafe.Pointer(&info.arp.mac), unsafe.Pointer(macp), C.sizeof_struct_ether_addr)
-	info.arp.ifindex = C.int(v.Interface)
-	info.arp.ip = ipv4toCuint32(v.IPAddress)
-
-	return info
-}
-
-func (r *RouterInstance) allocConfigRing(cmd C.router_cmd_t, ring *dpdk.Ring) *C.struct_router_information {
-	info := createEntry(cmd, r.vrfidx)
-	if info == nil {
-		return nil
-	}
-	cring := (*C.struct_rte_ring)(unsafe.Pointer(ring))
-
-	switch cmd {
-	case C.ROUTER_CMD_CONFIG_RING_TAP:
-		info.rings.tap = cring
-	case C.ROUTER_CMD_CONFIG_RING_HOSTIF:
-		info.rings.hostif = cring
-	case C.ROUTER_CMD_CONFIG_RING_IPIP:
-		info.rings.ipip = cring
-	case C.ROUTER_CMD_CONFIG_RING_ESP:
-		info.rings.esp = cring
-	case C.ROUTER_CMD_CONFIG_RING_GRE:
-		info.rings.gre = cring
+	route := &C.struct_route_entry{
+		prefixlen:  C.uint32_t(prefixlen),
+		netmask:    C.uint32_t(prefixlen),
+		dst:        dstip,
+		scope:      C.uint32_t(rt.Scope),
+		route_type: C.uint32_t(rt.Type),
+		metric:     C.uint32_t(rt.Metrics),
 	}
 
-	return info
+	length := len(rt.Nexthops)
+	if length == 0 {
+		length = 1
+	}
+	// allocation nexthops array
+	size := length * C.sizeof_struct_nexthop
+	route.nexthops = (*C.struct_nexthop)(C.calloc(1, C.ulong(size)))
+	nexthops := (*[1 << 30]C.struct_nexthop)(unsafe.Pointer(route.nexthops))[:length:length]
+
+	// get broadcast type
+	bt := C.IPV4_NO_BROADCAST
+	if rt.Type == syscall.RTN_BROADCAST {
+		if (dstip & 1) == 1 {
+			bt = C.IPV4_DIRECTED_BROADCAST
+		} else {
+			bt = C.IPV4_NONSTANDARD_BROADCAST
+		}
+	}
+
+	// set nexthops
+	route.nexthop_num = C.uint32_t(length)
+	if len(rt.Nexthops) == 0 {
+		// len(v.Nexthops) is 0, no v.Nexthops.
+		// use v.Interface and v.Nexthop
+		nexthops[0].ifindex = C.uint16_t(rt.Dev.VIFIndex())
+		nexthops[0].weight = 0
+		nexthops[0].gw = ipv4toCuint32(rt.Gw)
+		nexthops[0].netmask = C.uint8_t(prefixlen)
+		nexthops[0].broadcast_type = C.uint8_t(bt)
+	} else {
+		for i, nh := range rt.Nexthops {
+			nexthops[i].ifindex = C.uint16_t(nh.Dev.VIFIndex())
+			nexthops[i].weight = C.uint32_t(nh.Weight)
+			nexthops[i].gw = ipv4toCuint32(nh.Gw)
+			nexthops[i].netmask = C.uint8_t(prefixlen)
+			nexthops[i].broadcast_type = C.uint8_t(bt)
+		}
+	}
+
+	return route, nil
 }
 
 //-----
 
-func (r *RouterInstance) control(cmd routerCmd, ring *dpdk.Ring, v interface{}) error {
-	log.Printf("RS: control: cmd: %v, ring: %p\n", cmd, ring)
+func (r *RouterInstance) control(cmd routerCmd, info unsafe.Pointer) error {
+	log.Debug(0, "RS: control: cmd: %v, info: %p\n", cmd, info)
 	p := C.struct_router_control_param{
 		cmd:  C.router_cmd_t(cmd),
-		ring: (*C.struct_rte_ring)(unsafe.Pointer(ring)),
+		info: info,
 	}
-	switch cmd {
-	case ROUTER_CMD_CONFIG_RING_TAP:
-		p.info = r.allocConfigRing(C.ROUTER_CMD_CONFIG_RING_TAP, ring)
-	case ROUTER_CMD_CONFIG_RING_HOSTIF:
-		p.info = r.allocConfigRing(C.ROUTER_CMD_CONFIG_RING_HOSTIF, ring)
-	case ROUTER_CMD_CONFIG_RING_IPIP:
-		p.info = r.allocConfigRing(C.ROUTER_CMD_CONFIG_RING_IPIP, ring)
-	case ROUTER_CMD_CONFIG_RING_ESP:
-		p.info = r.allocConfigRing(C.ROUTER_CMD_CONFIG_RING_ESP, ring)
-	case ROUTER_CMD_CONFIG_RING_GRE:
-		p.info = r.allocConfigRing(C.ROUTER_CMD_CONFIG_RING_GRE, ring)
-	case ROUTER_CMD_VIF_ADD:
-		// add interface entry to interface table.
-		ie, ok := v.(InterfaceEntry)
-		if !ok {
-			return fmt.Errorf("Invalid parameter v = %v", v)
-		}
-		p.info = allocInterfaceEntry(C.ROUTER_CMD_VIF_ADD, ie)
-	case ROUTER_CMD_VIF_DELETE:
-		// delete interface entry to interface table.
-		ie, ok := v.(InterfaceEntry)
-		if !ok {
-			return fmt.Errorf("Invalid parameter v = %v", v)
-		}
-		p.info = allocInterfaceEntry(C.ROUTER_CMD_VIF_DELETE, ie)
-	case ROUTER_CMD_VIF_ADD_IP:
-		ie, ok := v.(InterfaceEntry)
-		if !ok {
-			return fmt.Errorf("Invalid parameter v = %v", v)
-		}
-		p.info = allocInterfaceIPAddressEntry(C.ROUTER_CMD_VIF_ADD_IP, ie)
-	case ROUTER_CMD_VIF_DELETE_IP:
-		ie, ok := v.(InterfaceEntry)
-		if !ok {
-			return fmt.Errorf("Invalid parameter v = %v", v)
-		}
-		p.info = allocInterfaceIPAddressEntry(C.ROUTER_CMD_VIF_DELETE_IP, ie)
-	case ROUTER_CMD_ROUTE_ADD:
-		// add route entry to routing table.
-		re, ok := v.(RouteEntry)
-		if !ok {
-			return fmt.Errorf("Invalid parameter v = %v", v)
-		}
-		p.info = allocRouteEntry(C.ROUTER_CMD_ROUTE_ADD, re)
-	case ROUTER_CMD_ROUTE_DELETE:
-		// delete route entry from routing table.
-		re, ok := v.(RouteEntry)
-		if !ok {
-			return fmt.Errorf("Invalid parameter v = %v", v)
-		}
-		p.info = allocRouteEntry(C.ROUTER_CMD_ROUTE_DELETE, re)
-	case ROUTER_CMD_ARP_ADD:
-		ae, ok := v.(ArpEntry)
-		if !ok {
-			return fmt.Errorf("Invalid parameter v = %v", v)
-		}
-		p.info = allocArpEntry(C.ROUTER_CMD_ARP_ADD, ae)
-	case ROUTER_CMD_ARP_DELETE:
-		ae, ok := v.(ArpEntry)
-		if !ok {
-			return fmt.Errorf("Invalid parameter v = %v", v)
-		}
-		p.info = allocArpEntry(C.ROUTER_CMD_ARP_DELETE, ae)
-	}
-	if p.info == nil {
-		return fmt.Errorf("Control entry allocation failed(v = %v).\n", v)
-	}
-
+	r.ctrls++
 	rc, err := r.instance.Control(unsafe.Pointer(&p))
 	if rc == false || err != nil {
-		return fmt.Errorf("%v Failed: %v", cmd, err)
+		r.ctrlsErr++
+		return fmt.Errorf("RS: Control command(%v) failed: %v", cmd, err)
 	}
 	return nil
 }
 
 // configuration apis.
 func (r *RouterInstance) AddVIF(vif *vswitch.VIF) error {
-	log.Printf("AddVIF: %v, %v", vif, r.vifs[vif.Index()])
-	if r.vifs[vif.Index()] == nil {
-		r.vifs[vif.Index()] = vif.Input()
+	log.Printf("AddVIF: %v", vif)
 
-		// add vif
-		tunnel := false
-		if vif.Tunnel() != nil {
-			tunnel = true
-		}
-		ie := InterfaceEntry{
-			VRFIdx:     uint64(vif.VRF().Index()),
-			VIFId:      uint32(vif.Index()),
-			VID:        uint16(vif.VID()),
-			MACAddress: vif.MACAddress(),
-			MTU:        uint16(vif.MTU()),
-			Tunnel:     tunnel,
-		}
-		log.Printf("CALL ROUTER_CMD_VIF_ADD")
-		r.control(ROUTER_CMD_VIF_ADD, vif.Input(), ie)
+	ips := vif.ListIPAddrs()
+	if r.addrsCount+uint(len(ips)) > C.IPADDR_MAX_NUM {
+		return errors.New("Can register nomore IP addresses")
+	}
+
+	// add vif
+	ie := &C.struct_interface_entry{
+		ifindex: C.uint32_t(vif.Index()),
+		ring:    (*C.struct_rte_ring)(unsafe.Pointer(vif.Input())),
+		mtu:     C.uint16_t(vif.MTU()),
+		vid:     C.uint16_t(vif.VID()),
+		mac:     createStructEtherAddr(vif.MACAddress()),
+	}
+
+	if vif.Tunnel() != nil {
+		ie.flags |= C.IFF_TYPE_TUNNEL
+	}
+
+	if err := r.control(ROUTER_CMD_VIF_ADD, unsafe.Pointer(ie)); err != nil {
+		return err
 	}
 
 	// add ip addresses
-	ips := vif.ListIPAddrs()
 	for _, ip := range ips {
-		ie := InterfaceEntry{
-			VIFId:     uint32(vif.Index()),
-			IPAddress: ip,
+		// send backend process
+		plen, _ := ip.Mask.Size()
+		addr := &C.struct_interface_addr_entry{
+			addr:      ipv4toCuint32(ip.IP),
+			ifindex:   C.uint32_t(vif.Index()),
+			prefixlen: C.uint32_t(plen),
 		}
-		r.control(ROUTER_CMD_VIF_ADD_IP, vif.Input(), ie)
+
+		// We intentionally ignore error here.
+		// It should never fail as all condition should be cleared before
+		// adding IP address.
+		if err := r.control(ROUTER_CMD_VIF_ADD_IP, unsafe.Pointer(addr)); err != nil {
+			log.Err("Adding IP address of %v failed: %v", err)
+		}
+		r.addrsCount++
 	}
 	return nil
 }
@@ -827,19 +846,105 @@ func (r *RouterInstance) AddVIF(vif *vswitch.VIF) error {
 func (r *RouterInstance) DeleteVIF(vif *vswitch.VIF) error {
 	// TODO: config agent not supported.
 	log.Printf("DeleteVIF: %v", vif)
-	ips := vif.ListIPAddrs()
-	for i := range ips {
-		ie := InterfaceEntry{
-			VIFId:     uint32(vif.Index()),
-			IPAddress: ips[i],
+	for _, ip := range vif.ListIPAddrs() {
+		// send backend process
+		plen, _ := ip.Mask.Size()
+		addr := &C.struct_interface_addr_entry{
+			addr:      ipv4toCuint32(ip.IP),
+			ifindex:   C.uint32_t(vif.Index()),
+			prefixlen: C.uint32_t(plen),
 		}
-		r.control(ROUTER_CMD_VIF_DELETE_IP, vif.Input(), ie)
+
+		// We intentionally ignore error here
+		// It should never fail as all condition should be cleared before
+		// deleting IP address.
+		if err := r.control(ROUTER_CMD_VIF_DELETE_IP, unsafe.Pointer(addr)); err != nil {
+			log.Err("Deleting IP address of %v failed: %v", err)
+		}
+		r.addrsCount--
 	}
-	delete(r.vifs, vif.Index())
-	return r.control(ROUTER_CMD_VIF_DELETE, nil, vif)
+
+	ie := &C.struct_interface_entry{ifindex: C.uint32_t(vif.Index())}
+	return r.control(ROUTER_CMD_VIF_DELETE, unsafe.Pointer(ie))
+}
+
+func (r *RouterInstance) AddOutputDevice(dev vswitch.OutputDevice) error {
+	log.Info("AddOutputDevice: %v", dev)
+
+	// Sanity check
+	if _, ok := dev.(*vswitch.VRF); !ok {
+		return fmt.Errorf("%v is not VRF", dev)
+	}
+
+	// For now, we assume we only get VRF.
+	ie := &C.struct_interface_entry{
+		ifindex: C.uint32_t(dev.VIFIndex()),
+		ring:    (*C.struct_rte_ring)(unsafe.Pointer(dev.Input())),
+		flags:   C.IFF_TYPE_VRF,
+	}
+
+	if err := r.control(ROUTER_CMD_VIF_ADD, unsafe.Pointer(ie)); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *RouterInstance) DeleteOutputDevice(dev vswitch.OutputDevice) error {
+	log.Info("DeleteOutputDevice: %v", dev)
+
+	// Sanity check
+	if _, ok := dev.(*vswitch.VRF); !ok {
+		return fmt.Errorf("%v is not VRF", dev)
+	}
+
+	// For now, we assume we only get VRF.
+	ie := &C.struct_interface_entry{
+		ifindex: C.uint32_t(dev.VIFIndex()),
+	}
+
+	if err := r.control(ROUTER_CMD_VIF_DELETE, unsafe.Pointer(ie)); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *RouterInstance) EnableNAPT(vif *vswitch.VIF) error {
+	log.Info("EnableNAPT: %v", vif)
+
+	napt := vif.NAPT()
+
+	if napt == nil {
+		log.Fatalf("vif.NAPT() shall not return nil: %v", vif)
+	}
+
+	nc := &C.struct_napt_config{
+		wan_addr:    ipv4toCuint32(napt.Address()),
+		port_min:    C.uint16_t(napt.PortRange().Start),
+		port_max:    C.uint16_t(napt.PortRange().End),
+		max_entries: C.uint16_t(napt.MaximumEntries()),
+		aging_time:  C.uint16_t(napt.AgingTime()),
+		vif:         C.vifindex_t(vif.Index()),
+	}
+
+	return r.control(ROUTER_CMD_NAPT_ENABLE, unsafe.Pointer(nc))
+}
+
+func (r *RouterInstance) DisableNAPT(vif *vswitch.VIF) error {
+	log.Info("DisableNAPT: %v", vif)
+
+	index := C.vifindex_t(vif.Index())
+
+	return r.control(ROUTER_CMD_NAPT_DISABLE, unsafe.Pointer(&index))
 }
 
 func init() {
+	if l, err := vlog.New(moduleName); err == nil {
+		log = l
+	} else {
+		log.Fatalf("Can't create logger: %s", moduleName)
+	}
 	rp := &vswitch.RingParam{
 		Count:    C.MAX_ROUTER_MBUFS,
 		SocketId: dpdk.SOCKET_ID_ANY,

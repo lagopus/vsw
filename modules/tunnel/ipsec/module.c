@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
  */
 
 #include "lagopus_apis.h"
+#include "tunnel.h"
 #include "module.h"
 
 struct module *
@@ -24,29 +25,30 @@ module_create(char *name) {
 
   conf = moduleconf_getconf(name);
   if (conf == NULL) {
-    printf("No such module %s", name);
+    TUNNEL_ERROR("No such module %s", name);
     return NULL;
   }
   module = calloc(1, sizeof(struct module));
   if (module != NULL) {
     module->name = strdup(name);
     if (module->name == NULL) {
-      printf("allocation failure for module %s", name);
+      TUNNEL_ERROR("allocation failure for module %s", name);
       free(module);
       return NULL;
     }
 
     module->context = calloc(1, conf->context_size);
     if (module->context == NULL) {
-      printf("%zu bytes allocation failure for module %s", conf->context_size, name);
+      TUNNEL_ERROR("%zu bytes allocation failure for module %s",
+                   conf->context_size, name);
       free((void *) module->name);
       free(module);
       return NULL;
     }
 
-    printf("create %s module.\n", name);
+    TUNNEL_DEBUG("create %s module.", name);
   } else {
-    printf("Can't create module.\n");
+    TUNNEL_ERROR("Can't create module.");
   }
   return module;
 }

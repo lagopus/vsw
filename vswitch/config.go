@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Nippon Telegraph and Telephone Corporation.
+// Copyright 2018-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -31,7 +31,7 @@ type Config struct {
 	data  string
 }
 
-var config *Config
+var config = &Config{}
 
 // GetConfig returns an instance of Config.
 func GetConfig() *Config {
@@ -70,8 +70,4 @@ func (c *Config) Decode(v interface{}) (*toml.MetaData, error) {
 
 	md, err := toml.Decode(c.data, v)
 	return &md, err
-}
-
-func init() {
-	config = &Config{}
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,87 +19,75 @@
  *      @brief  Routing table.
  */
 
-#ifndef __LAGOPUS_MODULE_ROUTER_ROUTE_H__
-#define __LAGOPUS_MODULE_ROUTER_ROUTE_H__
+#ifndef VSW_MODULE_ROUTER_ROUTE_H_
+#define VSW_MODULE_ROUTER_ROUTE_H_
 
+#include <linux/rtnetlink.h>
 #include <net/if.h>
 #include <netinet/in.h>
 
 #include <rte_config.h>
-#include <rte_ip.h>
-#include <rte_lpm.h>
 #include <rte_eal.h>
-#include <rte_lcore.h>
 #include <rte_ether.h>
+#include <rte_ip.h>
+#include <rte_lcore.h>
+#include <rte_lpm.h>
 
 #include "router_common.h"
 
-#define IPV4_MAX_NEXTHOPS 100000
-#define IPV4_MAX_ROUTES   100000
-
-typedef enum {
-	NO_RESOLVE = 0,
-	RESOLVED,
-} resolve_status_t;
+#define IPV4_MAX_ROUTES 100000
+#define ROUTE_ENTRY_POOL_SIZE 100
 
 /**
- * Nexthop information table.
+ * Metric entry.
+ * List by ascending order.
  */
-typedef struct ipv4_nexthop {
-	uint32_t gw;	/**< nexthop address. */
-	uint32_t prefixlen;	/**< prefix length. */
-	uint16_t scope;		/**< scope of interface. */
-	uint32_t metric;	/**< metric of interface. */
-	uint32_t ifindex;
-
-	struct arp_entry *arp;
-	struct interface *interface;
-
-	struct ipv4_nexthop *next;
-	struct ipv4_nexthop *prev;
-} ipv4_nexthop_t;
+typedef struct fib {
+	uint32_t metric;
+	nexthop_t *nexthop;
+	int nexthop_num;
+	struct fib *next;
+} fib_t;
 
 /**
- * Route
+ * Route entry.
+ * There is a possiblity of having more than one nexthop.
+ * Nexthop is listed from the top in order of preference.
  */
-typedef struct ipv4_route {
-	bool used;   /**< status of whether entry is registered. */
-	uint32_t dst;     /**< destination address. */
-	uint32_t prefixlen;     /**< length of prefix. */
-	ipv4_nexthop_t *top;
-} ipv4_route_t;
+typedef struct route {
+	uint32_t dst;	  /**< destination address. */
+	uint32_t prefixlen;    /**< length of prefix. */
+	enum rt_scope_t scope; /**< scope of interface. */
+	uint8_t route_type;    /* Kind of route(for check broadcast)*/
+	fib_t *fib;
+
+	int next; // for free list.
+} route_t;
 
 /**
- * Route table.
+ * Routing table.
  */
 struct route_table {
-	struct rte_lpm *table; /**< dir-24-8 to registered route informations. */
-	char name[RTE_LPM_NAMESIZE];            /**< name of dir-24-8 table. */
-	ipv4_route_t routes[IPV4_MAX_ROUTES]; /**< registered nexthop information. */
+	struct rte_lpm *lpm; /**< dir-24-8 to registered route informations. */
+	route_t *entries;    /**< registered nexthop information. */
+	int free;
+	uint32_t route_num;
+	uint32_t total;
+	route_t default_route;
 };
 
 /* ROUTE APIs. */
-bool
-route_init(struct route_table *route_table, const char *name);
+struct route_table *
+route_init(const char *name);
 void route_fini(struct route_table *route_table);
 
-int
-route_entry_add(struct route_table *route_table, struct route_entry *entry);
+bool
+route_entry_add(struct router_tables *t, struct route_entry *entry);
 
 bool
-route_entry_delete(struct route_table *route_table, struct route_entry *entry);
+route_entry_delete(struct router_tables *t, struct route_entry *entry);
 
-bool
-route_entry_resolve_update(struct route_table *route_table, uint32_t dst,
-		ipv4_nexthop_t *new, struct arp_entry *arp);
+nexthop_t *
+route_entry_get(struct router_tables *t, const uint32_t dst);
 
-ipv4_nexthop_t *
-route_entry_get(struct route_table *route_table, const uint32_t dst);
-
-void
-route_entries_all_clear(struct route_table *route_table);
-
-bool
-route_entry_resolve_reset(struct route_table *route_table);
-
-#endif /* __LAGOPUS_MODULE_ROUTER_ROUTE_H__ */
+#endif /* VSW_MODULE_ROUTER_ROUTE_H_ */

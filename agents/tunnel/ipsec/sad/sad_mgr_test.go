@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -63,38 +63,38 @@ func (suite *sadMgrTestSuite) SetupTest() {
 	// suite.out -> set some SA for debug
 	base := SAValue{
 		CSAValue: ipsec.CSAValue{
-			CipherAlgo: ipsec.CipherAlgoTypeNull,
-			AuthAlgo:   ipsec.AuthAlgoTypeNull,
-			LocalEPIP:  mkIPNet("192.168.0.1"),
+			CipherAlgoType: ipsec.CipherAlgoTypeNull,
+			AuthAlgoType:   ipsec.AuthAlgoTypeNull,
+			LocalEPIP:      mkIP("192.168.0.1"),
 		},
 	}
 	var sav SAValue
 	sav = base
-	sav.RemoteEPIP = mkIPNet("192.168.1.1")
+	sav.RemoteEPIP = mkIP("192.168.1.1")
 	sav.inStat = reserved
 	suite.out.vrfs[vrfIndex].sad[1] = sav
 	sav = base
-	sav.RemoteEPIP = mkIPNet("192.168.1.2")
+	sav.RemoteEPIP = mkIP("192.168.1.2")
 	sav.inStat = newing
 	suite.out.vrfs[vrfIndex].sad[2] = sav
 	sav = base
-	sav.RemoteEPIP = mkIPNet("192.168.1.3")
+	sav.RemoteEPIP = mkIP("192.168.1.3")
 	sav.inStat = valid
 	suite.out.vrfs[vrfIndex].sad[3] = sav
 	sav = base
-	sav.RemoteEPIP = mkIPNet("192.168.1.4")
+	sav.RemoteEPIP = mkIP("192.168.1.4")
 	sav.inStat = updating
 	suite.out.vrfs[vrfIndex].sad[4] = sav
 	sav = base
-	sav.RemoteEPIP = mkIPNet("192.168.1.5")
+	sav.RemoteEPIP = mkIP("192.168.1.5")
 	sav.inStat = softExpired
 	suite.out.vrfs[vrfIndex].sad[5] = sav
 	sav = base
-	sav.RemoteEPIP = mkIPNet("192.168.1.6")
+	sav.RemoteEPIP = mkIP("192.168.1.6")
 	sav.inStat = hardExpired
 	suite.out.vrfs[vrfIndex].sad[6] = sav
 	sav = base
-	sav.RemoteEPIP = mkIPNet("192.168.1.7")
+	sav.RemoteEPIP = mkIP("192.168.1.7")
 	sav.inStat = deleting
 	suite.out.vrfs[vrfIndex].sad[7] = sav
 }
@@ -189,7 +189,7 @@ func (suite *sadMgrTestSuite) TestAddSA() {
 
 	sav := &SAValue{
 		CSAValue: ipsec.CSAValue{
-			CipherAlgo: ipsec.CipherAlgoTypeAesCbc,
+			CipherAlgoType: ipsec.CipherAlgoTypeAes128Cbc,
 		},
 	}
 
@@ -204,28 +204,28 @@ func (suite *sadMgrTestSuite) TestAddSA() {
 	// add 2-7 (error. AlreadyExists)
 	selector.SPI = 2
 	suite.Error(mgr.AddSA(selector, sav))
-	suite.Equal(newing, vrf.sad[2].inStat)                       // not changed
-	suite.Equal(ipsec.CipherAlgoTypeNull, vrf.sad[2].CipherAlgo) // not changed
+	suite.Equal(newing, vrf.sad[2].inStat)                           // not changed
+	suite.Equal(ipsec.CipherAlgoTypeNull, vrf.sad[2].CipherAlgoType) // not changed
 	selector.SPI = 3
 	suite.Error(mgr.AddSA(selector, sav))
-	suite.Equal(valid, vrf.sad[3].inStat)                        // not changed
-	suite.Equal(ipsec.CipherAlgoTypeNull, vrf.sad[3].CipherAlgo) // not changed
+	suite.Equal(valid, vrf.sad[3].inStat)                            // not changed
+	suite.Equal(ipsec.CipherAlgoTypeNull, vrf.sad[3].CipherAlgoType) // not changed
 	selector.SPI = 4
 	suite.Error(mgr.AddSA(selector, sav))
-	suite.Equal(updating, vrf.sad[4].inStat)                     // not changed
-	suite.Equal(ipsec.CipherAlgoTypeNull, vrf.sad[4].CipherAlgo) // not changed
+	suite.Equal(updating, vrf.sad[4].inStat)                         // not changed
+	suite.Equal(ipsec.CipherAlgoTypeNull, vrf.sad[4].CipherAlgoType) // not changed
 	selector.SPI = 5
 	suite.Error(mgr.AddSA(selector, sav))
-	suite.Equal(softExpired, vrf.sad[5].inStat)                  // not changed
-	suite.Equal(ipsec.CipherAlgoTypeNull, vrf.sad[5].CipherAlgo) // not changed
+	suite.Equal(softExpired, vrf.sad[5].inStat)                      // not changed
+	suite.Equal(ipsec.CipherAlgoTypeNull, vrf.sad[5].CipherAlgoType) // not changed
 	selector.SPI = 6
 	suite.Error(mgr.AddSA(selector, sav))
-	suite.Equal(hardExpired, vrf.sad[6].inStat)                  // not changed
-	suite.Equal(ipsec.CipherAlgoTypeNull, vrf.sad[6].CipherAlgo) // not changed
+	suite.Equal(hardExpired, vrf.sad[6].inStat)                      // not changed
+	suite.Equal(ipsec.CipherAlgoTypeNull, vrf.sad[6].CipherAlgoType) // not changed
 	selector.SPI = 7
 	suite.Error(mgr.AddSA(selector, sav))
-	suite.Equal(deleting, vrf.sad[7].inStat)                     // not changed
-	suite.Equal(ipsec.CipherAlgoTypeNull, vrf.sad[7].CipherAlgo) // not changed
+	suite.Equal(deleting, vrf.sad[7].inStat)                         // not changed
+	suite.Equal(ipsec.CipherAlgoTypeNull, vrf.sad[7].CipherAlgoType) // not changed
 	suite.Len(vrf.sad, firstLen)
 
 	// add 10
@@ -233,12 +233,12 @@ func (suite *sadMgrTestSuite) TestAddSA() {
 	suite.NoError(mgr.AddSA(selector, sav))
 	suite.Len(vrf.sad, firstLen+1)
 	suite.Equal(reserved, vrf.sad[10].inStat)
-	suite.Equal(ipsec.CipherAlgoTypeAesCbc, vrf.sad[10].CipherAlgo)
+	suite.Equal(ipsec.CipherAlgoTypeAes128Cbc, vrf.sad[10].CipherAlgoType)
 
 	// add 10 again (no error. update.)
 	sav2 := &SAValue{
 		CSAValue: ipsec.CSAValue{
-			CipherAlgo: ipsec.CipherAlgoType3desCbc,
+			CipherAlgoType: ipsec.CipherAlgoType3desCbc,
 		},
 	}
 	suite.Error(mgr.AddSA(selector, sav2))
@@ -248,7 +248,7 @@ func (suite *sadMgrTestSuite) TestAddSA() {
 	suite.NoError(mgr.AddSA(selector, sav))
 	suite.Len(vrf.sad, firstLen+2)
 	suite.Equal(reserved, vrf.sad[11].inStat)
-	suite.Equal(ipsec.CipherAlgoTypeAesCbc, vrf.sad[11].CipherAlgo)
+	suite.Equal(ipsec.CipherAlgoTypeAes128Cbc, vrf.sad[11].CipherAlgoType)
 }
 
 func (suite *sadMgrTestSuite) TestUpdateSA() {
@@ -260,7 +260,7 @@ func (suite *sadMgrTestSuite) TestUpdateSA() {
 
 	sav := &SAValue{
 		CSAValue: ipsec.CSAValue{
-			CipherAlgo: ipsec.CipherAlgoTypeAesCbc,
+			CipherAlgoType: ipsec.CipherAlgoTypeAes128Cbc,
 		},
 	}
 
@@ -272,33 +272,33 @@ func (suite *sadMgrTestSuite) TestUpdateSA() {
 	// update 1-6 (no error)
 	selector.SPI = 1
 	suite.NoError(mgr.UpdateSA(selector, sav))
-	suite.Equal(reserved, vrf.sad[1].inStat)                       // not changed
-	suite.Equal(ipsec.CipherAlgoTypeAesCbc, vrf.sad[1].CipherAlgo) // changed
+	suite.Equal(reserved, vrf.sad[1].inStat)                              // not changed
+	suite.Equal(ipsec.CipherAlgoTypeAes128Cbc, vrf.sad[1].CipherAlgoType) // changed
 	selector.SPI = 2
 	suite.NoError(mgr.UpdateSA(selector, sav))
-	suite.Equal(newing, vrf.sad[2].inStat)                         // not changed
-	suite.Equal(ipsec.CipherAlgoTypeAesCbc, vrf.sad[2].CipherAlgo) // changed
+	suite.Equal(newing, vrf.sad[2].inStat)                                // not changed
+	suite.Equal(ipsec.CipherAlgoTypeAes128Cbc, vrf.sad[2].CipherAlgoType) // changed
 	selector.SPI = 3
 	suite.NoError(mgr.UpdateSA(selector, sav))
-	suite.Equal(valid, vrf.sad[3].inStat)                          // not changed
-	suite.Equal(ipsec.CipherAlgoTypeAesCbc, vrf.sad[3].CipherAlgo) // changed
+	suite.Equal(valid, vrf.sad[3].inStat)                                 // not changed
+	suite.Equal(ipsec.CipherAlgoTypeAes128Cbc, vrf.sad[3].CipherAlgoType) // changed
 	selector.SPI = 4
 	suite.NoError(mgr.UpdateSA(selector, sav))
-	suite.Equal(updating, vrf.sad[4].inStat)                       // not changed
-	suite.Equal(ipsec.CipherAlgoTypeAesCbc, vrf.sad[4].CipherAlgo) // changed
+	suite.Equal(updating, vrf.sad[4].inStat)                              // not changed
+	suite.Equal(ipsec.CipherAlgoTypeAes128Cbc, vrf.sad[4].CipherAlgoType) // changed
 	selector.SPI = 5
 	suite.NoError(mgr.UpdateSA(selector, sav))
-	suite.Equal(softExpired, vrf.sad[5].inStat)                    // not changed
-	suite.Equal(ipsec.CipherAlgoTypeAesCbc, vrf.sad[5].CipherAlgo) // changed
+	suite.Equal(softExpired, vrf.sad[5].inStat)                           // not changed
+	suite.Equal(ipsec.CipherAlgoTypeAes128Cbc, vrf.sad[5].CipherAlgoType) // changed
 	selector.SPI = 6
 	suite.NoError(mgr.UpdateSA(selector, sav))
-	suite.Equal(hardExpired, vrf.sad[6].inStat)                    // not changed
-	suite.Equal(ipsec.CipherAlgoTypeAesCbc, vrf.sad[6].CipherAlgo) // changed
+	suite.Equal(hardExpired, vrf.sad[6].inStat)                           // not changed
+	suite.Equal(ipsec.CipherAlgoTypeAes128Cbc, vrf.sad[6].CipherAlgoType) // changed
 	// update 7 (error. already marked as 'deleting')
 	selector.SPI = 7
 	suite.Error(mgr.UpdateSA(selector, sav))
-	suite.Equal(deleting, vrf.sad[7].inStat)                     // not changed
-	suite.Equal(ipsec.CipherAlgoTypeNull, vrf.sad[7].CipherAlgo) // not changed
+	suite.Equal(deleting, vrf.sad[7].inStat)                         // not changed
+	suite.Equal(ipsec.CipherAlgoTypeNull, vrf.sad[7].CipherAlgoType) // not changed
 	suite.Len(vrf.sad, firstLen)
 
 	// update 10 (error. NotExists)
@@ -512,15 +512,15 @@ func (suite *sadMgrTestSuite) TestFindSAbyIP() {
 	remote := net.ParseIP("192.168.1.10")
 	sav10 := &SAValue{
 		CSAValue: ipsec.CSAValue{
-			LocalEPIP:  net.IPNet{IP: local},
-			RemoteEPIP: net.IPNet{IP: remote},
+			LocalEPIP:  local,
+			RemoteEPIP: remote,
 		},
 		LifeTimeCurrent: time.Unix(10000, 0),
 	}
 	sav11 := &SAValue{
 		CSAValue: ipsec.CSAValue{
-			LocalEPIP:  net.IPNet{IP: local},
-			RemoteEPIP: net.IPNet{IP: remote},
+			LocalEPIP:  local,
+			RemoteEPIP: remote,
 		},
 		LifeTimeCurrent: time.Unix(20000, 0),
 	}
@@ -558,8 +558,8 @@ func (suite *sadMgrTestSuite) TestFindSAbyIP() {
 	// ip6
 	sav20 := &SAValue{
 		CSAValue: ipsec.CSAValue{
-			LocalEPIP:  net.IPNet{IP: net.ParseIP("fe80::1")},
-			RemoteEPIP: net.IPNet{IP: net.ParseIP("fe80::2")},
+			LocalEPIP:  net.ParseIP("fe80::1"),
+			RemoteEPIP: net.ParseIP("fe80::2"),
 		},
 	}
 	selector.SPI = 20

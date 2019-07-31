@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -31,72 +31,78 @@ import (
 type VswMatch int
 
 const (
-	MATCH_NONE          VswMatch = iota // No rule
-	MATCH_ANY                           // Default destination (arg: none)
-	MATCH_IN_VIF                        // Incoming VIF matched (arg: *VIF)
-	MATCH_OUT_VIF                       // Outgoing VIF matched (arg: *VIF)
-	MATCH_ETH_DST                       // Destination MAC address matched (arg: net.HardwareAddr)
-	MATCH_ETH_DST_SELF                  // Packet heading to the router itself (arg: none)
-	MATCH_ETH_DST_MC                    // Multicast (arg: none)
-	MATCH_ETH_DST_BC                    // Broadcast (arg: none)
-	MATCH_ETH_SRC                       // Source MAC address matched (arg: net.HardwareAddr)
-	MATCH_ETH_TYPE_IPV4                 // IPv4 packet type (arg: none)
-	MATCH_ETH_TYPE_IPV6                 // IPv6 packet type (arg: none)
-	MATCH_ETH_TYPE_ARP                  // ARP packet type (arg: none)
-	MATCH_ETH_TYPE                      // Ether packet type matched (arg: dpdk.EtherType)
-	MATCH_VLAN_ID                       // VLAN ID matched (arg: VID)
-	MATCH_IPV4_PROTO                    // IPv4 protocol type matched (arg: IPProto)
-	MATCH_IPV4_SRC                      // Source IPv4 address matched (arg: net.IP)
-	MATCH_IPV4_SRC_NET                  // Source IPv4 network address matched (arg: IPAddr)
-	MATCH_IPV4_DST                      // Destination IPv4 address matched (arg: net.IP)
-	MATCH_IPV4_DST_NET                  // Destination IPv4 network address matched (arg: IPAddr)
-	MATCH_IPV4_DST_SELF                 // IPv4 packet sent to the router itself (none)
+	MatchNone        VswMatch = iota // No rule
+	MatchAny                         // Default destination (arg: none)
+	MatchInVIF                       // Incoming VIF matched (arg: *VIF)
+	MatchOutVIF                      // Outgoing VIF matched (arg: *VIF)
+	MatchEthDst                      // Destination MAC address matched (arg: net.HardwareAddr)
+	MatchEthDstSelf                  // Packet heading to the router itself (arg: none)
+	MatchEthDstMC                    // Multicast (arg: none)
+	MatchEthDstBC                    // Broadcast (arg: none)
+	MatchEthSrc                      // Source MAC address matched (arg: net.HardwareAddr)
+	MatchEthTypeIPv4                 // IPv4 packet type (arg: none)
+	MatchEthTypeIPv6                 // IPv6 packet type (arg: none)
+	MatchEthTypeARP                  // ARP packet type (arg: none)
+	MatchEthType                     // Ether packet type matched (arg: dpdk.EtherType)
+	MatchVID                         // VLAN ID matched (arg: VID)
+	MatchIPv4Proto                   // IPv4 protocol type matched (arg: IPProto)
+	MatchIPv4Src                     // Source IPv4 address matched (arg: net.IP)
+	MatchIPv4SrcNet                  // Source IPv4 network address matched (arg: IPAddr)
+	MatchIPv4Dst                     // Destination IPv4 address matched (arg: net.IP)
+	MatchIPv4DstNet                  // Destination IPv4 network address matched (arg: IPAddr)
+	MatchIPv4DstSelf                 // IPv4 packet sent to the router itself (none)
+	Match5Tuple                      // 5-Tuple (arg: *FiveTuple)
+	MatchVxLAN                       // VxLAN (arg: *VxLAN)
 )
 
 var vswMatchStrings = map[VswMatch]string{
-	MATCH_ANY:           "MATCH_ANY",
-	MATCH_IN_VIF:        "MATCH_IN_VIF",
-	MATCH_OUT_VIF:       "MATCH_OUT_VIF",
-	MATCH_ETH_DST:       "MATCH_ETH_DST",
-	MATCH_ETH_DST_SELF:  "MATCH_ETH_DST_SELF",
-	MATCH_ETH_DST_MC:    "MATCH_ETH_DST_MC",
-	MATCH_ETH_DST_BC:    "MATCH_ETH_DST_BC",
-	MATCH_ETH_SRC:       "MATCH_ETH_SRC",
-	MATCH_ETH_TYPE_IPV4: "MATCH_ETH_TYPE_IPV4",
-	MATCH_ETH_TYPE_IPV6: "MATCH_ETH_TYPE_IPV6",
-	MATCH_ETH_TYPE_ARP:  "MATCH_ETH_TYPE_ARP",
-	MATCH_ETH_TYPE:      "MATCH_ETH_TYPE",
-	MATCH_VLAN_ID:       "MATCH_VLAN_ID",
-	MATCH_IPV4_PROTO:    "MATCH_IPV4_PROTO",
-	MATCH_IPV4_SRC:      "MATCH_IPV4_SRC",
-	MATCH_IPV4_SRC_NET:  "MATCH_IPV4_SRC_NET",
-	MATCH_IPV4_DST:      "MATCH_IPV4_DST",
-	MATCH_IPV4_DST_NET:  "MATCH_IPV4_DST_NET",
-	MATCH_IPV4_DST_SELF: "MATCH_IPV4_DST_SELF",
+	MatchAny:         "MatchAny",
+	MatchInVIF:       "MatchInVIF",
+	MatchOutVIF:      "MatchOutVIF",
+	MatchEthDst:      "MatchEthDst",
+	MatchEthDstSelf:  "MatchEthDstSelf",
+	MatchEthDstMC:    "MatchEthDstMC",
+	MatchEthDstBC:    "MatchEthDstBC",
+	MatchEthSrc:      "MatchEthSrc",
+	MatchEthTypeIPv4: "MatchEthTypeIPv4",
+	MatchEthTypeIPv6: "MatchEthTypeIPv6",
+	MatchEthTypeARP:  "MatchEthTypeARP",
+	MatchEthType:     "MatchEthType",
+	MatchVID:         "MatchVID",
+	MatchIPv4Proto:   "MatchIPv4Proto",
+	MatchIPv4Src:     "MatchIPv4Src",
+	MatchIPv4SrcNet:  "MatchIPv4SrcNet",
+	MatchIPv4Dst:     "MatchIPv4Dst",
+	MatchIPv4DstNet:  "MatchIPv4DstNet",
+	MatchIPv4DstSelf: "MatchIPv4DstSelf",
+	Match5Tuple:      "Match5Tuple",
+	MatchVxLAN:       "MatchVxLAN",
 }
 
 func (vm VswMatch) String() string { return vswMatchStrings[vm] }
 
 var paramTypes = map[VswMatch]reflect.Type{
-	MATCH_ANY:           nil,
-	MATCH_IN_VIF:        reflect.TypeOf((*VIF)(nil)),
-	MATCH_OUT_VIF:       reflect.TypeOf((*VIF)(nil)),
-	MATCH_ETH_DST:       reflect.TypeOf((*net.HardwareAddr)(nil)),
-	MATCH_ETH_DST_SELF:  nil,
-	MATCH_ETH_DST_MC:    nil,
-	MATCH_ETH_DST_BC:    nil,
-	MATCH_ETH_SRC:       reflect.TypeOf((*net.HardwareAddr)(nil)),
-	MATCH_ETH_TYPE_IPV4: nil,
-	MATCH_ETH_TYPE_IPV6: nil,
-	MATCH_ETH_TYPE_ARP:  nil,
-	MATCH_ETH_TYPE:      reflect.TypeOf(dpdk.EtherType(0)),
-	MATCH_VLAN_ID:       reflect.TypeOf(VID(0)),
-	MATCH_IPV4_PROTO:    reflect.TypeOf(IPProto(0)),
-	MATCH_IPV4_SRC:      reflect.TypeOf((*net.IP)(nil)),
-	MATCH_IPV4_SRC_NET:  reflect.TypeOf((*IPAddr)(nil)),
-	MATCH_IPV4_DST:      reflect.TypeOf((*net.IP)(nil)),
-	MATCH_IPV4_DST_NET:  reflect.TypeOf((*IPAddr)(nil)),
-	MATCH_IPV4_DST_SELF: nil,
+	MatchAny:         nil,
+	MatchInVIF:       reflect.TypeOf((*VIF)(nil)),
+	MatchOutVIF:      reflect.TypeOf((*VIF)(nil)),
+	MatchEthDst:      reflect.TypeOf((*net.HardwareAddr)(nil)),
+	MatchEthDstSelf:  nil,
+	MatchEthDstMC:    nil,
+	MatchEthDstBC:    nil,
+	MatchEthSrc:      reflect.TypeOf((*net.HardwareAddr)(nil)),
+	MatchEthTypeIPv4: nil,
+	MatchEthTypeIPv6: nil,
+	MatchEthTypeARP:  nil,
+	MatchEthType:     reflect.TypeOf(dpdk.EtherType(0)),
+	MatchVID:         reflect.TypeOf(VID(0)),
+	MatchIPv4Proto:   reflect.TypeOf(IPProto(0)),
+	MatchIPv4Src:     reflect.TypeOf((*net.IP)(nil)),
+	MatchIPv4SrcNet:  reflect.TypeOf((*IPAddr)(nil)),
+	MatchIPv4Dst:     reflect.TypeOf((*net.IP)(nil)),
+	MatchIPv4DstNet:  reflect.TypeOf((*IPAddr)(nil)),
+	MatchIPv4DstSelf: nil,
+	Match5Tuple:      reflect.TypeOf((*FiveTuple)(nil)),
+	MatchVxLAN:       reflect.TypeOf((*VxLAN)(nil)),
 }
 
 const ruleNotificationBuffer = 10
@@ -113,6 +119,20 @@ type Rules struct {
 	rules map[VswMatch]([]Rule)
 	noti  *notifier.Notifier
 	once  sync.Once
+	rn    RulesNotify
+}
+
+// RulesNotify needs to be implemented if the entity wants to receive
+// notifiication upon changes in the Rules.
+//
+// Calls to these methods are synchronous.
+//
+// It is highly recommeneded that callee apply rules immediately.
+// Rules should become effective before returning from these
+// methods.
+type RulesNotify interface {
+	RuleAdded(Rule)
+	RuleDeleted(Rule)
 }
 
 // ByMatch implements sort.Interface for []Rule based on the Match field.
@@ -124,6 +144,10 @@ func (m ByMatch) Less(i, j int) bool { return m[i].Match < m[j].Match }
 
 func newRules() *Rules {
 	return &Rules{rules: make(map[VswMatch]([]Rule))}
+}
+
+func (r *Rules) setRulesNotify(rn RulesNotify) {
+	r.rn = rn
 }
 
 // Notifier returns notifier for the rule set.
@@ -151,6 +175,14 @@ func (r *Rules) notify(op notifier.Type, rule Rule) {
 	if r.noti != nil {
 		r.noti.Notify(op, r, rule)
 	}
+
+	if r.rn != nil {
+		if op == notifier.Add {
+			r.rn.RuleAdded(rule)
+		} else if op == notifier.Delete {
+			r.rn.RuleDeleted(rule)
+		}
+	}
 }
 
 func (r *Rules) add(match VswMatch, param interface{}, ring *dpdk.Ring) error {
@@ -172,6 +204,7 @@ func (r *Rules) add(match VswMatch, param interface{}, ring *dpdk.Ring) error {
 	rule.Ring = ring
 
 	if t == nil {
+		// FIXME: We must remove the old Rule if there's one already.
 		r.rules[match] = make([]Rule, 1, 1)
 		r.rules[match][0] = rule
 	} else {

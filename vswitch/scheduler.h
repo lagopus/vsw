@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef LAGOPUS_SCHEDULER_H_
-#define LAGOPUS_SCHEDULER_H_
+#ifndef VSW_SCHEDULER_H_
+#define VSW_SCHEDULER_H_
 
 #include "runtime.h"
 
@@ -51,8 +51,8 @@ struct sched_request {
 	uint64_t seqno;		// Unique command sequence #
 	int rid;		// Unique Runtime ID
 	char *name;		// Human readable name of the runtime (used when adding)
-	struct lagopus_runtime_ops *ops;
-	struct lagopus_instance *ins;
+	struct vsw_runtime_ops *ops;
+	struct vsw_instance *ins;
 	void *param;
 	bool enabled;
 };
@@ -71,4 +71,4 @@ struct sched_result {
 // Scheduler main routine
 extern int sched_main(void *arg);
 
-#endif /* LAGOPUS_SCHEDULER_H_ */
+#endif /* VSW_SCHEDULER_H_ */

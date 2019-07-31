@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -154,6 +154,7 @@ const (
 	IPSEC_REPLAYWSIZE          = 32
 )
 
+// SadbMsgTypes Type of SAD msg.
 var SadbMsgTypes = [...]string{
 	0:  "SADB_RESERVED",
 	1:  "SADB_GETSPI",

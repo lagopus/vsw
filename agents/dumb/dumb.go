@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,21 +16,29 @@
 
 package dumb
 
-import "github.com/lagopus/vsw/vswitch"
+import (
+	"github.com/lagopus/vsw/vswitch"
+	"github.com/lagopus/vsw/vswitch/log"
+)
 
-var log = vswitch.Logger
+var logger = vswitch.Logger
 
 type dumb struct{}
 
 const name = "dumb"
 
-func (d *dumb) Start() bool {
-	log.Println("Start dumb agent.")
-	return true
+func (d *dumb) Init() error {
+	logger.Info("Init dumb agent.")
+	return nil
 }
 
-func (d *dumb) Stop() {
-	log.Println("Stops dumb agent.")
+func (d *dumb) Enable() error {
+	logger.Info("Start dumb agent.")
+	return nil
+}
+
+func (d *dumb) Disable() {
+	logger.Info("Stops dumb agent.")
 }
 
 func (d *dumb) String() string {
@@ -38,5 +46,11 @@ func (d *dumb) String() string {
 }
 
 func init() {
+	if l, err := log.New(name); err == nil {
+		logger = l
+	} else {
+		logger.Fatalf("Can't create logger for %s: %v", err, name)
+	}
+
 	vswitch.RegisterAgent(&dumb{})
 }

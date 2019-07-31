@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,12 +17,16 @@
 package testvif
 
 import (
-	"bytes"
 	"errors"
 	"net"
 
 	"github.com/lagopus/vsw/dpdk"
 	"github.com/lagopus/vsw/vswitch"
+	vlog "github.com/lagopus/vsw/vswitch/log"
+)
+
+const (
+	moduleName = "testvif"
 )
 
 var log = vswitch.Logger
@@ -189,7 +193,6 @@ func (tv *TestVIF) Enable() error {
 		}
 
 		index := tv.vif.Index()
-		mac := tv.vif.MACAddress()
 		vid := uint16(tv.vif.VID())
 
 		for tv.running {
@@ -199,10 +202,6 @@ func (tv *TestVIF) Enable() error {
 				md := (*vswitch.Metadata)(mbuf.Metadata())
 				md.SetInVIF(index)
 				md.SetOutVIF(0)
-
-				if bytes.Compare(mac, mbuf.EtherHdr().DstAddr()) == 0 {
-					md.SetSelf(true)
-				}
 
 				if oring.EnqueueMbuf(mbuf) == 0 {
 					tv.testif.stats.RxCount++
@@ -242,6 +241,12 @@ func (tv *TestVIF) Disable() {
  * Do module registration here.
  */
 func init() {
+	if l, err := vlog.New(moduleName); err == nil {
+		log = l
+	} else {
+		log.Fatalf("Can't create logger: %s", moduleName)
+	}
+
 	rp := &vswitch.RingParam{
 		Count:          QueueLength,
 		SocketId:       dpdk.SOCKET_ID_ANY,

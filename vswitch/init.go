@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,19 @@
 
 package vswitch
 
+import (
+	"fmt"
+
+	"github.com/lagopus/vsw/vswitch/log"
+)
+
+type loggerConfig struct {
+	Logging log.LogConfig
+}
+
+var logger *log.Logger
+var Logger = log.DefaultLogger() // for backward compatibility
+
 // Init initializes vswitch core. Init shall be called
 // before instantiating VRF, VSI, or Interfaces.
 // Only EnableLog maybe called before Init.
@@ -25,10 +38,40 @@ func Init(configPath string) error {
 	if err := GetConfig().setPath(configPath); err != nil {
 		return err
 	}
-	return initDpdk()
+
+	// Enable log after setting config path.
+	logConfig := loggerConfig{log.DefaultLogConfig}
+
+	if _, err := GetConfig().Decode(&logConfig); err != nil {
+		return fmt.Errorf("Can't parse [logging]: %v", err)
+	}
+
+	if err := log.Init(&logConfig.Logging); err != nil {
+		return err
+	}
+
+	// Open logger for the core
+	l, err := log.New("core")
+	if err != nil {
+		return fmt.Errorf("Can't get logger for core: %v", err)
+	}
+	logger = l
+
+	// Initialize DPDK first
+	if err := initDpdk(); err != nil {
+		return err
+	}
+
+	// Initialize agents
+	initAgents()
+
+	// Enable agents
+	return enableAgents()
 }
 
 // Deinit cleans all held resource up.
 func Deinit() {
+	disableAgents()
+
 	// TODO: implement deinit to ensure resources are all freed.
 }

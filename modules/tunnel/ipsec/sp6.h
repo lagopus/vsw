@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2018-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -98,15 +98,15 @@ sp6_set_lifetime_current(void *spd,
                          lagopus_chrono_t now);
 
 lagopus_result_t
-sp6_get_stat(struct spd6 *spd6,
-             struct spd_stat *stat,
-             uint32_t spi);
+sp6_get_stats(struct spd6 *spd6,
+              struct spd_stats *stats,
+              uint32_t spi);
 
 lagopus_result_t
-sp6_get_stats(struct spd6 *spd6,
-              struct spd_stat **stats);
+sp6_get_stats_array(struct spd6 *spd6,
+                    struct spd_stats **stats);
 
-void
+lagopus_result_t
 sp6_initialize(struct spd6 **spd6,
                uint32_t socket_id);
 

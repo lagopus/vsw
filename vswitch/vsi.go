@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Nippon Telegraph and Telephone Corporation.
+// Copyright 2018-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,8 +32,17 @@ type VSI struct {
 	macLearning  bool
 }
 
-var vsi = make(map[string]*VSI)
-var vsiMutex sync.Mutex
+type MACEntry struct {
+	VID VID
+	BridgeMACEntry
+}
+
+type vsiManager struct {
+	vsi   map[string]*VSI
+	mutex sync.Mutex
+}
+
+var vsiMgr = &vsiManager{vsi: make(map[string]*VSI)}
 
 const (
 	DefaultMACAgingTime       = 300     // Default MAC aging time
@@ -47,10 +56,10 @@ const (
 
 // NewVSI creates a new VSI.
 func NewVSI(name string) (*VSI, error) {
-	vsiMutex.Lock()
-	defer vsiMutex.Unlock()
+	vsiMgr.mutex.Lock()
+	defer vsiMgr.mutex.Unlock()
 
-	if _, exists := vsi[name]; exists {
+	if _, exists := vsiMgr.vsi[name]; exists {
 		return nil, fmt.Errorf("VSI %v already exists", name)
 	}
 
@@ -63,6 +72,8 @@ func NewVSI(name string) (*VSI, error) {
 		maxEntries:   DefaultMaxEntries,
 		macLearning:  DefaultMACLearningEnabled,
 	}
+
+	vsiMgr.vsi[name] = vsi
 
 	return vsi, nil
 }
@@ -85,9 +96,9 @@ func NewMAT(name string) (*VSI, error) {
 }
 
 func (v *VSI) Free() {
-	vsiMutex.Lock()
-	delete(vsi, v.name)
-	vsiMutex.Unlock()
+	vsiMgr.mutex.Lock()
+	delete(vsiMgr.vsi, v.name)
+	vsiMgr.mutex.Unlock()
 
 	for _, b := range v.bridges {
 		b.free()
@@ -97,6 +108,10 @@ func (v *VSI) Free() {
 		v.mat.free()
 		v.mat = nil
 	}
+}
+
+func (v *VSI) String() string {
+	return v.name
 }
 
 func (v *VSI) IsEnabled() bool {
@@ -138,24 +153,13 @@ func (v *VSI) Disable() {
 	return
 }
 
-func (v *VSI) VID() []VID {
-	vids := make([]VID, len(v.active))
-	n := 0
-	for vid, _ := range v.active {
-		vids[n] = vid
-		n++
-	}
-	return vids
-}
-
-func (v *VSI) ActiveVID() []VID {
-	vids := make([]VID, len(v.active))
-	n := 0
-	for vid, state := range v.active {
-		if state {
-			vids[n] = vid
-			n++
-		}
+// VID returns all VID associated with the VSI.
+// The returned value is a map with the VID as a key.
+// The value is a bool representing whether the VID is active.
+func (v *VSI) VID() map[VID]bool {
+	vids := make(map[VID]bool)
+	for k, v := range v.active {
+		vids[k] = v
 	}
 	return vids
 }
@@ -230,6 +234,9 @@ func (v *VSI) AddVIF(vif *VIF) error {
 	if !ok {
 		return fmt.Errorf("VID %d not registered.", vif.vid)
 	}
+	if err := vif.setVSI(v); err != nil {
+		return err
+	}
 	return b.addVIF(vif)
 }
 
@@ -239,6 +246,7 @@ func (v *VSI) DeleteVIF(vif *VIF) error {
 	if !ok {
 		return fmt.Errorf("VID %d not registered.", vif.vid)
 	}
+	vif.setVSI(nil)
 	return b.deleteVIF(vif)
 }
 
@@ -248,6 +256,15 @@ func (v *VSI) VIF() []*VIF {
 		vifs = append(vifs, b.vif()...)
 	}
 	return vifs
+}
+
+func (v *VSI) UpdateMTU(vif *VIF) error {
+	b, ok := v.bridges[vif.vid]
+	if !ok {
+		return fmt.Errorf("VID %d not registered.", vif.vid)
+	}
+	b.updateMTU()
+	return nil
 }
 
 func (v *VSI) MACAgingTime() int {
@@ -296,4 +313,36 @@ func (v *VSI) DisableMACLearning() {
 	for _, b := range v.bridges {
 		b.disableMACLearning()
 	}
+}
+
+func (v *VSI) MACTable() []MACEntry {
+	var macTable []MACEntry
+	for _, b := range v.bridges {
+		for _, e := range b.macTable() {
+			entry := MACEntry{
+				VID:            b.vid,
+				BridgeMACEntry: e,
+			}
+			macTable = append(macTable, entry)
+		}
+	}
+	return macTable
+}
+
+func VSIs() []*VSI {
+	vsiMgr.mutex.Lock()
+	defer vsiMgr.mutex.Unlock()
+
+	var vsi []*VSI
+	for _, v := range vsiMgr.vsi {
+		vsi = append(vsi, v)
+	}
+	return vsi
+}
+
+func GetVSI(name string) *VSI {
+	vsiMgr.mutex.Lock()
+	defer vsiMgr.mutex.Unlock()
+
+	return vsiMgr.vsi[name]
 }

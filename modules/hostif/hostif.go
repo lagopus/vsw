@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,8 +30,13 @@ import (
 	"github.com/lagopus/vsw/vswitch"
 
 	pb "github.com/lagopus/vsw/modules/hostif/packets_io"
+	vlog "github.com/lagopus/vsw/vswitch/log"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
+)
+
+const (
+	moduleName = "hostif"
 )
 
 var log = vswitch.Logger
@@ -156,6 +161,12 @@ func (him *HostifModule) Disable() {
  * Do module registration here.
  */
 func init() {
+	if l, err := vlog.New(moduleName); err == nil {
+		log = l
+	} else {
+		log.Fatalf("Can't create logger: %s", moduleName)
+	}
+
 	rp := &vswitch.RingParam{
 		Count:    C.MAX_HOSTIF_MBUFS,
 		SocketId: dpdk.SOCKET_ID_ANY,

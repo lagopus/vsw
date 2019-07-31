@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -77,7 +77,7 @@ func (p *RootParser) scanFile(file *os.File) error {
 			continue
 		}
 
-		if ts := strings.Fields(tokens); len(tokens) != 0 {
+		if ts := strings.Fields(tokens); len(ts) != 0 {
 			rootToken := ts[0]
 			if p, ok := p.parsers[rootToken]; ok {
 				// Call Parse func.

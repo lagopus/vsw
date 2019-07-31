@@ -1,3 +1,19 @@
+/*
+ * Copyright 2019 Nippon Telegraph and Telephone Corporation.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*-
  *   BSD LICENSE
  *
@@ -137,7 +153,7 @@ struct spd6_attr {
 
 struct spd6 {
   struct spd6_attr *db[2];
-  struct spd_stat stats[IPSEC_SP_MAX_ENTRIES];
+  struct spd_stats stats[IPSEC_SP_MAX_ENTRIES];
   rte_atomic64_t seq;
   uint64_t current;
 };
@@ -170,7 +186,7 @@ spd6_alloc_spd_attr(uint32_t socketid,
     *attr = (struct spd6_attr *) calloc(1, sizeof(struct spd6_attr));
     if (*attr == NULL) {
       ret = LAGOPUS_RESULT_NO_MEMORY;
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
       goto done;
     }
 
@@ -180,7 +196,7 @@ spd6_alloc_spd_attr(uint32_t socketid,
     (*attr)->in = spd6_alloc_acl_ctx(name, socketid);
     if ((*attr)->in == NULL) {
       ret = LAGOPUS_RESULT_NO_MEMORY;
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
       goto done;
     }
 
@@ -188,13 +204,13 @@ spd6_alloc_spd_attr(uint32_t socketid,
     (*attr)->out = spd6_alloc_acl_ctx(name, socketid);
     if ((*attr)->out == NULL) {
       ret = LAGOPUS_RESULT_NO_MEMORY;
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
       goto done;
     }
     ret = LAGOPUS_RESULT_OK;
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
 done:
@@ -235,7 +251,7 @@ spd6_alloc(struct spd6 **spd6, uint32_t socketid) {
     *spd6 = (struct spd6 *) calloc(1, sizeof(struct spd6));
     if (*spd6 == NULL) {
       ret = LAGOPUS_RESULT_NO_MEMORY;
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
       goto done;
     }
 
@@ -243,18 +259,18 @@ spd6_alloc(struct spd6 **spd6, uint32_t socketid) {
 
     if ((ret = spd6_alloc_spd_attr(socketid, &SPD_MODIFIED(*spd6))) !=
         LAGOPUS_RESULT_OK) {
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
       goto done;
     }
 
     if ((ret = spd6_alloc_spd_attr(socketid, &SPD_CURRENT(*spd6))) !=
         LAGOPUS_RESULT_OK) {
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
       goto done;
     }
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
 done:
@@ -287,7 +303,7 @@ spd6_pre_process(struct spd6 *spd6) {
     ret = LAGOPUS_RESULT_OK;
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
@@ -303,7 +319,7 @@ spd6_post_process(struct spd6 *spd6) {
     ret = LAGOPUS_RESULT_OK;
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
@@ -339,44 +355,43 @@ print_one_ip6_rule(int32_t i,
   uint32_t_to_char(rule->field[DST3_FIELD_IPV6].value.u32,
                    &a8, &b8, &c8, &d8);
 
-  lagopus_msg_debug(1,
-                    "%d:"
-                    "%.2x%.2x:%.2x%.2x"
-                    ":%.2x%.2x:%.2x%.2x"
-                    ":%.2x%.2x:%.2x%.2x"
-                    ":%.2x%.2x:%.2x%.2x/%u "
-                    "%.2x%.2x:%.2x%.2x"
-                    ":%.2x%.2x:%.2x%.2x"
-                    ":%.2x%.2x:%.2x%.2x"
-                    ":%.2x%.2x:%.2x%.2x/%u "
-                    "%hu : %hu %hu : %hu 0x%hhx/0x%hhx "
-                    "0x%x-0x%x-0x%x\n",
-                    i,
-                    a1, b1, c1, d1,
-                    a2, b2, c2, d2,
-                    a3, b3, c3, d3,
-                    a4, b4, c4, d4,
-                    rule->field[SRC0_FIELD_IPV6].mask_range.u32
-                    + rule->field[SRC1_FIELD_IPV6].mask_range.u32
-                    + rule->field[SRC2_FIELD_IPV6].mask_range.u32
-                    + rule->field[SRC3_FIELD_IPV6].mask_range.u32,
-                    a5, b5, c5, d5,
-                    a6, b6, c6, d6,
-                    a7, b7, c7, d7,
-                    a8, b8, c8, d8,
-                    rule->field[DST0_FIELD_IPV6].mask_range.u32
-                    + rule->field[DST1_FIELD_IPV6].mask_range.u32
-                    + rule->field[DST2_FIELD_IPV6].mask_range.u32
-                    + rule->field[DST3_FIELD_IPV6].mask_range.u32,
-                    rule->field[SRCP_FIELD_IPV6].value.u16,
-                    rule->field[SRCP_FIELD_IPV6].mask_range.u16,
-                    rule->field[DSTP_FIELD_IPV6].value.u16,
-                    rule->field[DSTP_FIELD_IPV6].mask_range.u16,
-                    rule->field[PROTO_FIELD_IPV6].value.u8,
-                    rule->field[PROTO_FIELD_IPV6].mask_range.u8,
-                    rule->data.category_mask,
-                    rule->data.priority,
-                    rule->data.userdata);
+  TUNNEL_DEBUG("%d:"
+               "%.2x%.2x:%.2x%.2x"
+               ":%.2x%.2x:%.2x%.2x"
+               ":%.2x%.2x:%.2x%.2x"
+               ":%.2x%.2x:%.2x%.2x/%u "
+               "%.2x%.2x:%.2x%.2x"
+               ":%.2x%.2x:%.2x%.2x"
+               ":%.2x%.2x:%.2x%.2x"
+               ":%.2x%.2x:%.2x%.2x/%u "
+               "%hu : %hu %hu : %hu 0x%hhx/0x%hhx "
+               "0x%x-0x%x-0x%x",
+               i,
+               a1, b1, c1, d1,
+               a2, b2, c2, d2,
+               a3, b3, c3, d3,
+               a4, b4, c4, d4,
+               rule->field[SRC0_FIELD_IPV6].mask_range.u32
+               + rule->field[SRC1_FIELD_IPV6].mask_range.u32
+               + rule->field[SRC2_FIELD_IPV6].mask_range.u32
+               + rule->field[SRC3_FIELD_IPV6].mask_range.u32,
+               a5, b5, c5, d5,
+               a6, b6, c6, d6,
+               a7, b7, c7, d7,
+               a8, b8, c8, d8,
+               rule->field[DST0_FIELD_IPV6].mask_range.u32
+               + rule->field[DST1_FIELD_IPV6].mask_range.u32
+               + rule->field[DST2_FIELD_IPV6].mask_range.u32
+               + rule->field[DST3_FIELD_IPV6].mask_range.u32,
+               rule->field[SRCP_FIELD_IPV6].value.u16,
+               rule->field[SRCP_FIELD_IPV6].mask_range.u16,
+               rule->field[DSTP_FIELD_IPV6].value.u16,
+               rule->field[DSTP_FIELD_IPV6].mask_range.u16,
+               rule->field[PROTO_FIELD_IPV6].value.u8,
+               rule->field[PROTO_FIELD_IPV6].mask_range.u8,
+               rule->data.category_mask,
+               rule->data.priority,
+               rule->data.userdata);
 }
 
 static inline void
@@ -385,7 +400,7 @@ spd6_dump_rules(const struct acl6_rules *rule,
   int32_t i;
 
   if (rule != NULL) {
-    lagopus_msg_debug(1, "dump ip6 rules :\n");
+    TUNNEL_DEBUG("dump ip6 rules :");
     for (i = 0; i < num; i++, rule++) {
       print_one_ip6_rule(i, rule);
     }
@@ -410,11 +425,11 @@ spd6_add_acl_rules(struct rte_acl_ctx *ctx, const struct acl6_rules *rules,
       } else {
         ret = LAGOPUS_RESULT_ANY_FAILURES;
       }
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
     }
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
@@ -442,14 +457,14 @@ spd6_build_acl(struct rte_acl_ctx *ctx) {
       } else {
         ret = LAGOPUS_RESULT_ANY_FAILURES;
       }
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
       goto done;
     }
 
     ret = LAGOPUS_RESULT_OK;
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
 done:
@@ -470,11 +485,11 @@ spd6_classify_spd(const struct rte_acl_ctx *ctx,
       ret = LAGOPUS_RESULT_OK;
     } else {
       ret = LAGOPUS_RESULT_INVALID_ARGS;
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
     }
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
@@ -520,7 +535,7 @@ sp6_set_rule(size_t index,
         break;
       default:
         ret = LAGOPUS_RESULT_INVALID_ARGS;
-        lagopus_perror(ret);
+        TUNNEL_PERROR(ret);
         goto done;
     }
 
@@ -613,7 +628,7 @@ sp6_set_rule(size_t index,
     ret = LAGOPUS_RESULT_OK;
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
 done:
@@ -636,7 +651,7 @@ sp6_pre_process(struct spd6 *spd6) {
     ret = spd6_pre_process(spd6);
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
@@ -650,7 +665,7 @@ sp6_post_process(struct spd6 *spd6) {
     ret = spd6_post_process(spd6);
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
@@ -685,14 +700,15 @@ sp6_make_spd(struct spd6 *spd6,
        */
       reserved_rules.data.userdata = RESERVED;
       reserved_rules.data.category_mask = 1;
+      reserved_rules.data.priority = RTE_ACL_MIN_PRIORITY;
       if ((ret = spd6_add_acl_rules(in, &reserved_rules, 1)) !=
           LAGOPUS_RESULT_OK) {
-        lagopus_perror(ret);
+        TUNNEL_PERROR(ret);
         goto done;
       }
       if ((ret = spd6_add_acl_rules(out, &reserved_rules, 1)) !=
           LAGOPUS_RESULT_OK) {
-        lagopus_perror(ret);
+        TUNNEL_PERROR(ret);
         goto done;
       }
 
@@ -704,14 +720,14 @@ sp6_make_spd(struct spd6 *spd6,
       if (in_rules != NULL && in_rules_nb != 0) {
         if ((ret = spd6_add_acl_rules(in, in_rules, in_rules_nb)) !=
             LAGOPUS_RESULT_OK) {
-          lagopus_perror(ret);
+          TUNNEL_PERROR(ret);
           goto done;
         }
       }
       if (out_rules != NULL && out_rules_nb != 0) {
         if ((ret = spd6_add_acl_rules(out, out_rules, out_rules_nb)) !=
             LAGOPUS_RESULT_OK) {
-          lagopus_perror(ret);
+          TUNNEL_PERROR(ret);
           goto done;
         }
       }
@@ -719,12 +735,12 @@ sp6_make_spd(struct spd6 *spd6,
       /* build ACL. */
       if ((ret = spd6_build_acl(in)) !=
           LAGOPUS_RESULT_OK) {
-        lagopus_perror(ret);
+        TUNNEL_PERROR(ret);
         goto done;
       }
       if ((ret = spd6_build_acl(out)) !=
           LAGOPUS_RESULT_OK) {
-        lagopus_perror(ret);
+        TUNNEL_PERROR(ret);
         goto done;
       }
 
@@ -734,14 +750,14 @@ sp6_make_spd(struct spd6 *spd6,
         /* dump rules (dynamic). */
         sp6_dump_rules(in_rules, (int32_t) in_rules_nb);
         /* dump acls. */
-        lagopus_msg_info("sp6 in(modified) :\n");
+        TUNNEL_INFO("sp6 in(modified) :");
         rte_acl_dump(in);
       }
       if (out_rules != NULL) {
         /* dump rules (dynamic). */
         sp6_dump_rules(out_rules, (int32_t) out_rules_nb);
         /* dump acls. */
-        lagopus_msg_info("sp6 out(modified) :\n");
+        TUNNEL_INFO("sp6 out(modified) :");
         rte_acl_dump(out);
       }
     } else {
@@ -749,7 +765,7 @@ sp6_make_spd(struct spd6 *spd6,
     }
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
 done:
@@ -764,18 +780,18 @@ sp6_classify_spd_in(void *spd,
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
   struct spd6 *spd6 = (struct spd6 *) spd;
 
-  lagopus_msg_debug(1, "call sp6_classify_spd_in.\n");
+  TUNNEL_DEBUG("call sp6_classify_spd_in.");
 
   if (likely(IS_VALID_SPD(spd6) == true && data != NULL && *data != NULL &&
              results != NULL && num != 0)) {
     if (unlikely((ret = spd6_classify_spd(
                           SPD_CURRENT(spd6)->in, data,
                           results, num)) != LAGOPUS_RESULT_OK)) {
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
     }
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
@@ -789,18 +805,18 @@ sp6_classify_spd_out(void *spd,
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
   struct spd6 *spd6 = (struct spd6 *) spd;
 
-  lagopus_msg_debug(1, "call sp6_classify_spd_out.\n");
+  TUNNEL_DEBUG("call sp6_classify_spd_out.");
 
   if (likely(IS_VALID_SPD(spd6) == true && data != NULL && *data != NULL &&
              results != NULL && num != 0)) {
     if (unlikely((ret = spd6_classify_spd(
                           SPD_CURRENT(spd6)->out, data,
                           results, num)) != LAGOPUS_RESULT_OK)) {
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
     }
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
@@ -820,24 +836,7 @@ sp6_set_lifetime_current(void *spd,
     ret = LAGOPUS_RESULT_OK;
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
-  }
-
-  return ret;
-}
-
-lagopus_result_t
-sp6_get_stat(struct spd6 *spd6,
-             struct spd_stat *stat,
-             uint32_t spi) {
-  lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
-
-  if (spd6->stats != NULL && stat != NULL) {
-    *stat = spd6->stats[SPI2IDX(spi)];
-    ret = LAGOPUS_RESULT_OK;
-  } else {
-    ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
@@ -845,7 +844,24 @@ sp6_get_stat(struct spd6 *spd6,
 
 lagopus_result_t
 sp6_get_stats(struct spd6 *spd6,
-              struct spd_stat **stats) {
+              struct spd_stats *stats,
+              uint32_t spi) {
+  lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
+
+  if (spd6->stats != NULL && stats != NULL) {
+    *stats = spd6->stats[SPI2IDX(spi)];
+    ret = LAGOPUS_RESULT_OK;
+  } else {
+    ret = LAGOPUS_RESULT_INVALID_ARGS;
+    TUNNEL_PERROR(ret);
+  }
+
+  return ret;
+}
+
+lagopus_result_t
+sp6_get_stats_array(struct spd6 *spd6,
+                    struct spd_stats **stats) {
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
 
   if (spd6->stats != NULL && stats != NULL) {
@@ -853,14 +869,14 @@ sp6_get_stats(struct spd6 *spd6,
     ret = LAGOPUS_RESULT_OK;
   } else {
     ret = LAGOPUS_RESULT_INVALID_ARGS;
-    lagopus_perror(ret);
+    TUNNEL_PERROR(ret);
   }
 
   return ret;
 }
 
 
-void
+lagopus_result_t
 sp6_initialize(struct spd6 **spd6,
                uint32_t socket_id) {
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
@@ -869,19 +885,21 @@ sp6_initialize(struct spd6 **spd6,
     rte_srand(rte_rdtsc());
 
     if ((ret = spd6_alloc(spd6, socket_id)) != LAGOPUS_RESULT_OK) {
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
       spd6_finalize(spd6);
-      rte_exit(EXIT_FAILURE, "Can't initialize SPD6.\n");
+      return ret;
     }
 
     /* add/build reserved rules. */
     if ((ret = sp6_make_spd(*spd6, NULL, 0, NULL, 0))
         != LAGOPUS_RESULT_OK) {
-      lagopus_perror(ret);
+      TUNNEL_PERROR(ret);
       spd6_finalize(spd6);
-      rte_exit(EXIT_FAILURE, "Can't add reserved rules.\n");
+      return ret;
     }
   }
+
+  return LAGOPUS_RESULT_OK;
 }
 
 void

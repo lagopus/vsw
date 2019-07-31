@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,7 +37,7 @@ ip_init_id(void) {
 uint16_t
 ip_generate_id(void) {
   uint16_t id = rte_atomic16_add_return(&ip_id, 1);
-  if (id == 0) {
+  if (unlikely(id == 0)) {
     /* 0 is reserved. */
     return ip_generate_id();
   }

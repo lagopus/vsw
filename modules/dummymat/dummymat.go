@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,6 +23,11 @@ import (
 	"github.com/lagopus/vsw/dpdk"
 	"github.com/lagopus/vsw/utils/notifier"
 	"github.com/lagopus/vsw/vswitch"
+	vlog "github.com/lagopus/vsw/vswitch/log"
+)
+
+const (
+	moduleName = "dummymat"
 )
 
 var log = vswitch.Logger
@@ -52,7 +57,7 @@ func newDummyMATInstance(base *vswitch.BaseInstance, p interface{}) (vswitch.Ins
 func (d *DummyMATInstance) listener() {
 	for n := range d.notiCh {
 		rule, ok := n.Value.(vswitch.Rule)
-		if !ok || rule.Match != vswitch.MATCH_VLAN_ID {
+		if !ok || rule.Match != vswitch.MatchVID {
 			log.Printf("%s: Unexpected rule: %v", d.base.Name(), rule)
 			continue
 		}
@@ -142,6 +147,12 @@ func (d *DummyMATInstance) Free() {
  * Do module registration here.
  */
 func init() {
+	if l, err := vlog.New(moduleName); err == nil {
+		log = l
+	} else {
+		log.Fatalf("Can't create logger: %s", moduleName)
+	}
+
 	if err := vswitch.RegisterModule("mat", newDummyMATInstance, nil, vswitch.TypeOther); err != nil {
 		log.Fatalf("Failed to register the class: %v", err)
 	}

@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -57,6 +57,7 @@ func (suite *testSPDTestSuite) TestAddDeleteSP() {
 	selector.RemotePortRangeEnd = 1
 	selector.UpperProtocol = ipsec.UpperProtocolType(syscall.IPPROTO_TCP)
 
+	// find.
 	spv, ok := mgr.FindSP(selector.Direction, selector)
 	suite.True(ok)
 	suite.NotEmpty(spv)
@@ -65,7 +66,42 @@ func (suite *testSPDTestSuite) TestAddDeleteSP() {
 	suite.True(ok)
 	suite.NotEmpty(spv)
 
-	// TODO: Update.
+	spi = uint32(2)
+	vSP.SPI = spi
+
+	// Update spi: OK.
+	UpdateSP(vrf, vSP)
+
+	// find.
+	spv, ok = mgr.FindSP(selector.Direction, selector)
+	suite.True(ok)
+	suite.NotEmpty(spv)
+	suite.Equal(spv.SPI, spi)
+
+	spv, ok = db[vSP.Name]
+	suite.True(ok)
+	suite.NotEmpty(spv)
+	suite.Equal(spv.SPI, spi)
+
+	vSP.SrcPort = 2
+	selector.LocalPortRangeStart = vSP.SrcPort
+	selector.LocalPortRangeEnd = vSP.SrcPort
+
+	// Update src port: OK.
+	UpdateSP(vrf, vSP)
+
+	// find.
+	spv, ok = mgr.FindSP(selector.Direction, selector)
+	suite.True(ok)
+	suite.NotEmpty(spv)
+	suite.Equal(spv.LocalPortRangeStart, vSP.SrcPort)
+	suite.Equal(spv.LocalPortRangeEnd, vSP.SrcPort)
+
+	spv, ok = db[vSP.Name]
+	suite.True(ok)
+	suite.NotEmpty(spv)
+	suite.Equal(spv.LocalPortRangeStart, vSP.SrcPort)
+	suite.Equal(spv.LocalPortRangeEnd, vSP.SrcPort)
 
 	// Delete: OK.
 	DeleteSP(vrf, vSP)
@@ -248,7 +284,7 @@ func (suite *testSPDTestSuite) TestUpperProtocol() {
 	spi := uint32(1)
 	protocols := map[vswitch.IPProto]ipsec.UpperProtocolType{
 		vswitch.IPP_TCP: syscall.IPPROTO_TCP,        // Protocol == TCP
-		0:               ipsec.UpperProtocolTypeAny, // Protocol == any
+		vswitch.IPP_ANY: ipsec.UpperProtocolTypeAny, // Protocol == any
 	}
 
 	for vProtocol, sProtocol := range protocols {

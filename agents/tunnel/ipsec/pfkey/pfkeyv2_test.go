@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -666,4 +666,54 @@ func (s *PFKeyv2TestSuit) TestToIPNetTosockaddr() {
 	ipnet := addr.ToIPNet(0)
 	sa := ToSockaddr(ipnet)
 	s.Assert().Equal(addr, sa)
+}
+
+func (s *PFKeyv2TestSuit) TestDeserializeSadbXNatTType() {
+	b := []byte{
+		0x02, 0x00, 0x00, 0x00,
+	}
+	r := bytes.NewReader(b)
+	smsg := SadbXNatTType{}
+	err := smsg.Deserialize(r)
+	s.Assert().NoError(err)
+
+	smsgOK := SadbXNatTType{2, [3]uint8{0, 0, 0}}
+	s.Assert().Equal(smsgOK, smsg)
+}
+
+func (s *PFKeyv2TestSuit) TestSerializeSadbXNatTType() {
+	smsg := SadbXNatTType{2, [3]uint8{0, 0, 0}}
+	buf := bytes.Buffer{}
+	err := smsg.Serialize(&buf)
+	s.Assert().NoError(err)
+
+	b := []byte{
+		0x02, 0x00, 0x00, 0x00,
+	}
+	s.Assert().Equal(b, buf.Bytes())
+}
+
+func (s *PFKeyv2TestSuit) TestDeserializeSadbXNatTPort() {
+	b := []byte{
+		0x11, 0x94, 0x00, 0x00,
+	}
+	r := bytes.NewReader(b)
+	smsg := SadbXNatTPort{}
+	err := smsg.Deserialize(r)
+	s.Assert().NoError(err)
+
+	smsgOK := SadbXNatTPort{4500, 0}
+	s.Assert().Equal(smsgOK, smsg)
+}
+
+func (s *PFKeyv2TestSuit) TestSerializeSadbXNatTPort() {
+	smsg := SadbXNatTPort{4500, 0}
+	buf := bytes.Buffer{}
+	err := smsg.Serialize(&buf)
+	s.Assert().NoError(err)
+
+	b := []byte{
+		0x11, 0x94, 0x00, 0x00,
+	}
+	s.Assert().Equal(b, buf.Bytes())
 }

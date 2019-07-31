@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -348,8 +348,8 @@ func TestMain(m *testing.M) {
 	dumb := vrf.NewModule("dumb", "dumb0")
 
 	// Connect Instances
-	testvif.Connect(dumb, vswitch.MATCH_ANY)
-	dumb.Connect(testvif, vswitch.MATCH_ANY)
+	testvif.Connect(dumb, vswitch.MatchAny)
+	dumb.Connect(testvif, vswitch.MatchAny)
 
 	// Get Channels
 	tx_chan, _ = testvif.Control("GET_TX_CHAN", nil).(chan *dpdk.Mbuf)

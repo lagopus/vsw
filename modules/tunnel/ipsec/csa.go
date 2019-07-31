@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -37,21 +37,23 @@ const (
 	IP4Tunnel SAFlag = C.IP4_TUNNEL
 	IP6Tunnel SAFlag = C.IP6_TUNNEL
 	Transport SAFlag = C.TRANSPORT
-
-	UnknownAlgorithm = C.UNKNOWN_ALGORITHM
 )
 
 // CSAValue Values in SAD.
 type CSAValue struct {
-	CipherAlgo CipherAlgoType // Cypher Algorithm Identifier
-	CipherKey  []byte         // Key for Encriptiton
-	AuthAlgo   AuthAlgoType   // Authentication Algorithm Identifier
-	AuthKey    []byte         // Key for Authentication
-	AeadAlgo   AeadAlgoType   // AEAD Algorithm Identifier
-	AeadKey    []byte         // Key for AEAD
-	LocalEPIP  net.IPNet      // Local Endpoint IP addr, mask
-	RemoteEPIP net.IPNet      // Remote Endpoint IP addr, mask
-	Flags      SAFlag         // flag
+	CipherAlgoType CipherAlgoType // Cypher Algorithm Identifier
+	CipherKey      []byte         // Key for Encriptiton
+	AuthAlgoType   AuthAlgoType   // Authentication Algorithm Identifier
+	AuthKey        []byte         // Key for Authentication
+	AeadAlgoType   AeadAlgoType   // AEAD Algorithm Identifier
+	AeadKey        []byte         // Key for AEAD
+	LocalEPIP      net.IP         // Local Endpoint IP addr
+	RemoteEPIP     net.IP         // Remote Endpoint IP addr
+	EncapType      EncapType      // Type of encap , For NAT-T
+	EncapProtocol  EncapProtoType // EncapProtocol(Not encap or UDP), For NAT-T
+	EncapSrcPort   uint16         // EncapSrcPort, For NAT-T
+	EncapDstPort   uint16         // EncapDstPort, For NAT-T
+	Flags          SAFlag         // flag
 }
 
 func ip2ipAddr(from net.IP) (to C.struct_ip_addr) {
@@ -89,20 +91,20 @@ func ipAddr2ipNet(ver int, from C.struct_ip_addr, mask []byte) (to net.IPNet) {
 func (sav *CSAValue) sav2saCipherAlgo(csa *C.struct_ipsec_sa) error {
 	var err error
 
-	if civ, exists := SupportedCipherAlgo[sav.CipherAlgo]; exists {
-		csa.cipher_algo = (C.enum_rte_crypto_cipher_algorithm)(sav.CipherAlgo)
+	if civ, exists := SupportedCipherAlgoByType[sav.CipherAlgoType]; exists {
+		csa.cipher_algo = (C.enum_rte_crypto_cipher_algorithm)(civ.Algo)
 		if (int)(civ.KeyLen) == len(sav.CipherKey) {
 			csa.block_size = (C.uint16_t)(civ.BlockSize)
 			csa.iv_len = (C.uint16_t)(civ.IvLen)
-			switch sav.CipherAlgo {
-			case CipherAlgoTypeAesCbc:
+			switch civ.Algo {
+			case CipherAlgoAesCbc, CipherAlgo3desCbc:
 				csa.cipher_key_len = (C.uint16_t)(civ.KeyLen)
 				csa.cipher_key, err = bytes2keyArr(sav.CipherKey)
 				if err != nil {
 					return err
 				}
 				csa.salt = (C.uint32_t)(C.rte_rand())
-			case CipherAlgoTypeAesCtr:
+			case CipherAlgoAesCtr:
 				csa.cipher_key_len = (C.uint16_t)(civ.KeyLen - 4)
 				csa.cipher_key, err = bytes2keyArr(sav.CipherKey)
 				if err != nil {
@@ -113,18 +115,18 @@ func (sav *CSAValue) sav2saCipherAlgo(csa *C.struct_ipsec_sa) error {
 			}
 		} else {
 			return fmt.Errorf("invalid cipher keylen: %d, required: %d, algo: %d",
-				len(sav.CipherKey), civ.KeyLen, sav.CipherAlgo)
+				len(sav.CipherKey), civ.KeyLen, sav.CipherAlgoType)
 		}
 	} else {
-		return fmt.Errorf("cipher algorithm not supported %d", sav.CipherAlgo)
+		return fmt.Errorf("cipher algorithm not supported %d", sav.CipherAlgoType)
 	}
 
 	return nil
 }
 
 func (sav *CSAValue) sav2saAuthAlgo(csa *C.struct_ipsec_sa) error {
-	if aiv, exists := SupportedAuthAlgo[sav.AuthAlgo]; exists {
-		csa.auth_algo = (C.enum_rte_crypto_auth_algorithm)(sav.AuthAlgo)
+	if aiv, exists := SupportedAuthAlgoByType[sav.AuthAlgoType]; exists {
+		csa.auth_algo = (C.enum_rte_crypto_auth_algorithm)(aiv.Algo)
 		aKey, err := bytes2keyArr(sav.AuthKey)
 		if err != nil {
 			return err
@@ -138,10 +140,10 @@ func (sav *CSAValue) sav2saAuthAlgo(csa *C.struct_ipsec_sa) error {
 			csa.auth_key = aKey
 		} else {
 			return fmt.Errorf("invalid auth keylen: %d, required: %d, algo: %d",
-				len(sav.AuthKey), aiv.KeyLen, sav.AuthAlgo)
+				len(sav.AuthKey), aiv.KeyLen, sav.AuthAlgoType)
 		}
 	} else {
-		return fmt.Errorf("auth algorithm not supported %d", sav.AuthAlgo)
+		return fmt.Errorf("auth algorithm not supported %d", sav.AuthAlgoType)
 	}
 
 	return nil
@@ -150,16 +152,16 @@ func (sav *CSAValue) sav2saAuthAlgo(csa *C.struct_ipsec_sa) error {
 func (sav *CSAValue) sav2saAeadAlgo(csa *C.struct_ipsec_sa) error {
 	var err error
 
-	if aiv, exists := SupportedAeadAlgo[sav.AeadAlgo]; exists {
-		csa.aead_algo = (C.enum_rte_crypto_aead_algorithm)(sav.AeadAlgo)
+	if aiv, exists := SupportedAeadAlgoByType[sav.AeadAlgoType]; exists {
+		csa.aead_algo = (C.enum_rte_crypto_aead_algorithm)(aiv.Algo)
 		if (int)(aiv.KeyLen) == len(sav.AeadKey) {
 			csa.block_size = (C.uint16_t)(aiv.BlockSize)
 			csa.iv_len = (C.uint16_t)(aiv.IvLen)
 			csa.digest_len = (C.uint16_t)(aiv.DigestLen)
 			csa.aad_len = (C.uint16_t)(aiv.AadLen)
 
-			switch sav.AeadAlgo {
-			case AeadAlgoTypeGcm:
+			switch aiv.Algo {
+			case AeadAlgoGcm:
 				csa.cipher_key_len = (C.uint16_t)(aiv.KeyLen - 4)
 				csa.cipher_key, err = bytes2keyArr(sav.AeadKey)
 				if err != nil {
@@ -170,10 +172,10 @@ func (sav *CSAValue) sav2saAeadAlgo(csa *C.struct_ipsec_sa) error {
 			}
 		} else {
 			return fmt.Errorf("invalid aead keylen: %d, required: %d, algo: %d",
-				len(sav.AeadKey), aiv.KeyLen, sav.AeadAlgo)
+				len(sav.AeadKey), aiv.KeyLen, sav.AeadAlgoType)
 		}
 	} else {
-		return fmt.Errorf("aead algorithm not supported %d", sav.AeadAlgo)
+		return fmt.Errorf("aead algorithm not supported %d", sav.AeadAlgoType)
 	}
 
 	return nil
@@ -187,8 +189,8 @@ func (sav *CSAValue) Sav2sa(spi CSPI) (CSA, error) {
 	ret.flags = (C.uint16_t)(sav.Flags)
 
 	// cipher/auth algo.
-	if sav.CipherAlgo != UnknownAlgorithm &&
-		sav.AuthAlgo != UnknownAlgorithm {
+	if sav.CipherAlgoType != CipherAlgoTypeUnknown &&
+		sav.AuthAlgoType != AuthAlgoTypeUnknown {
 		// cipher algo.
 		if err = sav.sav2saCipherAlgo(&ret); err != nil {
 			return CSA(ret), err
@@ -197,29 +199,34 @@ func (sav *CSAValue) Sav2sa(spi CSPI) (CSA, error) {
 		if err = sav.sav2saAuthAlgo(&ret); err != nil {
 			return CSA(ret), err
 		}
-	} else if sav.AeadAlgo != UnknownAlgorithm {
+	} else if sav.AeadAlgoType != AeadAlgoTypeUnknown {
 		// aead algo
 		if err = sav.sav2saAeadAlgo(&ret); err != nil {
 			return CSA(ret), err
 		}
 	} else {
 		return CSA(ret), fmt.Errorf("Invalid algorithm: cipher = %d, auth = %d, aead = %d",
-			sav.CipherAlgo, sav.AuthAlgo, sav.AeadAlgo)
+			sav.CipherAlgoType, sav.AuthAlgoType, sav.AeadAlgoType)
 	}
 
-	ret.src = ip2ipAddr(sav.LocalEPIP.IP)
-	ret.dst = ip2ipAddr(sav.RemoteEPIP.IP)
+	ret.src = ip2ipAddr(sav.LocalEPIP)
+	ret.dst = ip2ipAddr(sav.RemoteEPIP)
+
+	ret.encap_proto = C.uint8_t(sav.EncapProtocol)
+	ret.encap_src_port = C.uint16_t(sav.EncapSrcPort)
+	ret.encap_dst_port = C.uint16_t(sav.EncapDstPort)
 
 	// generate hash.
 	hash := fnv.New64a()
-	str := fmt.Sprintf("%v%v%v%v%v%v%v%v%v%v%v%v%v%v%v",
+	str := fmt.Sprintf("%v%v%v%v%v%v%v%v%v%v%v%v%v%v%v%v%v%v",
 		ret.spi, ret.cipher_algo, ret.auth_algo,
 		ret.aead_algo, ret.digest_len,
 		ret.iv_len, ret.block_size,
-		ret.flags, ret.src,
-		ret.dst, ret.cipher_key,
-		ret.cipher_key_len, ret.auth_key,
-		ret.auth_key_len, ret.aad_len)
+		ret.flags, ret.src, ret.dst,
+		ret.encap_proto, ret.encap_src_port, ret.encap_dst_port,
+		ret.cipher_key, ret.cipher_key_len,
+		ret.auth_key, ret.auth_key_len,
+		ret.aad_len)
 	_, _ = hash.Write([]byte(str))
 	ret.hash = C.uint64_t(hash.Sum64())
 
@@ -238,8 +245,6 @@ func (sav *CSAValue) Sav2sa(spi CSPI) (CSA, error) {
 
 	// TBD:
 	//   sav.Protocol
-	//   sav.LocalEPIP.Mask
-	//   sav.RemoteEPIP.Mask
 	//   sav.State
 	return CSA(ret), nil
 }

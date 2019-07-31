@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,47 +17,27 @@
 package ethdev
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../include -I/usr/local/include/dpdk -m64 -pthread -O3 -msse4.2
-#cgo LDFLAGS: -Wl,-unresolved-symbols=ignore-all -L/usr/local/lib -ldpdk
+#cgo CFLAGS: -I${SRCDIR}/../../include -m64 -pthread -O3 -msse4.2
+#cgo LDFLAGS: -Wl,-unresolved-symbols=ignore-all
 
 #include <rte_config.h>
 #include <rte_ethdev.h>
 
 #include "ethdev.h"
-
-static struct rte_eth_conf *get_port_conf() {
-	static struct rte_eth_conf port_conf = {
-		.rxmode = {
-#if MAX_PACKET_SZ > 2048
-			.jumbo_frame    = 1, // Jumbo Frame Support enabled
-			.max_rx_pkt_len = 9000, // Max RX packet length
-#endif // MAX_PACKET_SZ
-		},
-		.rx_adv_conf = {
-			.rss_conf = {
-				.rss_key = NULL,
-				.rss_hf = ETH_RSS_IPV4 | ETH_RSS_IPV6,
-			},
-		},
-		.txmode = {
-			.mq_mode = ETH_MQ_TX_NONE,
-		},
-	};
-	return &port_conf;
-}
-
 */
 import "C"
 
 import (
 	"errors"
 	"fmt"
-	"github.com/lagopus/vsw/dpdk"
-	"github.com/lagopus/vsw/utils/notifier"
-	"github.com/lagopus/vsw/vswitch"
 	"net"
 	"sync"
 	"unsafe"
+
+	"github.com/lagopus/vsw/dpdk"
+	"github.com/lagopus/vsw/utils/notifier"
+	"github.com/lagopus/vsw/vswitch"
+	vlog "github.com/lagopus/vsw/vswitch/log"
 )
 
 const (
@@ -66,6 +46,7 @@ const (
 
 type EthdevInstance struct {
 	base        *vswitch.BaseInstance
+	counter     *vswitch.Counter
 	dev         *dpdk.EthDev
 	rts         *ethdevRuntime
 	rx_instance *vswitch.RuntimeInstance
@@ -86,7 +67,7 @@ type EthdevVIFInstance struct {
 	output  *dpdk.Ring
 	noti    *notifier.Notifier
 	notiCh  chan notifier.Notification
-	running bool
+	counter *vswitch.Counter
 }
 
 type ethdevRuntime struct {
@@ -109,15 +90,17 @@ type ethdevConfigSection struct {
 }
 
 type ethdevConfig struct {
-	RxCore uint `toml:"rx_core"`
-	TxCore uint `toml:"tx_core"`
+	RxCore         uint `toml:"rx_core"`         // Slave core for RX.
+	TxCore         uint `toml:"tx_core"`         // Slave core for TX.
+	ForceLinearize bool `toml:"force_linearize"` // Whether to linearize multi-sgement mbuf.
 }
 
 var config ethdevConfig
 
 var defaultConfig = ethdevConfig{
-	RxCore: 2,
-	TxCore: 3,
+	RxCore:         2,
+	TxCore:         3,
+	ForceLinearize: false,
 }
 
 //
@@ -141,7 +124,8 @@ func getRuntimeForEthdev(dev *dpdk.EthDev) (*ethdevRuntime, error) {
 
 	// Create runtime argument
 	param := C.struct_ethdev_runtime_param{
-		pool: (*C.struct_rte_mempool)(unsafe.Pointer(pool)),
+		pool:          (*C.struct_rte_mempool)(unsafe.Pointer(pool)),
+		iopl_required: (C.bool)(dev.RequireIOPL()),
 	}
 
 	rxOps := vswitch.LagopusRuntimeOps(unsafe.Pointer(&C.ethdev_rx_runtime_ops))
@@ -154,7 +138,7 @@ func getRuntimeForEthdev(dev *dpdk.EthDev) (*ethdevRuntime, error) {
 	}
 
 	txOps := vswitch.LagopusRuntimeOps(unsafe.Pointer(&C.ethdev_tx_runtime_ops))
-	tx_rt, err := vswitch.NewRuntime(config.TxCore, "ethdev_tx", txOps, nil)
+	tx_rt, err := vswitch.NewRuntime(config.TxCore, "ethdev_tx", txOps, unsafe.Pointer(&param))
 	if err != nil {
 		rx_rt.Terminate()
 		return nil, err
@@ -186,8 +170,19 @@ func openEthDev(name string) (*dpdk.EthDev, error) {
 		return nil, fmt.Errorf("Can't open %v: %v", name, err)
 	}
 
+	// Construct port configuration
+	port_conf := &C.struct_rte_eth_conf{}
+
+	if C.MAX_PACKET_SZ > 2048 {
+		port_conf.rxmode.offloads = C.DEV_RX_OFFLOAD_JUMBO_FRAME
+		port_conf.rxmode.max_rx_pkt_len = 9000
+	}
+
+	dev_info := (*C.struct_rte_eth_dev_info)(unsafe.Pointer(dev.DevInfo()))
+	port_conf.rx_adv_conf.rss_conf.rss_hf = C.ETH_RSS_IP & dev_info.flow_type_rss_offloads
+
 	// Limit numbers of rx/tx queues to 1 each
-	if dev.Configure(1, 1, (*dpdk.EthConf)(unsafe.Pointer(C.get_port_conf()))) != 0 {
+	if dev.Configure(1, 1, (*dpdk.EthConf)(unsafe.Pointer(port_conf))) != 0 {
 		return nil, fmt.Errorf("Can't configure %v", name)
 	}
 
@@ -247,10 +242,11 @@ func newEthdevInstance(base *vswitch.BaseInstance, priv interface{}) (vswitch.In
 	// Create & register ethdev instance
 	e := &EthdevInstance{
 		base:     base,
+		counter:  base.Counter(),
 		dev:      dev,
 		rts:      rts,
-		rx_param: (*C.struct_ethdev_rx_instance)(C.malloc(C.sizeof_struct_ethdev_rx_instance)),
-		tx_param: (*C.struct_ethdev_tx_instance)(C.malloc(C.sizeof_struct_ethdev_tx_instance)),
+		rx_param: (*C.struct_ethdev_rx_instance)(C.calloc(1, C.sizeof_struct_ethdev_rx_instance)),
+		tx_param: (*C.struct_ethdev_tx_instance)(C.calloc(1, C.sizeof_struct_ethdev_tx_instance)),
 		mode:     vswitch.AccessMode,
 		enabled:  false,
 	}
@@ -259,7 +255,8 @@ func newEthdevInstance(base *vswitch.BaseInstance, priv interface{}) (vswitch.In
 	// Prepare RX Instance
 	e.rx_param.common.base.name = e.cname
 	e.rx_param.common.base.outputs = &e.rx_param.common.o[0]
-	e.rx_param.common.port_id = C.unsigned(dev.PortID())
+	e.rx_param.common.port_id = C.uint16_t(dev.PortID())
+	e.rx_param.common.counter = (*C.struct_vsw_counter)(unsafe.Pointer(e.counter))
 	e.rx_param.nb_rx_desc = MbufLen / 4 // XXX: Must be configurable
 
 	e.rx_instance, err = instantiate(rts.rx, unsafe.Pointer(e.rx_param))
@@ -273,8 +270,10 @@ func newEthdevInstance(base *vswitch.BaseInstance, priv interface{}) (vswitch.In
 	e.tx_param.common.base.input = (*C.struct_rte_ring)(unsafe.Pointer(e.base.Input()))
 	// We don't actually need outputs for TX, but we use them to check validity of VID
 	e.tx_param.common.base.outputs = &e.tx_param.common.o[0]
-	e.tx_param.common.port_id = C.unsigned(dev.PortID())
+	e.tx_param.common.port_id = C.uint16_t(dev.PortID())
+	e.tx_param.common.counter = (*C.struct_vsw_counter)(unsafe.Pointer(e.counter))
 	e.tx_param.nb_tx_desc = MbufLen // XXX: Must be configurable
+	e.tx_param.force_linearize = C.bool(config.ForceLinearize)
 
 	e.tx_instance, err = instantiate(rts.tx, unsafe.Pointer(e.tx_param))
 	if err != nil {
@@ -347,7 +346,7 @@ func (e *EthdevInstance) SetMACAddress(mac net.HardwareAddr) error {
 		return fmt.Errorf("SetMACAddress failed: %v", err)
 	}
 
-	if err := e.control(ETHDEV_CMD_UPDATE_MAC, 0, nil, 0); err != nil {
+	if err := e.control(&controlMsg{cmd: ETHDEV_CMD_UPDATE_MAC}); err != nil {
 		e.dev.SetDefaultMACAddr(oldmac)
 		return fmt.Errorf("Refreshing self MAC address failed: %v", err)
 	}
@@ -373,6 +372,23 @@ func (e *EthdevInstance) SetMTU(mtu vswitch.MTU) error {
 
 func (e *EthdevInstance) InterfaceMode() vswitch.VLANMode {
 	return e.mode
+}
+
+func (e *EthdevInstance) UpdateCounter() {
+	if s, err := e.dev.Stats(); err == nil {
+		c := (*C.struct_vsw_counter)(unsafe.Pointer(e.counter))
+		c.in_octets = C.uint64_t(s.InBytes)
+		c.out_octets = C.uint64_t(s.OutBytes)
+		c.in_errors = C.uint64_t(s.InErrors)
+		c.out_errors = C.uint64_t(s.OutErrors)
+	} else {
+		log.Err("Can't get ethdev stats: %v", err)
+	}
+}
+
+func (e *EthdevInstance) LinkStatus() bool {
+	link := e.dev.Link(false)
+	return link.StatusUp
 }
 
 type devcmd int
@@ -405,20 +421,33 @@ func (c devcmd) String() string {
 	return cmdstr[c]
 }
 
-func (e *EthdevInstance) control(cmd devcmd, vid vswitch.VID, out *dpdk.Ring, index vswitch.VIFIndex) error {
-	p := C.struct_ethdev_control_param{
-		cmd:    C.ethdev_cmd_t(cmd),
-		vid:    C.int(vid),
-		output: (*C.struct_rte_ring)(unsafe.Pointer(out)),
-		index:  C.vifindex_t(index),
-	}
+type controlMsg struct {
+	cmd     devcmd
+	vid     vswitch.VID
+	out     *dpdk.Ring
+	vif     vswitch.VIFIndex
+	counter *vswitch.Counter
+}
 
-	rc, err := e.rx_instance.Control(unsafe.Pointer(&p))
+func (c *controlMsg) create() *C.struct_ethdev_control_param {
+	return &C.struct_ethdev_control_param{
+		cmd:     C.ethdev_cmd_t(c.cmd),
+		vid:     C.int(c.vid),
+		output:  (*C.struct_rte_ring)(unsafe.Pointer(c.out)),
+		index:   C.vifindex_t(c.vif),
+		counter: (*C.struct_vsw_counter)(unsafe.Pointer(c.counter)),
+	}
+}
+
+func (e *EthdevInstance) control(cmd *controlMsg) error {
+	p := cmd.create()
+
+	rc, err := e.rx_instance.Control(unsafe.Pointer(p))
 	if rc == false || err != nil {
 		return fmt.Errorf("%v Failed: %v", cmd, err)
 	}
 
-	rc, err = e.tx_instance.Control(unsafe.Pointer(&p))
+	rc, err = e.tx_instance.Control(unsafe.Pointer(p))
 	if rc == false || err != nil {
 		return fmt.Errorf("%v Failed: %v", cmd, err)
 	}
@@ -427,12 +456,15 @@ func (e *EthdevInstance) control(cmd devcmd, vid vswitch.VID, out *dpdk.Ring, in
 }
 
 func (e *EthdevInstance) SetInterfaceMode(mode vswitch.VLANMode) error {
-	cmd := ETHDEV_CMD_SET_TRUNK_MODE
+	msg := &controlMsg{}
+
 	if mode == vswitch.AccessMode {
-		cmd = ETHDEV_CMD_SET_ACCESS_MODE
+		msg.cmd = ETHDEV_CMD_SET_ACCESS_MODE
+	} else {
+		msg.cmd = ETHDEV_CMD_SET_TRUNK_MODE
 	}
 
-	if err := e.control(cmd, 0, nil, 0); err != nil {
+	if err := e.control(msg); err != nil {
 		return err
 	}
 
@@ -462,9 +494,10 @@ func (e *EthdevInstance) SetNativeVID(vid vswitch.VID) error {
 
 func (e *EthdevInstance) NewVIF(vif *vswitch.VIF) (vswitch.VIFInstance, error) {
 	ev := &EthdevVIFInstance{
-		vif:   vif,
-		iface: e,
-		noti:  vif.Rules().Notifier(),
+		vif:     vif,
+		iface:   e,
+		noti:    vif.Rules().Notifier(),
+		counter: vif.Counter(),
 	}
 
 	ev.notiCh = ev.noti.Listen()
@@ -487,39 +520,57 @@ func (ev *EthdevVIFInstance) listener() {
 			continue
 		}
 
+		msg := &controlMsg{}
+
 		switch rule.Match {
-		case vswitch.MATCH_ANY:
-			// Default Output (The same as Output())
+		case vswitch.MatchEthDstSelf:
+			msg.cmd = ETHDEV_CMD_SET_DST_SELF_FORWARD
+		case vswitch.MatchEthDstBC:
+			msg.cmd = ETHDEV_CMD_SET_DST_BC_FORWARD
+		case vswitch.MatchEthDstMC:
+			msg.cmd = ETHDEV_CMD_SET_DST_MC_FORWARD
+		default:
+			continue
+		}
 
-		case vswitch.MATCH_ETH_DST_SELF:
-			if err := ev.iface.control(ETHDEV_CMD_SET_DST_SELF_FORWARD, ev.vif.VID(), rule.Ring, 0); err != nil {
-				log.Printf("Setting dst self Forward failed: %v", err)
-			}
-
-		case vswitch.MATCH_ETH_DST_BC:
-			if err := ev.iface.control(ETHDEV_CMD_SET_DST_BC_FORWARD, ev.vif.VID(), rule.Ring, 0); err != nil {
-				log.Printf("Setting dst broadcast Forward failed: %v", err)
-			}
-
-		case vswitch.MATCH_ETH_DST_MC:
-			if err := ev.iface.control(ETHDEV_CMD_SET_DST_MC_FORWARD, ev.vif.VID(), rule.Ring, 0); err != nil {
-				log.Printf("Setting dst multicast Forward failed: %v", err)
-			}
+		msg.vid = ev.vif.VID()
+		if n.Type == notifier.Add {
+			msg.out = rule.Ring
+		}
+		if err := ev.iface.control(msg); err != nil {
+			log.Printf("%s failed: %v", msg.cmd, err)
 		}
 	}
 }
 
 func (ev *EthdevVIFInstance) Enable() error {
-	cmd := ETHDEV_CMD_ADD_VID
-	vid := ev.vif.VID()
-	if ev.iface.mode == vswitch.TrunkMode && vid == ev.iface.nativeVID {
-		cmd = ETHDEV_CMD_SET_NATIVE_VID
+	msg := &controlMsg{
+		cmd:     ETHDEV_CMD_ADD_VID,
+		vid:     ev.vif.VID(),
+		out:     ev.vif.Output(),
+		vif:     ev.vif.Index(),
+		counter: ev.counter,
 	}
-	return ev.iface.control(cmd, vid, ev.vif.Output(), ev.vif.Index())
+	if ev.iface.mode == vswitch.TrunkMode && msg.vid == ev.iface.nativeVID {
+		msg.cmd = ETHDEV_CMD_SET_NATIVE_VID
+	}
+	return ev.iface.control(msg)
 }
 
 func (ev *EthdevVIFInstance) Disable() {
-	ev.iface.control(ETHDEV_CMD_DELETE_VID, ev.vif.VID(), nil, 0)
+	ev.iface.control(&controlMsg{cmd: ETHDEV_CMD_DELETE_VID, vid: ev.vif.VID()})
+}
+
+func (ev *EthdevVIFInstance) UpdateCounter() {
+	log.Info("%s: UpdateCounter() called.", ev.vif)
+	if ev.iface.mode == vswitch.AccessMode {
+		ev.iface.UpdateCounter()
+		src := (*C.struct_vsw_counter)(unsafe.Pointer(ev.iface.counter))
+		dst := (*C.struct_vsw_counter)(unsafe.Pointer(ev.counter))
+		log.Info("%s: Updating counter: %v -> %v", ev.vif, *src, *dst)
+		*dst = *src
+		log.Info("%s: Updated counter.", ev.vif)
+	}
 }
 
 ///////////////////////////////////////////////////////
@@ -531,6 +582,12 @@ const (
  * Register module here
  */
 func init() {
+	if l, err := vlog.New(moduleName); err == nil {
+		log = l
+	} else {
+		log.Fatalf("Can't create logger: %s", moduleName)
+	}
+
 	rp := &vswitch.RingParam{
 		Count:    MbufLen,
 		SocketId: dpdk.SOCKET_ID_ANY,

@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@ package spd
 import (
 	"fmt"
 	"net"
-	"time"
 
 	"github.com/lagopus/vsw/modules/tunnel/ipsec"
 	"github.com/lagopus/vsw/vswitch"
@@ -98,14 +97,13 @@ type dummy struct{}
 // mockSPD.
 
 type mockCount struct {
-	callRllocRules            uint64
-	callFreeRules             uint64
-	callMake                  uint64
-	callGetStat               uint64
-	callGetStatLiftimeCurrent uint64
-	callSetRule               uint64
-	callDumpRules             uint64
-	callNewParams             uint64
+	callRllocRules uint64
+	callFreeRules  uint64
+	callMake       uint64
+	callGetStats   uint64
+	callSetRule    uint64
+	callDumpRules  uint64
+	callNewParams  uint64
 }
 
 type mockExpected struct {
@@ -134,38 +132,28 @@ func (cs *mockCSPD) FreeRules(rules ipsec.CACLRules) {
 }
 
 func (cs *mockCSPD) Make(spd ipsec.CSPD, inRules ipsec.CACLRules, inRulesSize uint32,
-	outRules ipsec.CACLRules, outRulesSize uint32) ipsec.LagopusResult {
+	outRules ipsec.CACLRules, outRulesSize uint32) error {
 	cs.callMake++
 	testSuite.NotNil(spd)
 	testSuite.NotNil(inRules)
 	testSuite.NotNil(outRules)
 	testSuite.Equal(cs.makeInRulesSize, inRulesSize)
 	testSuite.Equal(cs.makeOutRulesSize, outRulesSize)
-	return ipsec.LagopusResultOK
+	return nil
 }
 
-func (cs *mockCSPD) Stat(spd ipsec.CSPD, stat *ipsec.CSPDStat,
-	spi uint32) ipsec.LagopusResult {
+func (cs *mockCSPD) Stats(spd ipsec.CSPD, spi uint32) (*ipsec.CSPDStats, error) {
 	testSuite.NotNil(spd)
-	testSuite.NotNil(stat)
-	return ipsec.LagopusResultOK
-}
-
-func (cs *mockCSPD) dummyLifeTime() time.Time {
-	return time.Date(2017, 1, 2, 3, 4, 5, 6, time.Local)
-}
-
-func (cs *mockCSPD) StatLiftimeCurrent(stat ipsec.CSPDStat) int64 {
-	cs.callGetStatLiftimeCurrent++
-	return int64(cs.dummyLifeTime().UnixNano())
+	cs.callGetStats++
+	return &ipsec.CSPDStats{}, nil
 }
 
 func (cs *mockCSPD) SetRule(index uint32, rules ipsec.CACLRules,
-	params ipsec.CACLParams) ipsec.LagopusResult {
+	params ipsec.CACLParams) error {
 	cs.callSetRule++
 	testSuite.NotNil(rules)
 	testSuite.NotNil(params)
-	return ipsec.LagopusResultOK
+	return nil
 }
 
 func (cs *mockCSPD) DumpRules(rules ipsec.CACLRules, size uint32) {
@@ -219,8 +207,8 @@ func newMockCSPDMakeErr() *mockCSPDMakeErr {
 }
 
 func (cs *mockCSPDMakeErr) Make(spd ipsec.CSPD, inRules ipsec.CACLRules, inRulesSize uint32,
-	outRules ipsec.CACLRules, outRulesSize uint32) ipsec.LagopusResult {
-	return ipsec.LagopusResult(-1) // ANY_FAILURES
+	outRules ipsec.CACLRules, outRulesSize uint32) error {
+	return fmt.Errorf("Make, %v Error", cs)
 }
 
 // SetRuleErr
@@ -233,20 +221,19 @@ func newMockCSPDSetRuleErr() *mockCSPDSetRuleErr {
 }
 
 func (cs *mockCSPDSetRuleErr) SetRule(index uint32, rules ipsec.CACLRules,
-	params ipsec.CACLParams) ipsec.LagopusResult {
-	return ipsec.LagopusResult(-1) // ANY_FAILURES
+	params ipsec.CACLParams) error {
+	return fmt.Errorf("SetRule, %v Error", cs)
 }
 
-// GetStatErr
-type mockCSPDGetStatErr struct {
+// GetStatsErr
+type mockCSPDGetStatsErr struct {
 	mockCSPD
 }
 
-func newMockCSPDGetStatErr() *mockCSPDGetStatErr {
-	return &mockCSPDGetStatErr{}
+func newMockCSPDGetStatsErr() *mockCSPDGetStatsErr {
+	return &mockCSPDGetStatsErr{}
 }
 
-func (cs *mockCSPDGetStatErr) Stat(spd ipsec.CSPD, stat *ipsec.CSPDStat,
-	spi uint32) ipsec.LagopusResult {
-	return ipsec.LagopusResult(-1) // ANY_FAILURES
+func (cs *mockCSPDGetStatsErr) Stats(spd ipsec.CSPD, spi uint32) (*ipsec.CSPDStats, error) {
+	return nil, fmt.Errorf("Stats, %v Error", cs)
 }

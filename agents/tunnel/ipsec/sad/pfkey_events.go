@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,10 +17,10 @@
 package sad
 
 import (
-	"log"
 	"net"
 
 	"github.com/lagopus/vsw/modules/tunnel/ipsec"
+	"github.com/lagopus/vsw/modules/tunnel/log"
 	"github.com/lagopus/vsw/vswitch"
 )
 
@@ -58,7 +58,7 @@ func SadbExpire(vrfIndex vswitch.VRFIndex, dir ipsec.DirectionType, spi SPI, sav
 	if _sadbExpire != nil {
 		return _sadbExpire(vrfIndex, dir, spi, sav, kind)
 	}
-	log.Printf("not send SADB_EXPIRE(%s) %s %d %+v (SadbExpireFunc not registered.)\n",
+	log.Logger.Err("not send SADB_EXPIRE(%s) %s %d %+v (SadbExpireFunc not registered.)",
 		kind.String(), dir.String(), spi, sav)
 	return false
 }
@@ -77,7 +77,7 @@ func SadbAcquire(vrfIndex vswitch.VRFIndex, entryID uint32, src *net.IPNet, dst 
 	if _sadbAcquire != nil {
 		return _sadbAcquire(vrfIndex, entryID, src, dst)
 	}
-	log.Printf("not send SADB_ACQUIRE id:%d src:%s dst:%s (SadbAcquireFunc not registered.)\n",
+	log.Logger.Err("not send SADB_ACQUIRE id:%d src:%s dst:%s (SadbAcquireFunc not registered.)",
 		entryID, *src, *dst)
 	return false
 }

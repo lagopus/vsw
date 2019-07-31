@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,15 +19,19 @@ package netlink
 
 import (
 	"fmt"
-	"github.com/lagopus/vsw/utils/notifier"
-	"github.com/lagopus/vsw/vswitch"
-	"github.com/vishvananda/netlink"
 	"io/ioutil"
 	"net"
 	"os"
 	"syscall"
 	"unsafe"
+
+	"github.com/lagopus/vsw/utils/notifier"
+	"github.com/lagopus/vsw/vswitch"
+	vlog "github.com/lagopus/vsw/vswitch/log"
+	"github.com/vishvananda/netlink"
 )
+
+const agentName = "netlink"
 
 var log = vswitch.Logger
 var netlinkInstance *NetlinkAgent
@@ -47,11 +51,11 @@ var stateToNudState = map[int]vswitch.NudState{
 type NetlinkAgent struct {
 	vswch  chan notifier.Notification
 	ruch   chan netlink.RouteUpdate
-	ndch   chan NeighUpdate
+	ndch   chan netlink.NeighUpdate
 	nldone chan struct{}
 	vrfs   map[string]*netlink.Vrf
 	taps   map[string]*netlink.Tuntap
-	links  map[int]*vswitch.VIF
+	links  map[int]vswitch.OutputDevice
 	tables map[int]*vswitch.VRF
 }
 
@@ -123,6 +127,7 @@ func (n *NetlinkAgent) addVRF(vrf *vswitch.VRF) {
 
 	n.vrfs[nv.LinkAttrs.Name] = nv
 	n.tables[tableID] = vrf
+	n.links[nv.LinkAttrs.Index] = vrf
 }
 
 func (n *NetlinkAgent) deleteRule(vrfName string) {
@@ -140,16 +145,17 @@ func (n *NetlinkAgent) deleteRule(vrfName string) {
 }
 
 func (n *NetlinkAgent) deleteVRF(vrf *vswitch.VRF) {
-	if link, ok := n.vrfs[vrf.Name()]; ok {
-		netlink.LinkDel(link)
-		n.deleteRule(link.LinkAttrs.Name)
+	if nv, ok := n.vrfs[vrf.Name()]; ok {
+		netlink.LinkDel(nv)
+		n.deleteRule(nv.LinkAttrs.Name)
+		delete(n.vrfs, nv.LinkAttrs.Name)
+		delete(n.tables, int(nv.Table))
 	}
 }
 
 func (n *NetlinkAgent) deleteAllVRF() {
-	for _, link := range n.vrfs {
-		netlink.LinkDel(link)
-		n.deleteRule(link.LinkAttrs.Name)
+	for _, vrf := range n.tables {
+		n.deleteVRF(vrf)
 	}
 }
 
@@ -269,8 +275,10 @@ func (n *NetlinkAgent) deleteTap(vif *vswitch.VIF) {
 }
 
 func (n *NetlinkAgent) deleteAllTap() {
-	for _, vif := range n.links {
-		n.deleteTap(vif)
+	for _, dev := range n.links {
+		if vif, ok := dev.(*vswitch.VIF); ok {
+			n.deleteTap(vif)
+		}
 	}
 }
 
@@ -341,35 +349,57 @@ func (n *NetlinkAgent) handleIPAddr(t notifier.Type, vif *vswitch.VIF, ip vswitc
 func (n *NetlinkAgent) handleRouteUpdate(ru netlink.RouteUpdate) {
 	vi, ok := n.tables[ru.Table]
 	if !ok {
-		return
-	}
-
-	vif, ok := n.links[ru.LinkIndex]
-	if !ok {
+		log.Warning("Can't find VRF associated with table %d", ru.Table)
 		return
 	}
 
 	entry := vswitch.Route{
-		Dst:      ru.Dst,
-		Src:      ru.Src,
-		Gw:       ru.Gw,
-		Metrics:  ru.Priority,
-		VIFIndex: vif.Index(),
-		Scope:    vswitch.RouteScope(ru.Scope),
+		Dst:     ru.Dst,
+		Src:     ru.Src,
+		Gw:      ru.Gw,
+		Metrics: ru.Priority,
+		Scope:   vswitch.RouteScope(ru.Scope),
+		Type:    vswitch.RouteType(ru.Route.Type),
 	}
-	if ru.Type == syscall.RTM_NEWROUTE {
-		if !vi.AddEntry(entry) {
-			log.Printf("Netlink Agent: Can't add a route entry for %v: %v", vi, entry)
+
+	if len(ru.MultiPath) == 0 {
+		if dev, ok := n.links[ru.LinkIndex]; ok {
+			entry.Dev = dev
+		} else {
+			log.Warning("Can't find VIF associated with link index %d", ru.LinkIndex)
+			return
 		}
 	} else {
-		if !vi.DeleteEntry(entry) {
-			log.Printf("Netlink Agent: Can't delete a route entry for %v: %v", vi, entry)
+		for _, nhi := range ru.MultiPath {
+			if dev, ok := n.links[nhi.LinkIndex]; ok {
+				nh := &vswitch.Nexthop{
+					Dev:    dev,
+					Weight: nhi.Hops + 1,
+					Gw:     nhi.Gw,
+				}
+				entry.Nexthops = append(entry.Nexthops, nh)
+			} else {
+				log.Warning("Can't find VIF associated with link index %d", ru.LinkIndex)
+			}
 		}
+	}
+
+	switch ru.Type {
+	case syscall.RTM_NEWROUTE:
+		if err := vi.AddEntry(entry); err != nil {
+			log.Printf("Netlink Agent: Can't add a route entry for %v: %v (%v)", vi, entry, err)
+		}
+	case syscall.RTM_DELROUTE:
+		if err := vi.DeleteEntry(entry); err != nil {
+			log.Printf("Netlink Agent: Can't delete a route entry for %v: %v (%v)", vi, entry, err)
+		}
+	default:
+		log.Printf("Unknown RouteUpdate type: %v", ru.Type)
 	}
 }
 
-func (n *NetlinkAgent) handleNeighbourUpdate(nu NeighUpdate) {
-	vif, ok := n.links[nu.LinkIndex]
+func (n *NetlinkAgent) handleNeighbourUpdate(nu netlink.NeighUpdate) {
+	vif, ok := n.links[nu.LinkIndex].(*vswitch.VIF)
 	if !ok {
 		return
 	}
@@ -471,6 +501,15 @@ func (n *NetlinkAgent) listen() {
 }
 
 func (n *NetlinkAgent) Enable() error {
+	// Initialize Netlink Agent
+	n.ruch = make(chan netlink.RouteUpdate)
+	n.ndch = make(chan netlink.NeighUpdate)
+	n.nldone = make(chan struct{})
+	n.vrfs = make(map[string]*netlink.Vrf)
+	n.taps = make(map[string]*netlink.Tuntap)
+	n.links = make(map[int]vswitch.OutputDevice)
+	n.tables = make(map[int]*vswitch.VRF)
+
 	// Listen to changes on VIF/VRF
 	n.vswch = vswitch.GetNotifier().Listen()
 
@@ -478,7 +517,7 @@ func (n *NetlinkAgent) Enable() error {
 		return fmt.Errorf("Netlink Agent: Can't receive route update: %v", err)
 	}
 
-	if err := NeighSubscribe(n.ndch, n.nldone); err != nil {
+	if err := netlink.NeighSubscribe(n.ndch, n.nldone); err != nil {
 		return fmt.Errorf("Netlink Agent: Can't receive neighbour update: %v", err)
 	}
 
@@ -493,22 +532,28 @@ func (n *NetlinkAgent) Disable() {
 	n.deleteAllVRF()
 	n.deleteAllTap()
 	vswitch.GetNotifier().Close(n.vswch)
+
+	// Clean ups
 	close(n.nldone)
+	close(n.ruch)
+	close(n.ndch)
+	n.vrfs = nil
+	n.taps = nil
+	n.links = nil
+	n.tables = nil
 }
 
 func (n *NetlinkAgent) String() string {
-	return "Netlink Agent"
+	return agentName
 }
 
 func init() {
-	netlinkInstance = &NetlinkAgent{
-		ruch:   make(chan netlink.RouteUpdate),
-		ndch:   make(chan NeighUpdate),
-		nldone: make(chan struct{}),
-		vrfs:   make(map[string]*netlink.Vrf),
-		taps:   make(map[string]*netlink.Tuntap),
-		links:  make(map[int]*vswitch.VIF),
-		tables: make(map[int]*vswitch.VRF),
+	if l, err := vlog.New(agentName); err == nil {
+		log = l
+	} else {
+		log.Fatalf("Can't create logger: %s", agentName)
 	}
+
+	netlinkInstance = &NetlinkAgent{}
 	vswitch.RegisterAgent(netlinkInstance)
 }

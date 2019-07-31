@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,15 +17,33 @@
 package dpdk
 
 /*
+#include <stdio.h>
 #include <stdlib.h>
 #include <rte_config.h>
 #include <rte_mbuf.h>
 #include <rte_ether.h>
+#include <rte_mempool.h>
 #include "dpdk.h"
+
+static char *mempool_list_dump() {
+        char *ptr;
+        size_t size;
+
+        FILE *out = open_memstream(&ptr, &size);
+        if (out == NULL)
+                return NULL;
+
+        rte_mempool_list_dump(out);
+
+        fclose(out);
+
+        return ptr;
+};
 */
 import "C"
 
 import (
+	"fmt"
 	"unsafe"
 )
 
@@ -67,6 +85,18 @@ func (mp *MemPool) AllocBulkMbufs(count uint) []*Mbuf {
 	}
 
 	return nil
+}
+
+func MempoolListDump() (string, error) {
+	cstr, err := C.mempool_list_dump()
+
+	if err != nil {
+		return "", fmt.Errorf("Can't dump mempool list: %v", err)
+	}
+
+	defer C.free(unsafe.Pointer(cstr))
+	return C.GoString(cstr), nil
+
 }
 
 // Check if Mbuf has at least size of ether header

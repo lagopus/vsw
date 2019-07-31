@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,437 +19,466 @@
  *      @brief  Routing table use dpdk hash.
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
+#include <assert.h>
 #include <inttypes.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <string.h>
 #include <rte_errno.h>
 #include <rte_malloc.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
 
-#include "router_log.h"
+#include "interface.h"
+#include "neighbor.h"
 #include "route.h"
+#include "router_log.h"
 
 #define IPV4_LPM_MAX_RULES 1024
 #define IPV4_LPM_NUMBER_TBL8S 256
 
-/**
- * Output log for route information.
- */
-static inline char *
-get_arp_status(struct arp_entry *arp) {
-	if (arp == NULL)
-		return "not resolved";
-	if (arp->valid)
-		return "valid";
-	else
-		return "invalid";
-}
-static void
-print_nexthop_entry(const char *type_str, ipv4_route_t *r, ipv4_nexthop_t *nh, char *name) {
-
-	// destination network address.
-	char dstbuf[BUFSIZ];
-	inet_ntop(AF_INET, &r->dst, dstbuf, BUFSIZ);
-
-	// gateway address.
-	char gwbuf[BUFSIZ];
-	inet_ntop(AF_INET, &nh->gw, gwbuf, BUFSIZ);
-	int resolve = (nh->arp == NULL) ? -1 : nh->arp->valid;
-	int ifindex = (nh->interface == NULL) ? -1 : nh->interface->ifindex;
-
-	LAGOPUS_DEBUG("[ROUTE] (%s) %s: %15s/%d, gw %15s, if %3d, scope %d, metric %"PRIu32", arp [%s]\n",
-		name, type_str, dstbuf, r->prefixlen, gwbuf,
-		ifindex, nh->scope, nh->metric, get_arp_status(nh->arp));
-}
-
-static void
-print_route_entry(const char *type_str, ipv4_route_t *r, char *name) {
-
-	if (!r->used) {
-		return;
-	}
-
-	ipv4_nexthop_t *nh = r->top;
-	while (nh) {
-		print_nexthop_entry(type_str, r, nh, name);
-		nh = nh->next;
-	}
-}
-
-
-void
-debug_print_list(struct route_table *route_table) {
-#if 1 // DEBUG
-	for (int i = 0; i < IPV4_MAX_NEXTHOPS; i++) {
-		ipv4_route_t *r = &route_table->routes[i];
-		if (r->used) {
-			print_route_entry("List", r, route_table->name);
-		}
-	}
-#endif
-}
+#define ROUTE_EOL -1
 
 /**
- * Create nexthop entry.
+ * Update route entry table.
+ * If update failed, do running.
  */
-ipv4_nexthop_t *
-create_nexthop(uint32_t gw, int prefixlen, int ifindex, uint8_t scope, uint32_t metric) {
-	ipv4_nexthop_t *nh = rte_zmalloc(NULL, sizeof(ipv4_nexthop_t), 0);
-	if (!nh) {
-		lagopus_printf("[ROUTE] %s: rte_zmalloc() failed.", __func__);
-		return NULL;
-	}
-
-	nh->gw        = gw;
-	nh->prefixlen = prefixlen;
-	nh->scope     = scope;
-	nh->metric    = metric;
-	nh->ifindex = ifindex;
-
-	nh->next = NULL;
-	nh->prev = NULL;
-
-	return nh;
-}
-
-/**
- * Add nexthop to route entry.
- */
-int
-add_nexthop(ipv4_route_t *r, ipv4_nexthop_t *new) {
-	int ret = 0;
-	ipv4_nexthop_t *nh = r->top;
-	while (nh) {
-		if (nh->metric < new->metric) {
-			if (nh->next == NULL) {
-				nh->next = new;
-				new->prev = nh;
-				break;
-			}
-			nh = nh->next;
-			continue;
-		} else if (nh->metric == new->metric) {
-			// Don't add nexthop with same metric.
-			ret = -1;
-			break;
-		} else {
-			if (r->top == nh) {
-				r->top = new;
-			} else {
-				nh->prev->next = new;
-			}
-			new->next = nh;
-			new->prev = nh->prev;
-			nh->prev = new;
-			break;
-		}
-	}
-	return ret;
-}
-
-/**
- * Delete nexthop from route entry.
- */
-void
-del_nexthop(ipv4_route_t *r, struct route_entry *entry) {
-	ipv4_nexthop_t *nh = r->top;
-	while (nh) {
-		if (nh->gw == entry->gw &&
-		    nh->metric == entry->metric &&
-		    nh->ifindex == entry->ifindex) {
-			if (nh->prev)
-				nh->prev->next = nh->next;
-			else
-				r->top = nh->next;
-
-			if (nh->next)
-				nh->next->prev = nh->prev;
-
-			rte_free(nh);
-			break;
-		}
-		nh = nh->next;
-	}
-}
-
-/*** public functions ***/
-/**
- * Initialize route table.
- */
-bool
-route_init(struct route_table *route_table, const char *name) {
-	unsigned int sockid = 0;
-	uint32_t lcore = rte_lcore_id();
-	struct rte_lpm_config config;
-
-	// set end of entries.
-	route_table->routes[IPV4_MAX_ROUTES- 1].used = false;
-
-	config.max_rules = IPV4_LPM_MAX_RULES;
-	config.number_tbl8s = IPV4_LPM_NUMBER_TBL8S;
-	config.flags = 0;
-
-	if (lcore != UINT32_MAX) {
-		sockid = rte_lcore_to_socket_id(lcore);
-	}
-
-	// set module name.
-	snprintf(route_table->name, sizeof(route_table->name), "%s", name);
-
-	// create rte_lpm.
-	char lpm_name[RTE_LPM_NAMESIZE];
-	snprintf(lpm_name, sizeof(lpm_name),
-		 "lpm_%s", name);
-	LAGOPUS_DEBUG("[ROUTE] (%s) route table name: %s\n", route_table->name, lpm_name);
-
-	route_table->table = rte_lpm_create(lpm_name, sockid, &config);
-	if (route_table->table == NULL) {
-		lagopus_printf("[ROUTE] %s: (%s) unable to create the lpm table: %s",
-				__func__, route_table->name, rte_strerror(rte_errno));
+static bool
+routelist_update(struct route_table *rt) {
+	if (rt->total >= IPV4_MAX_ROUTES) {
+		ROUTER_DEBUG("[ROUTE] Route entry table is full.");
 		return false;
 	}
+
+	// TODO: If there are too many free entries,
+	//      I want to shrink.
+	rt->entries = rte_realloc(rt->entries,
+				  sizeof(route_t) * (rt->total + ROUTE_ENTRY_POOL_SIZE),
+				  0);
+	if (!rt->entries) {
+		ROUTER_DEBUG("[ROUTE] Route entry table realloc failed.");
+		return false;
+	}
+
+	// Reset first free index.
+	rt->free = rt->total;
+
+	// Set new list number.
+	int i;
+	for (i = 0; i < ROUTE_ENTRY_POOL_SIZE - 1; i++)
+		rt->entries[rt->total + i].next = (rt->total + i) + 1;
+	// Set EOL
+	rt->entries[rt->total + i].next = ROUTE_EOL;
+
+	// Total number of entries in list.
+	rt->total += ROUTE_ENTRY_POOL_SIZE;
+
 	return true;
 }
 
 /**
- * Finalize route table.
+ * Push route entry to free list.
  */
 void
-route_fini(struct route_table *route_table) {
-	route_entries_all_clear(route_table);
-	rte_lpm_free(route_table->table);
+routelist_push(struct route_table *rt, int id) {
+	rt->entries[id].next = rt->free;
+	rt->free = id;
 }
 
 /**
- * Add a route entry to route table.
+ * Pop route entry from free list.
  */
-int
-route_entry_add(struct route_table *route_table, struct route_entry *entry) {
-	if (route_table == NULL || route_table->table == NULL || entry == NULL) {
-		lagopus_printf("[ROUTE] %s: Invalid argument(route table = %p, hash = %p, entry = %p).",
-				__func__, route_table, route_table->table, entry);
+static int
+routelist_pop(struct route_table *rt) {
+	if (rt->free == ROUTE_EOL && !routelist_update(rt))
+		return ROUTE_EOL;
+
+	int id = rt->free;
+	rt->free = rt->entries[id].next;
+
+	return id;
+}
+
+/**
+ * Create free list.
+ */
+static bool
+routelist_create(struct route_table *rt) {
+	// Check total num
+	if (rt->total >= IPV4_MAX_ROUTES) {
+		ROUTER_INFO("[ROUTE] route entry is full.");
+		return false;
+	}
+
+	// Create pool.ROUTE_ENTRY_POOL_SIZE.
+	rt->entries = rte_zmalloc(NULL, sizeof(route_t) * ROUTE_ENTRY_POOL_SIZE, 0);
+	// allocation failed, return a error.
+	if (!rt->entries) {
+		ROUTER_ERROR("Allocation failed.");
+		return false;
+	}
+
+	// set head
+	rt->free = 0;
+	// create or update free list.
+	int i;
+	for (i = 0; i < ROUTE_ENTRY_POOL_SIZE - 1; i++)
+		rt->entries[i].next = i + 1;
+	rt->entries[i].next = ROUTE_EOL;
+	rt->total = ROUTE_ENTRY_POOL_SIZE;
+	return true;
+}
+
+/**
+ * Output log for route information.
+ */
+static void
+print_nexthop_entry(nexthop_t *nh) {
+	ROUTER_DEBUG("      gw ip: %s, weight: %d, netmask: %d, broadcast type: %d\n",
+		     ip2str(nh->gw), nh->weight, nh->netmask, nh->broadcast_type);
+
+	struct interface *ie = nh->interface;
+	struct interface_entry *base = &ie->base;
+
+	if (!ie)
+		return;
+	ROUTER_DEBUG("      ifindex: %d, vid: %d, mtu: %d, tunnel: %s\n",
+		     base->ifindex, base->vid, base->mtu,
+		     is_iff_type_tunnel(base) ? "true" : "false");
+}
+
+static void
+print_fib_entry(fib_t *f) {
+	ROUTER_DEBUG("    metric: %" PRIu32 "\n", f->metric);
+	for (int i = 0; i < f->nexthop_num; i++) {
+		nexthop_t *nh = &f->nexthop[i];
+		if (!nh)
+			return;
+		print_nexthop_entry(nh);
+	}
+}
+
+static void
+print_route_entry(route_t *r) {
+	ROUTER_DEBUG("  %s/%d route type: %d, scope: %d\n",
+		     ip2str(r->dst), r->prefixlen, r->route_type, r->scope);
+	fib_t *f = r->fib;
+	while (f) {
+		print_fib_entry(f);
+		f = f->next;
+	}
+}
+
+static void
+print_route_list(struct route_table *rt) {
+	ROUTER_DEBUG("[ROUTE] List");
+	for (uint32_t i = 0, cnt = 0;
+	     i < IPV4_MAX_ROUTES && cnt < rt->route_num; i++) {
+		route_t *r = &rt->entries[i];
+		print_route_entry(r);
+		cnt++;
+	}
+}
+
+/**
+ * Delete metric from route entry.
+ */
+static void
+fib_delete(route_t *r, uint32_t metric) {
+	fib_t **f = &r->fib;
+	fib_t *p = r->fib;
+	while (p) {
+		if (p->metric == metric) {
+			*f = p->next;
+			free(p->nexthop);
+			rte_free(p);
+			break;
+		}
+		f = &(*f)->next;
+		p = p->next;
+	}
+}
+
+/**
+ * Add metric to route entry.
+ */
+static bool
+fib_add(route_t *r, fib_t *new) {
+	// XXX: Do sanity check in frontend.
+	// Same metric entry is not notified,
+	// do not check here.
+
+	if (!r->fib) {
+		r->fib = new;
+		return true;
+	}
+	if (r->fib->metric > new->metric) {
+		new->next = r->fib;
+		r->fib = new;
+		return true;
+	}
+
+	fib_t *f = r->fib;
+	while (f->next) {
+		if (f->next->metric < new->metric) {
+			f = f->next;
+			continue;
+		} else {
+			new->next = f->next;
+			break;
+		}
+	}
+	f->next = new;
+	return true;
+}
+
+/**
+ * Create metric entry.
+ */
+static fib_t *
+fib_create(struct interface_table *it, struct route_entry *entry) {
+	fib_t *f = rte_zmalloc(NULL, sizeof(fib_t), 0);
+	if (!f) {
+		ROUTER_ERROR("[ROUTE] Failed to allocate metric entry.");
+		return NULL;
+	}
+
+	// Set metric
+	f->metric = entry->metric;
+	f->next = NULL;
+
+	f->nexthop_num = entry->nexthop_num;
+	f->nexthop = entry->nexthops;
+	for (int i = 0; i < f->nexthop_num; i++) {
+		f->nexthop[i].interface = interface_entry_get(it, entry->nexthops[i].ifindex);
+	}
+
+	return f;
+}
+
+/**
+ * Get free route entry, and add to lpm.
+ */
+static uint32_t
+route_add_new_entry(struct route_table *rt, struct route_entry *entry) {
+	// Get free route entry.
+	int index = routelist_pop(rt);
+	if (index == -1) {
+		ROUTER_ERROR("[ROUTE] free list updating failed.");
 		return -1;
 	}
 
-	uint32_t index;
-	uint32_t nhid;
-	uint32_t dst = entry->dst;
-	uint32_t gw = entry->gw;
-	uint32_t prefixlen = entry->prefixlen;
-	uint32_t network = entry->network;
-	uint32_t ifindex = entry->ifindex;
-	uint8_t scope = entry->scope;
-	uint32_t metric = entry->metric;
-
-	// check if the rule is present in the lpm table.
-	int ret = rte_lpm_is_rule_present(route_table->table, ntohl(dst), prefixlen, &nhid);
-	if (ret == 0) {
-		// add new route
-		for (index = 0; index < IPV4_MAX_ROUTES; index++) {
-			ipv4_route_t *r = &route_table->routes[index];
-			if (!r->used) {
-				// set nexthop data.
-				r->used = true;
-				r->dst = dst;
-				r->prefixlen = prefixlen;
-				r->top = create_nexthop(gw, network, ifindex, scope, metric);
-				if (!r->top) {
-					lagopus_printf("[ROUTE] %s: (%s) Failed to create nexthop.",
-							__func__, route_table->name);
-					return -1;
-				}
-				if (rte_lpm_add(route_table->table, ntohl(dst),
-						prefixlen, index) < 0) {
-					// add failed.
-					r->used = false;
-					rte_free(r->top);
-					lagopus_printf("[ROUTE] %s: (%s) Failed to add route entry.",
-							__func__, route_table->name);
-					return -1;
-				}
-				// add success.
-				print_route_entry("Add", r, route_table->name);
-				return index;
-			}
-		}
-		lagopus_printf("[ROUTE] %s: (%s) nexthop table is full.",
-			__func__, route_table->name);
-	} else if (ret == 1) {
-		// add new nexthop
-		ipv4_nexthop_t *nh = create_nexthop(gw, network, ifindex, scope, metric);
-		if (!nh) {
-			lagopus_printf("[ROUTE] %s: (%s) Failed to create nexthop.",
-					__func__, route_table->name);
-			return -1;
-		}
-		if (add_nexthop(&route_table->routes[nhid], nh) != 0) {
-			// Don't add nexthop with same metric.
-			// Just free.
-			rte_free(nh);
-		}
-		print_route_entry("Update", &route_table->routes[nhid], route_table->name);
-		return nhid;
+	route_t *r = &rt->entries[index];
+	// Set route information
+	r->dst = entry->dst;
+	r->prefixlen = entry->prefixlen;
+	r->scope = entry->scope;
+	// Add to lpm new route entry.
+	if (rte_lpm_add(rt->lpm, entry->dst, entry->prefixlen, index) < 0) {
+		// Add failed.
+		ROUTER_ERROR("[ROUTE] Failed to add route entry.");
+		return -1;
 	}
+	rt->route_num++;
 
-	return -1;
+	return index;
 }
 
 /**
  * Delete a route entry from route table.
  */
 bool
-route_entry_delete(struct route_table *route_table, struct route_entry *entry) {
+route_entry_delete(struct router_tables *t, struct route_entry *entry) {
 	uint32_t nhid;
+	struct route_table *rt = t->route;
 
-	/* check if the entry is exist. */
-	int ret = rte_lpm_is_rule_present(route_table->table,
-				ntohl(entry->dst), (uint8_t)entry->prefixlen, &nhid);
-
-	/* delete the entry from route table. */
-	if (ret == 1) {
-		ipv4_route_t *r = &route_table->routes[nhid];
-		del_nexthop(r, entry);
-		if (!r->top) {
-			rte_lpm_delete(route_table->table,
-				ntohl(entry->dst), entry->prefixlen);
-			route_table->routes[nhid].used = false;
-		}
-		print_route_entry("Delete", &route_table->routes[nhid], route_table->name);
-	} else {
-		lagopus_printf("[ROUTE] %s: (%s) No entry in lpm.", __func__, route_table->name);
+	// Delete default route.
+	if (entry->dst == 0) {
+		fib_delete(&rt->default_route, entry->metric);
+		return true;
 	}
 
-	debug_print_list(route_table);
+	// Check if the entry is exist.
+	int ret = rte_lpm_is_rule_present(rt->lpm, entry->dst,
+					  (uint8_t)entry->prefixlen, &nhid);
+	// fatal error.
+	assert(ret >= 0);
+
+	// No entry.
+	if (ret == 0) {
+		ROUTER_INFO("[ROUTE] No entry in lpm.");
+		return true;
+	}
+
+	// Route entry exists
+	route_t *r = &rt->entries[nhid];
+
+	// Delete rule specified by agent.
+	fib_delete(r, entry->metric);
+
+	// No nexthop, delete route entry from table.
+	if (!r->fib) {
+		rte_lpm_delete(rt->lpm,
+			       entry->dst, entry->prefixlen);
+		rt->route_num--;
+		ROUTER_DEBUG("[ROUTE] route delete %s/%d",
+			     ip2str(entry->dst), entry->prefixlen);
+	}
+
+	// Output route list after delete.
+	if (VSW_LOG_DEBUG_ENABLED(router_log_id)) {
+		ROUTER_DEBUG("[ROUTE] Delete");
+		print_route_entry(&rt->entries[nhid]);
+	}
+
+	if (VSW_LOG_DEBUG_ENABLED(router_log_id))
+		print_route_list(rt);
 
 	return true;
 }
 
 /**
- * Update mac address of nexthop in nexthop entry.
+ * Add a route entry to route table.
+ * If entry exists, update.
  */
 bool
-route_entry_resolve_update(struct route_table *route_table,
-		uint32_t dst, ipv4_nexthop_t *new,
-		struct arp_entry *arp) {
-	// add new route entry, by dst ip address.
-	uint32_t id;
-	struct route_entry entry;
+route_entry_add(struct router_tables *t, struct route_entry *entry) {
+	struct route_table *rt = t->route;
 
-	// set values to route entry.
-	entry.dst = dst;
-	entry.gw = new->gw;
-	entry.prefixlen = 32;
-	entry.network = new->prefixlen;
-	entry.scope = new->scope;
-	entry.metric = new->metric;
-	entry.ifindex = new->ifindex;
+	// Default route.
+	if (entry->dst == 0) {
+		fib_t *f = fib_create(t->interface, entry);
+		if ((!f) || !fib_add(&rt->default_route, f)) {
+			ROUTER_ERROR("[ROUTE] Failed to add default route");
+			return false;
+		}
+		return true;
+	}
 
-	// add entry to route table.
-	if ((id = route_entry_add(route_table, &entry)) < 0) {
+	uint32_t nhid;
+	uint32_t dst = entry->dst;
+	uint32_t prefixlen = entry->prefixlen;
+	// Check if the rule is present in the lpm table.
+	int ret = rte_lpm_is_rule_present(rt->lpm, dst, prefixlen, &nhid);
+	// fatal error.
+	assert(ret >= 0);
+
+	// Newly added or updated, create a new fib entry and nexthops.
+	// XXX: An entry with the same metric does not come.
+	//      If same metric entry will be come,
+	//      do not create entry.
+	fib_t *f = fib_create(t->interface, entry);
+	if (!f) {
+		ROUTER_ERROR("Failed to create metric entry.");
 		return false;
 	}
 
-	// get nexthop list by id.
-	ipv4_nexthop_t *nh = route_table->routes[id].top;
-	struct interface *ie = nh->interface;
-	if (!ie) {
-		// if ie is null, set new interface entry.
-		ie = new->interface;
-	}
-	struct interface *nie = new->interface;
-	while (nh) {
-		// update resolve info.
-		if (nh->gw == new->gw &&
-		    nh->metric == new->metric &&
-		    ie->ifindex == nie->ifindex) {
-			if (arp) {
-				// set new arp entry.
-				nh->arp = arp;
-			}
-			*ie = *nie;
-			print_route_entry("Resolve Update", &route_table->routes[id], route_table->name);
-			return true;
-		}
-		nh = nh->next;
+	// Add route entry to lpm.
+	if (ret == 0 && (nhid = route_add_new_entry(rt, entry)) == -1) {
+		return false;
 	}
 
-	lagopus_printf("[ROUTE] %s: (%s) Failed to update resolved route entry.",
-			__func__, route_table->name);
-	return false;
+	// Add nexthop to list of route entry.
+	route_t *r = &rt->entries[nhid];
+	// Add metric entry to metric list of the route entry.
+	fib_add(r, f);
+
+	// output route entry list for debug.
+	if (VSW_LOG_DEBUG_ENABLED(router_log_id)) {
+		ROUTER_DEBUG("[ROUTE] Update");
+		print_route_entry(r);
+	}
+
+	return true;
 }
 
 /**
  * Get a route entry from route_table.
  */
-ipv4_nexthop_t *
-route_entry_get(struct route_table *route_table, const uint32_t dst) {
+nexthop_t *
+route_entry_get(struct router_tables *tbls, const uint32_t dst) {
+	struct route_table *rt = tbls->route;
 	uint32_t nexthop_index;
-	int ret;
-	ipv4_nexthop_t *nh = NULL;
-
-	ret = rte_lpm_lookup(route_table->table,
-			ntohl(dst), &nexthop_index);
-	/* set nexthop information. */
-	ipv4_route_t *r = &route_table->routes[nexthop_index];
-	if (ret == 0 && r->used && r->top) {
-		// Prioritize the first nexthop.
-		nh = r->top;
-		print_nexthop_entry("Get ", r, nh, route_table->name);
-	} else {
-		lagopus_printf("[ROUTE] %s: (%s) Not found entry.",
-				__func__, route_table->name);
+	int ret = rte_lpm_lookup(rt->lpm, dst, &nexthop_index);
+	if (ret == -ENOENT) {
+		// return default route.
+		if (rt->default_route.fib)
+			return rt->default_route.fib->nexthop;
+		return NULL;
 	}
-	debug_print_list(route_table);
+	// Invalid parameter, assertion fail..
+	assert(ret == 0);
+
+	// Set nexthop information.
+	route_t *r = &rt->entries[nexthop_index];
+	// Use the first nexthop with the highest metric.
+	fib_t *f = r->fib;
+	// TODO: In the future, we need to be able to select the nexthop by weight.
+	nexthop_t *nh = &f->nexthop[0];
+
+	// Interface must be resolved.
+	// It does not hold the interface index at this timing.
+	if (!nh->interface) {
+		ROUTER_ERROR("[ROUTE] No valid interface.");
+		return NULL;
+	}
+
+	if (VSW_LOG_DEBUG_ENABLED(router_log_id)) {
+		ROUTER_DEBUG("[ROUTE] Get %s", ip2str(dst));
+		print_nexthop_entry(nh);
+		print_route_list(rt);
+	}
 
 	return nh;
 }
 
 /**
- * Clear all entries in route table.
+ * Initialize route table.
  */
-void
-route_entries_all_clear(struct route_table *route_table) {
-	for (int i = 0; i < IPV4_MAX_ROUTES; i++) {
-		ipv4_nexthop_t *nh = route_table->routes[i].top;
-		while (nh) {
-			rte_free(nh);
-			nh = nh->next;
-		}
-		route_table->routes[i].used = false;
+struct route_table *
+route_init(const char *name) {
+	struct route_table *rt;
+	if (!(rt = rte_zmalloc(NULL, sizeof(struct route_table), 0))) {
+		ROUTER_ERROR("router: %s: route table rte_zmalloc() failed.", name);
+		return NULL;
 	}
-	rte_lpm_delete_all(route_table->table);
-	memset(route_table->routes, 0, sizeof(route_table->routes));
+
+	if (!routelist_create(rt)) {
+		rte_free(rt);
+		return NULL;
+	}
+
+	unsigned int sockid = 0;
+	uint32_t lcore = rte_lcore_id();
+	if (lcore != UINT32_MAX)
+		sockid = rte_lcore_to_socket_id(lcore);
+
+	// Create rte_lpm.
+	char lpm_name[RTE_LPM_NAMESIZE];
+	snprintf(lpm_name, sizeof(lpm_name), "lpm_%s", name);
+	ROUTER_DEBUG("[ROUTE] (%s) route table name: %s\n", name, lpm_name);
+
+	struct rte_lpm_config config;
+	config.max_rules = IPV4_LPM_MAX_RULES;
+	config.number_tbl8s = IPV4_LPM_NUMBER_TBL8S;
+	config.flags = 0;
+	rt->lpm = rte_lpm_create(lpm_name, sockid, &config);
+	if (rt->lpm == NULL) {
+		ROUTER_ERROR("[ROUTE] (%s) unable to create the lpm table: %s",
+			     name, rte_strerror(rte_errno));
+		rte_free(rt);
+		return NULL;
+	}
+
+	return rt;
 }
 
 /**
- * Reset arp resolve satus of all etries.
+ * Finalize route table.
  */
-bool
-route_entry_resolve_reset (struct route_table *route_table) {
-	if (!route_table) {
-		lagopus_printf("[ROUTE] %s: (%s) Invalid argument(route table is nil).",
-				__func__, route_table->name);
-		return false;
-	}
-
-	for (int i = 0; i < IPV4_MAX_ROUTES; i++) {
-		ipv4_route_t *r = &route_table->routes[i];
-		if (!r->used)
-			continue;
-		ipv4_nexthop_t *nh = r->top;
-		while (nh) {
-			if (nh->arp)
-				nh->arp->valid = false;
-			nh = nh->next;
-		}
-	}
-
-	debug_print_list(route_table);
-
-	return true;
+void
+route_fini(struct route_table *rt) {
+	if (!rt)
+		return;
+	rte_lpm_free(rt->lpm);
 }
-

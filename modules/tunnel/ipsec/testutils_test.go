@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,15 +24,17 @@ import (
 // mock.
 
 type mockMgr struct {
-	suite                *testIPsecTestSuite
-	countCallSetVRFIndex uint64
-	countCallSetRing     uint64
-	countCallUnsetRing   uint64
-	countCallSetTTL      uint64
-	countCallSetTOS      uint64
-	expectedVRFIndex     vswitch.VRFIndex
-	expectedTTL          uint8
-	expectedTOS          int8
+	suite              *testIPsecTestSuite
+	countCallSetVRF    uint64
+	countCallUnsetVRF  uint64
+	countCallSetRing   uint64
+	countCallUnsetRing uint64
+	countCallSetTTL    uint64
+	countCallSetTOS    uint64
+	countCallStats     uint64
+	expectedVRF        *vswitch.VRF
+	expectedTTL        uint8
+	expectedTOS        int8
 }
 
 func newMockMgr(suite *testIPsecTestSuite) *mockMgr {
@@ -41,10 +43,18 @@ func newMockMgr(suite *testIPsecTestSuite) *mockMgr {
 	}
 }
 
-func (m *mockMgr) SetVRFIndex(vifIndex vswitch.VIFIndex,
-	vrfIndex vswitch.VRFIndex) {
-	m.suite.Equal(m.expectedVRFIndex, vrfIndex)
-	m.countCallSetVRFIndex++
+func (m *mockMgr) SetVRF(vifIndex vswitch.VIFIndex,
+	vrf *vswitch.VRF) error {
+	m.suite.Equal(m.expectedVRF, vrf)
+	m.countCallSetVRF++
+	return nil
+}
+
+func (m *mockMgr) UnsetVRF(vifIndex vswitch.VIFIndex,
+	vrf *vswitch.VRF) error {
+	m.suite.Equal(m.expectedVRF, vrf)
+	m.countCallUnsetVRF++
+	return nil
 }
 
 func (m *mockMgr) SetRing(vifIndex vswitch.VIFIndex,
@@ -68,8 +78,22 @@ func (m *mockMgr) SetTOS(vifIndex vswitch.VIFIndex,
 	m.countCallSetTOS++
 }
 
-func (m *mockMgr) EqualCountCallSetVRFIndex(count uint64) {
-	m.suite.Equal(count, m.countCallSetVRFIndex)
+func (m *mockMgr) Stats(vifIndex vswitch.VIFIndex,
+	direction DirectionType) *CIfaceStats {
+	m.countCallStats++
+	return &CIfaceStats{}
+}
+
+func (m *mockMgr) ResetStats(vifIndex vswitch.VIFIndex,
+	direction DirectionType) {
+}
+
+func (m *mockMgr) EqualCountCallSetVRF(count uint64) {
+	m.suite.Equal(count, m.countCallSetVRF)
+}
+
+func (m *mockMgr) EqualCountCallUnsetVRF(count uint64) {
+	m.suite.Equal(count, m.countCallUnsetVRF)
 }
 
 func (m *mockMgr) EqualCountCallSetRing(count uint64) {
@@ -109,7 +133,20 @@ func (v *VIF) Tunnel() *MockTunnel {
 	return &MockTunnel{}
 }
 
-// mock for MockTunnel
+func (v *VIF) Rules() *MockRules {
+	return &MockRules{}
+}
+
+// mock for Rules.
+type MockRules struct {
+	vswitch.Rules
+}
+
+func (r *MockRules) Output(match vswitch.VswMatch) *dpdk.Ring {
+	return &dpdk.Ring{}
+}
+
+// mock for MockTunnel.
 type MockTunnel struct {
 }
 

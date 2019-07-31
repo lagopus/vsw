@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,7 +24,9 @@ import (
 	"syscall"
 
 	_ "github.com/lagopus/vsw/agents/config"
+	_ "github.com/lagopus/vsw/agents/debugsh"
 	_ "github.com/lagopus/vsw/agents/netlink"
+	_ "github.com/lagopus/vsw/agents/tunnel/ipsec"
 	_ "github.com/lagopus/vsw/modules/bridge"
 	_ "github.com/lagopus/vsw/modules/ethdev"
 	_ "github.com/lagopus/vsw/modules/hostif"
@@ -32,7 +34,6 @@ import (
 	_ "github.com/lagopus/vsw/modules/router"
 	_ "github.com/lagopus/vsw/modules/tap"
 	_ "github.com/lagopus/vsw/modules/tunnel"
-	_ "github.com/lagopus/vsw/modules/tunnel/ipip"
 	"github.com/lagopus/vsw/vswitch"
 )
 
@@ -56,8 +57,6 @@ func initSignalHandling() {
 func main() {
 	flag.Parse()
 
-	vswitch.EnableLog(logging)
-
 	if err := vswitch.Init(configPath); err != nil {
 		fmt.Println(err)
 		return
@@ -65,27 +64,14 @@ func main() {
 
 	initSignalHandling()
 
-	// Start DP Agents
-	agents := vswitch.EnableAgents("Netlink Agent", "config")
-	for _, agent := range agents {
-		vswitch.Logger.Printf("Agent %v started.\n", agent)
-	}
-
 	// Wait for signal
 	<-quit
-
-	// Stop Agents
-	for _, agent := range agents {
-		agent.Disable()
-	}
 
 	vswitch.Deinit()
 }
 
-var logging bool
 var configPath string
 
 func init() {
 	flag.StringVar(&configPath, "f", defaultConfigPath, "Config file")
-	flag.BoolVar(&logging, "v", false, "verbose mode")
 }

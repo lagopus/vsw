@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -52,9 +52,32 @@ func (suite *testIfaceMgrTestSuite) TestSetVRFIndex() {
 	// SetVRFIndex - OK.
 	for _, vifIndex := range vifIndexes {
 		expectedIface := newIface(vifIndex)
-		expectedIface.VRFIndex = 1
+		vrfIndex := vswitch.VRFIndex(1)
+		expectedIface.VRFIndex = &vrfIndex
 
-		mgr.SetVRFIndex(vifIndex, 1)
+		mgr.SetVRFIndex(vifIndex, &vrfIndex)
+		for _, direction := range directions {
+			suite.True(mgr.dbs[direction].isModified)
+			suite.Equal(mgr.dbs[direction].ifaces[vifIndex], expectedIface)
+		}
+	}
+}
+
+func (suite *testIfaceMgrTestSuite) TestUnsetVRFIndex() {
+	mgr := GetMgr()
+
+	directions := []ipsec.DirectionType{
+		ipsec.DirectionTypeIn,
+		ipsec.DirectionTypeOut,
+	}
+	vifIndexes := []vswitch.VIFIndex{0, 1}
+
+	// UnsetVRFIndex - OK.
+	for _, vifIndex := range vifIndexes {
+		expectedIface := newIface(vifIndex)
+		expectedIface.VRFIndex = nil
+
+		mgr.UnsetVRFIndex(vifIndex)
 		for _, direction := range directions {
 			suite.True(mgr.dbs[direction].isModified)
 			suite.Equal(mgr.dbs[direction].ifaces[vifIndex], expectedIface)
@@ -67,29 +90,38 @@ func (suite *testIfaceMgrTestSuite) TestSetUnsetRing() {
 
 	vifIndexes := []vswitch.VIFIndex{0, 1}
 
-	inputs := map[ipsec.DirectionType]*dpdk.Ring{
-		ipsec.DirectionTypeIn:  &dpdk.Ring{},
-		ipsec.DirectionTypeOut: &dpdk.Ring{},
+	rings := map[ipsec.DirectionType][2]*dpdk.Ring{
+		ipsec.DirectionTypeIn: [2]*dpdk.Ring{
+			&dpdk.Ring{},
+			&dpdk.Ring{},
+		},
+		ipsec.DirectionTypeOut: [2]*dpdk.Ring{
+			&dpdk.Ring{},
+			&dpdk.Ring{},
+		},
 	}
-	output := &dpdk.Ring{}
 
 	// SetRing - OK.
 	for _, vifIndex := range vifIndexes {
 		expectedIface := newIface(vifIndex)
-		expectedIface.Output = output
-		rings := ipsec.NewRings(inputs[ipsec.DirectionTypeIn],
-			inputs[ipsec.DirectionTypeOut], output)
+		rs := ipsec.NewRings(
+			rings[ipsec.DirectionTypeIn][0],
+			rings[ipsec.DirectionTypeOut][0],
+			rings[ipsec.DirectionTypeIn][1],
+			rings[ipsec.DirectionTypeOut][1],
+		)
 
-		mgr.SetRing(vifIndex, rings)
-		for direction, input := range inputs {
-			expectedIface.Input = input
+		mgr.SetRing(vifIndex, rs)
+		for direction, ring := range rings {
+			expectedIface.Input = ring[0]
+			expectedIface.Output = ring[1]
 			suite.Equal(mgr.dbs[direction].ifaces[vifIndex], expectedIface)
 			suite.True(mgr.dbs[direction].isModified)
 		}
 	}
 
 	// Reset isModified flags.
-	for direction := range inputs {
+	for direction := range rings {
 		mgr.dbs[direction].isModified = false
 	}
 
@@ -100,7 +132,7 @@ func (suite *testIfaceMgrTestSuite) TestSetUnsetRing() {
 		expectedIface.Output = nil
 
 		mgr.UnsetRing(vifIndex)
-		for direction := range inputs {
+		for direction := range rings {
 			suite.Equal(mgr.dbs[direction].ifaces[vifIndex], expectedIface)
 			suite.True(mgr.dbs[direction].isModified)
 		}
@@ -156,22 +188,31 @@ func (suite *testIfaceMgrTestSuite) TestPushIfaces() {
 
 	vifIndexes := []vswitch.VIFIndex{0, 1}
 
-	inputs := map[ipsec.DirectionType]*dpdk.Ring{
-		ipsec.DirectionTypeIn:  &dpdk.Ring{},
-		ipsec.DirectionTypeOut: &dpdk.Ring{},
+	rings := map[ipsec.DirectionType][2]*dpdk.Ring{
+		ipsec.DirectionTypeIn: [2]*dpdk.Ring{
+			&dpdk.Ring{},
+			&dpdk.Ring{},
+		},
+		ipsec.DirectionTypeOut: [2]*dpdk.Ring{
+			&dpdk.Ring{},
+			&dpdk.Ring{},
+		},
 	}
-	output := &dpdk.Ring{}
 
 	// SetRing.
 	for _, vifIndex := range vifIndexes {
 		expectedIface := newIface(vifIndex)
-		expectedIface.Output = output
-		rings := ipsec.NewRings(inputs[ipsec.DirectionTypeIn],
-			inputs[ipsec.DirectionTypeOut], output)
+		rs := ipsec.NewRings(
+			rings[ipsec.DirectionTypeIn][0],
+			rings[ipsec.DirectionTypeOut][0],
+			rings[ipsec.DirectionTypeIn][1],
+			rings[ipsec.DirectionTypeOut][1],
+		)
 
-		mgr.SetRing(vifIndex, rings)
-		for direction, input := range inputs {
-			expectedIface.Input = input
+		mgr.SetRing(vifIndex, rs)
+		for direction, ring := range rings {
+			expectedIface.Input = ring[0]
+			expectedIface.Output = ring[1]
 			suite.Equal(mgr.dbs[direction].ifaces[vifIndex], expectedIface)
 			suite.True(mgr.dbs[direction].isModified)
 		}
@@ -180,7 +221,7 @@ func (suite *testIfaceMgrTestSuite) TestPushIfaces() {
 	// push - OK.
 	err := mgr.push()
 	suite.Empty(err)
-	for direction := range inputs {
+	for direction := range rings {
 		suite.False(mgr.dbs[direction].isModified)
 		cif := mgr.dbs[direction].cifaces.(*mockCIfaces)
 		cif.EqualCountPushIfaces(1)
@@ -192,27 +233,36 @@ func (suite *testIfaceMgrTestSuite) TestPushIfacesErr() {
 
 	vifIndexes := []vswitch.VIFIndex{0, 1}
 
-	inputs := map[ipsec.DirectionType]*dpdk.Ring{
-		ipsec.DirectionTypeIn:  &dpdk.Ring{},
-		ipsec.DirectionTypeOut: &dpdk.Ring{},
+	rings := map[ipsec.DirectionType][2]*dpdk.Ring{
+		ipsec.DirectionTypeIn: [2]*dpdk.Ring{
+			&dpdk.Ring{},
+			&dpdk.Ring{},
+		},
+		ipsec.DirectionTypeOut: [2]*dpdk.Ring{
+			&dpdk.Ring{},
+			&dpdk.Ring{},
+		},
 	}
-	output := &dpdk.Ring{}
 
 	// set mock for err.
-	for direction := range inputs {
+	for direction := range rings {
 		mgr.dbs[direction].cifaces = newMockCIfacesErr(suite)
 	}
 
 	// SetRing.
 	for _, vifIndex := range vifIndexes {
 		expectedIface := newIface(vifIndex)
-		expectedIface.Output = output
-		rings := ipsec.NewRings(inputs[ipsec.DirectionTypeIn],
-			inputs[ipsec.DirectionTypeOut], output)
+		rs := ipsec.NewRings(
+			rings[ipsec.DirectionTypeIn][0],
+			rings[ipsec.DirectionTypeOut][0],
+			rings[ipsec.DirectionTypeIn][1],
+			rings[ipsec.DirectionTypeOut][1],
+		)
 
-		mgr.SetRing(vifIndex, rings)
-		for direction, input := range inputs {
-			expectedIface.Input = input
+		mgr.SetRing(vifIndex, rs)
+		for direction, ring := range rings {
+			expectedIface.Input = ring[0]
+			expectedIface.Output = ring[1]
 			suite.Equal(mgr.dbs[direction].ifaces[vifIndex], expectedIface)
 			suite.True(mgr.dbs[direction].isModified)
 		}
@@ -221,6 +271,55 @@ func (suite *testIfaceMgrTestSuite) TestPushIfacesErr() {
 	// push - ERR.
 	err := mgr.push()
 	suite.NotEmpty(err)
+}
+
+func (suite *testIfaceMgrTestSuite) TestStats() {
+	mgr := GetMgr()
+
+	directions := []ipsec.DirectionType{
+		ipsec.DirectionTypeIn,
+		ipsec.DirectionTypeOut,
+	}
+
+	vifIndex := vswitch.VIFIndex(1)
+
+	// SetVRFIndex.
+	vrfIndex := vswitch.VRFIndex(1)
+	mgr.SetVRFIndex(vifIndex, &vrfIndex)
+
+	// stats - OK.
+	for _, direction := range directions {
+		stats := mgr.Stats(vifIndex, direction)
+		suite.Equal(newDummyStats(), stats)
+		cif := mgr.dbs[direction].cifaces.(*mockCIfaces)
+		cif.EqualCountStats(1)
+	}
+}
+
+func (suite *testIfaceMgrTestSuite) TestStatsErr() {
+	mgr := GetMgr()
+
+	directions := []ipsec.DirectionType{
+		ipsec.DirectionTypeIn,
+		ipsec.DirectionTypeOut,
+	}
+
+	vifIndex := vswitch.VIFIndex(1)
+
+	// set mock for err.
+	for _, direction := range directions {
+		mgr.dbs[direction].cifaces = newMockCIfacesErr(suite)
+	}
+
+	// SetVRFIndex.
+	vrfIndex := vswitch.VRFIndex(1)
+	mgr.SetVRFIndex(vifIndex, &vrfIndex)
+
+	// stats - ERROR (return empty stats).
+	for _, direction := range directions {
+		stats := mgr.Stats(vifIndex, direction)
+		suite.Equal(newDummyStats(), stats)
+	}
 }
 
 var testSuite *testIfaceMgrTestSuite

@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2018-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -41,9 +41,7 @@ typedef lagopus_result_t (*sp_set_lifetime_current_proc_t)(void *spd,
     uint32_t sa_index,
     lagopus_chrono_t now);
 
-
-
-struct spd_stat {
+struct spd_stats {
   int64_t lifetime_current;
 };
 

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,15 +14,15 @@
  * limitations under the License.
  */
 
-#ifndef LAGOPUS_RUNTIME_H_
-#define LAGOPUS_RUNTIME_H_
+#ifndef VSW_RUNTIME_H_
+#define VSW_RUNTIME_H_
 
 #include <stdbool.h>
 #include <stdint.h>
 
 #include <rte_ring.h>
 
-struct lagopus_instance {
+struct vsw_instance {
 	uint64_t	id;
 	const char	*name;
 	bool		enabled;
@@ -31,7 +31,7 @@ struct lagopus_instance {
 	struct rte_ring **outputs;
 };
 
-struct lagopus_runtime_ops {
+struct vsw_runtime_ops {
 	// Initialize the runtime. Called only once at startup time.
 	// If the runtime is successively initialized, init shall
 	// return non-NULL value. The value is then passed as the first
@@ -50,20 +50,20 @@ struct lagopus_runtime_ops {
 
 	// Register an instance to the runtime.
 	// Priv is the value returned by init.
-	bool (*register_instance)(void *priv, struct lagopus_instance *instance);
+	bool (*register_instance)(void *priv, struct vsw_instance *instance);
 
 	// Unregister the instance from the runtime.
 	// Priv is the value returned by init.
-	bool (*unregister_instance)(void *priv, struct lagopus_instance *instance);
+	bool (*unregister_instance)(void *priv, struct vsw_instance *instance);
 
 	// Update rings for the instance.
 	// Rings might have been added or deleted.
 	// Priv is the value returned by init.
-	bool (*update_rings)(void *priv, struct lagopus_instance *instance);
+	bool (*update_rings)(void *priv, struct vsw_instance *instance);
 
 	// Control the instance. Param is runtime specific.
 	// Priv is the value returned by init.
-	bool (*control_instance)(void *priv, struct lagopus_instance *instance, void *param);
+	bool (*control_instance)(void *priv, struct vsw_instance *instance, void *param);
 };
 
-#endif /* LAGOPUS_RUNTIME_H_ */
+#endif /* VSW_RUNTIME_H_ */

@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,34 +17,63 @@
 package vswitch
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 )
 
-// TunnelNotify shall be implemented if the entity wants to receive
-// notification upon changes in the tunnel settings.
-// Methods are called with the new value.
-// Old values are still visible via gtter when these methods are called.
 type TunnelNotify interface {
 	AddressTypeUpdated(AddressFamily)
-	EncapsMethodUpdated(EncapsMethod)
 	HopLimitUpdated(uint8)
 	LocalAddressUpdated(net.IP)
-	RemoteAddressUpdated(net.IP)
-	SecurityUpdated(Security)
-	TOSUpdated(int8)
+	RemoteAddressesUpdated([]net.IP)
+	VRFUpdated(*VRF)
 }
 
-type Tunnel struct {
+// L3TunnelNotify shall be implemented if the entity wants to receive
+// notification upon changes in the L3 tunnel settings.
+// Methods are called with the new value.
+// Old values are still visible via gtter when these methods are called.
+type L3TunnelNotify interface {
+	TunnelNotify
+	SecurityUpdated(Security)
+	L3TOSUpdated(int8)
+}
+
+// L2TunnelNotify shall be implemented if the entity wants to receive
+// notification upon changes in the L2 tunnel settings.
+// Methods are called with the new value.
+// Old values are still visible via gtter when these methods are called.
+type L2TunnelNotify interface {
+	TunnelNotify
+	VNIUpdated(uint32)
+	L2TOSUpdated(uint8)
+}
+
+type tunnel struct {
 	encapsMethod EncapsMethod
 	hopLimit     uint8
 	local        net.IP
-	remote       net.IP
-	security     Security
-	tos          int8
+	remotes      []net.IP
 	addressType  AddressFamily
+	vrf          *VRF
 	notify       TunnelNotify
+}
+
+type L3Tunnel struct {
+	*tunnel
+	security Security
+	tos      int8
+	l3notify L3TunnelNotify
+}
+
+type L2Tunnel struct {
+	*tunnel
+	vni       uint32
+	vxlanPort uint16 // UDP Port used for VxLAN
+	tos       uint8
+	l2notify  L2TunnelNotify
 }
 
 type EncapsMethod int
@@ -52,14 +81,20 @@ type EncapsMethod int
 const (
 	EncapsMethodDirect EncapsMethod = iota
 	EncapsMethodGRE
+	EncapsMethodVxLAN
 )
 
 func (e EncapsMethod) String() string {
 	s := map[EncapsMethod]string{
 		EncapsMethodDirect: "direct",
 		EncapsMethodGRE:    "gre",
+		EncapsMethodVxLAN:  "vxlan",
 	}
 	return s[e]
+}
+
+func (e EncapsMethod) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + e.String() + `"`), nil
 }
 
 type Security int
@@ -77,25 +112,26 @@ func (e Security) String() string {
 	return s[e]
 }
 
-// NewTunnel creates new Tunnel param with default setting.
-// Tunnel is epected to be instantiated with NewTunnel.
-func NewTunnel() *Tunnel {
-	return &Tunnel{
-		hopLimit:    0,
-		tos:         -1,
-		addressType: AF_IPv4,
+func (e Security) MarshalJSON() ([]byte, error) {
+	if e == SecurityNone {
+		return []byte(`"none"`), nil
+	}
+	return []byte(`"ipsec"`), nil
+}
+
+func newTunnel(em EncapsMethod) *tunnel {
+	return &tunnel{
+		hopLimit:     0,
+		addressType:  AF_IPv4,
+		encapsMethod: em,
 	}
 }
 
-func (t *Tunnel) setNotify(n TunnelNotify) {
-	t.notify = n
-}
-
-func (t *Tunnel) AddressType() AddressFamily {
+func (t *tunnel) AddressType() AddressFamily {
 	return t.addressType
 }
 
-func (t *Tunnel) SetAddressType(af AddressFamily) {
+func (t *tunnel) SetAddressType(af AddressFamily) {
 	if t.addressType != af {
 		if t.notify != nil {
 			t.notify.AddressTypeUpdated(af)
@@ -104,24 +140,15 @@ func (t *Tunnel) SetAddressType(af AddressFamily) {
 	}
 }
 
-func (t *Tunnel) EncapsMethod() EncapsMethod {
+func (t *tunnel) EncapsMethod() EncapsMethod {
 	return t.encapsMethod
 }
 
-func (t *Tunnel) SetEncapsMethod(em EncapsMethod) {
-	if t.encapsMethod != em {
-		if t.notify != nil {
-			t.notify.EncapsMethodUpdated(em)
-		}
-		t.encapsMethod = em
-	}
-}
-
-func (t *Tunnel) HopLimit() uint8 {
+func (t *tunnel) HopLimit() uint8 {
 	return t.hopLimit
 }
 
-func (t *Tunnel) SetHopLimit(h uint8) {
+func (t *tunnel) SetHopLimit(h uint8) {
 	if t.hopLimit != h {
 		if t.notify != nil {
 			t.notify.HopLimitUpdated(h)
@@ -130,11 +157,11 @@ func (t *Tunnel) SetHopLimit(h uint8) {
 	}
 }
 
-func (t *Tunnel) LocalAddress() net.IP {
+func (t *tunnel) LocalAddress() net.IP {
 	return t.local
 }
 
-func (t *Tunnel) SetLocalAddress(ip net.IP) {
+func (t *tunnel) SetLocalAddress(ip net.IP) {
 	if !t.local.Equal(ip) {
 		if t.notify != nil {
 			t.notify.LocalAddressUpdated(ip)
@@ -143,51 +170,109 @@ func (t *Tunnel) SetLocalAddress(ip net.IP) {
 	}
 }
 
-func (t *Tunnel) RemoteAddress() net.IP {
-	return t.remote
+func (t *tunnel) RemoteAddresses() []net.IP {
+	return t.remotes
 }
 
-func (t *Tunnel) SetRemoteAddress(ip net.IP) {
-	if !t.remote.Equal(ip) {
-		if t.notify != nil {
-			t.notify.RemoteAddressUpdated(ip)
+func compareRemotes(old, new []net.IP) bool {
+	if len(old) != len(new) {
+		return false
+	}
+
+	for _, ip1 := range new {
+		matched := false
+		for _, ip2 := range old {
+			if ip1.Equal(ip2) {
+				matched = true
+				break
+			}
 		}
-		t.remote = ip
+		if !matched {
+			return false
+		}
+	}
+	return true
+}
+
+func (t *tunnel) SetRemoteAddresses(ips []net.IP) {
+	if !compareRemotes(t.remotes, ips) {
+		if t.notify != nil {
+			t.notify.RemoteAddressesUpdated(ips)
+		}
+		t.remotes = ips
 	}
 }
 
-func (t *Tunnel) Security() Security {
+func (t *tunnel) VRF() *VRF {
+	return t.vrf
+}
+
+func (t *tunnel) SetVRF(vrf *VRF) {
+	if t.vrf != vrf {
+		if t.notify != nil {
+			t.notify.VRFUpdated(vrf)
+		}
+		t.vrf = vrf
+	}
+}
+
+func (t *tunnel) String() string {
+	return fmt.Sprintf("AddressType=%v EncapsMethod=%v HopLimit=%d LocalAddress=%v RemoteAddress=%v",
+		t.addressType, t.encapsMethod, t.hopLimit, t.local, t.remotes)
+}
+
+func (t *tunnel) mapJSON() map[string]interface{} {
+	m := map[string]interface{}{
+		"encaps-method":  t.encapsMethod,
+		"hop-limit":      t.hopLimit,
+		"local-address":  t.local,
+		"remote-address": t.remotes,
+		"address-type":   t.addressType,
+	}
+	if t.vrf != nil {
+		m["vrf"] = t.vrf
+	}
+	return m
+}
+
+// NewL3Tunnel creates new L3Tunnel param with default setting.
+// L3Tunnel is epected to be instantiated with NewL3Tunnel.
+//
+// Encaps is an encapsulation method. Only EcanpsMethodGRE, or
+// EncapsMethodDirect are permitted.
+//
+// Returns nil on the error.
+func NewL3Tunnel(encaps EncapsMethod) (*L3Tunnel, error) {
+	if encaps != EncapsMethodGRE && encaps != EncapsMethodDirect {
+		return nil, fmt.Errorf("Invalid encaps method: %v", encaps)
+	}
+
+	return &L3Tunnel{
+		tunnel: newTunnel(encaps),
+		tos:    -1,
+	}, nil
+}
+
+func (t *L3Tunnel) setNotify(n L3TunnelNotify) {
+	t.l3notify = n
+	t.tunnel.notify = n.(TunnelNotify)
+}
+
+func (t *L3Tunnel) Security() Security {
 	return t.security
 }
 
-func (t *Tunnel) SetSecurity(s Security) {
+func (t *L3Tunnel) SetSecurity(s Security) {
 	if t.security != s {
-		if t.notify != nil {
-			t.notify.SecurityUpdated(s)
+		if t.l3notify != nil {
+			t.l3notify.SecurityUpdated(s)
 		}
 		t.security = s
 	}
 }
 
-func (t *Tunnel) TOS() int8 {
-	return t.tos
-}
-
-func (t *Tunnel) SetTOS(tos int8) error {
-	if tos < -2 || tos > 63 {
-		return errors.New("TOS is out of bound (Must be -2..63)")
-	}
-	if t.tos != tos {
-		if t.notify != nil {
-			t.notify.TOSUpdated(tos)
-		}
-		t.tos = tos
-	}
-	return nil
-}
-
 // IPProto returns supported IPProto value with the given configuration.
-func (t *Tunnel) IPProto() IPProto {
+func (t *L3Tunnel) IPProto() IPProto {
 	if t.encapsMethod == EncapsMethodGRE {
 		return IPP_GRE
 	}
@@ -197,7 +282,111 @@ func (t *Tunnel) IPProto() IPProto {
 	return IPP_IPIP
 }
 
-func (t *Tunnel) String() string {
-	return fmt.Sprintf("AddressType=%v EncapsMethod=%v HopLimit=%d LocalAddress=%v RemoteAddress=%v Security=%v TOS=%d",
-		t.addressType, t.encapsMethod, t.hopLimit, t.local, t.remote, t.security, t.tos)
+func (t *L3Tunnel) TOS() int8 {
+	return t.tos
+}
+
+func (t *L3Tunnel) SetTOS(tos int8) error {
+	if tos < -2 || tos > 63 {
+		return errors.New("TOS is out of bound (Must be -2..63)")
+	}
+	if t.tos != tos {
+		if t.notify != nil {
+			t.l3notify.L3TOSUpdated(tos)
+		}
+		t.tos = tos
+	}
+	return nil
+}
+
+func (t *L3Tunnel) String() string {
+	return fmt.Sprintf("%v Security=%v TOS=%d", t.tunnel, t.security, t.tos)
+}
+
+func (t *L3Tunnel) MarshalJSON() ([]byte, error) {
+	m := t.mapJSON()
+	m["security"] = t.security
+	m["tos"] = t.tos
+	return json.Marshal(m)
+}
+
+// NewL2Tunnel creates new L3Tunnel param with default setting.
+// L2Tunnel should be instantiated with NewL2Tunnel.
+//
+// Encaps is an encapsulation method. Only EcanpsMethodGRE, or
+// EncapsMethodVxLAN are permitted.
+//
+// Returns nil on the error.
+func NewL2Tunnel(encaps EncapsMethod) (*L2Tunnel, error) {
+	if encaps != EncapsMethodGRE && encaps != EncapsMethodVxLAN {
+		return nil, fmt.Errorf("Invalid encaps method: %v", encaps)
+	}
+
+	return &L2Tunnel{
+		tunnel:    newTunnel(encaps),
+		vxlanPort: DefaultVxLANPort,
+	}, nil
+}
+
+func (t *L2Tunnel) setNotify(n L2TunnelNotify) {
+	t.l2notify = n
+	t.tunnel.notify = n.(TunnelNotify)
+}
+
+func (t *L2Tunnel) VNI() uint32 {
+	return t.vni
+}
+
+func (t *L2Tunnel) SetVNI(vni uint32) error {
+	if vni > 16777215 {
+		return errors.New("VNI is out of bound (Must be 0..16777215)")
+	}
+	if t.vni != vni {
+		if t.l2notify != nil {
+			t.l2notify.VNIUpdated(vni)
+		}
+		t.vni = vni
+	}
+	return nil
+}
+
+func (t *L2Tunnel) TOS() uint8 {
+	return t.tos
+}
+
+func (t *L2Tunnel) SetTOS(tos uint8) error {
+	if tos > 63 {
+		return errors.New("TOS is out of bound (Must be 0..63)")
+	}
+	if t.tos != tos {
+		if t.notify != nil {
+			t.l2notify.L2TOSUpdated(tos)
+		}
+		t.tos = tos
+	}
+	return nil
+}
+
+func (t *L2Tunnel) VxLANPort() uint16 {
+	return t.vxlanPort
+}
+
+func (t *L2Tunnel) SetVxLANPort(port uint16) error {
+	if t.encapsMethod != EncapsMethodVxLAN {
+		return errors.New("The encapsulation method is not VxLAN.")
+	}
+	t.vxlanPort = port
+	return nil
+}
+
+func (t *L2Tunnel) String() string {
+	return fmt.Sprintf("%v VNI=%d TOS=%d", t.tunnel, t.vni, t.tos)
+}
+
+func (t *L2Tunnel) MarshalJSON() ([]byte, error) {
+	m := t.mapJSON()
+	m["vni"] = t.vni
+	m["tos"] = t.tos
+	m["vxlanPort"] = t.vxlanPort
+	return json.Marshal(m)
 }

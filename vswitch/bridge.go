@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package vswitch
 import (
 	"errors"
 	"fmt"
+	"net"
 
 	"github.com/lagopus/vsw/dpdk"
 )
@@ -26,11 +27,41 @@ import (
 type BridgeInstance interface {
 	AddVIF(*VIF, MTU) error
 	DeleteVIF(*VIF, MTU) error
+	SetMTU(MTU)
 	SetMACAgingTime(int)
 	SetMaxEntries(int)
 	EnableMACLearning()
 	DisableMACLearning()
 	SetMAT(*dpdk.Ring) error
+	MACTable() []BridgeMACEntry
+}
+
+type EntryType int
+
+const (
+	EntryStatic EntryType = iota
+	EntryDynamic
+)
+
+func (et EntryType) String() string {
+	if et == EntryStatic {
+		return "static"
+	}
+	return "dynamic"
+}
+
+func (et EntryType) MarshalJSON() ([]byte, error) {
+	if et == EntryStatic {
+		return []byte(`"static"`), nil
+	}
+	return []byte(`"dynamic"`), nil
+}
+
+type BridgeMACEntry struct {
+	MACAddress net.HardwareAddr
+	Age        uint64
+	VIF        *VIF
+	EntryType  EntryType
 }
 
 type bridge struct {
@@ -70,7 +101,7 @@ func newBridge(name string, vid VID, mat *BaseInstance) (*bridge, error) {
 			return nil, err
 		}
 
-		if err := mat.connect(b.base.input, MATCH_VLAN_ID, vid); err != nil {
+		if err := mat.connect(b.base.input, MatchVID, vid); err != nil {
 			return nil, err
 		}
 	}
@@ -127,7 +158,7 @@ func (b *bridge) deleteVIF(vif *VIF) error {
 		if v == vif {
 			continue
 		}
-		if m := vif.MTU(); mtu > m {
+		if m := v.MTU(); mtu > m {
 			mtu = m
 		}
 	}
@@ -144,6 +175,21 @@ func (b *bridge) deleteVIF(vif *VIF) error {
 	vif.setOutput(nil)
 
 	return nil
+}
+
+func (b *bridge) updateMTU() {
+	mtu := InvalidMTU
+	for v := range b.vifs {
+		if m := v.MTU(); mtu > m {
+			mtu = m
+		}
+	}
+
+	if mtu != b.mtu {
+		b.instance.SetMTU(mtu)
+		b.mtu = mtu
+	}
+	return
 }
 
 func (b *bridge) vif() []*VIF {
@@ -178,4 +224,8 @@ func (b *bridge) enableMACLearning() {
 
 func (b *bridge) disableMACLearning() {
 	b.instance.DisableMACLearning()
+}
+
+func (b *bridge) macTable() []BridgeMACEntry {
+	return b.instance.MACTable()
 }

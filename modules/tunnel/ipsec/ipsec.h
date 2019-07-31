@@ -1,3 +1,19 @@
+/*
+ * Copyright 2019 Nippon Telegraph and Telephone Corporation.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 /*-
  *   BSD LICENSE
  *
@@ -50,6 +66,8 @@
 #define MODULE_NAME "ipsec"
 
 #define VIF_MAX_ENTRY (VIF_MAX_INDEX + 1)
+
+#define DEFAULT_SOCKET_ID (0UL)
 
 /*
  * SP acl.userdata(uint32)
@@ -118,34 +136,35 @@ struct cnt_blk {
   uint32_t cnt;
 } __attribute__((packed));
 
-struct ipsec_param {
+struct ipsec_params {
   ipsecvsw_queue_role_t role;
+  bool is_core_bind;
+  uint64_t inbound_core_mask;
+  uint64_t outbound_core_mask;
 };
-
-uint16_t
-ipsec_esp_inbound(const pthread_t tid, struct sa_ctx *sad,
-                  struct rte_mbuf *pkts[],
-                  size_t nb_pkts, const lagopus_chrono_t now, uint16_t len);
-
-uint16_t
-ipsec_esp_outbound(const pthread_t tid, struct sa_ctx *sad,
-                   struct rte_mbuf *pkts[],
-                   uint32_t sa_idx[],
-                   size_t nb_pkts, const lagopus_chrono_t now, uint16_t len);
 
 static inline uint16_t
 ipsec_metadata_size(void) {
   return sizeof(struct ipsec_mbuf_metadata);
 }
 
+/* get metadata of mbuf.
+ *          +---+----------------------+---------------------+---
+ * rte_mbuf |...| tunnel_mbuf_metadata | ipsec_mbuf_metadata |...
+ *          +---+----------------------+---------------------+---
+ *              ^
+ *              |
+ *              vsw_packet_metadata.udata
+ */
 static inline struct ipsec_mbuf_metadata *
-get_priv(struct rte_mbuf *m) {
-  struct lagopus_packet_metadata *lm = LAGOPUS_MBUF_METADATA(m);
-  return (struct ipsec_mbuf_metadata *) &lm->udata;
+get_priv(const struct rte_mbuf *m) {
+  struct vsw_packet_metadata *lm = VSW_MBUF_METADATA(m);
+  return (struct ipsec_mbuf_metadata *) ((void *) (lm->udata) +
+         sizeof(struct tunnel_mbuf_metadata));
 }
 
 static inline void *
-get_cnt_blk(struct rte_mbuf *m) {
+get_cnt_blk(const struct rte_mbuf *m) {
   struct ipsec_mbuf_metadata *priv = get_priv(m);
 
   return &priv->buf[0];

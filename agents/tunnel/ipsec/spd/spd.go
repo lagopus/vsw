@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,9 +18,9 @@ package spd
 
 import (
 	"fmt"
-	"log"
 
 	"github.com/lagopus/vsw/modules/tunnel/ipsec"
+	"github.com/lagopus/vsw/modules/tunnel/log"
 	"github.com/lagopus/vsw/vswitch"
 )
 
@@ -68,32 +68,30 @@ func (s *spd) freeRules(r ipsec.CACLRules) {
 }
 
 func (s *spd) newRules(db db) (ipsec.CACLRules, uint32, error) {
-	var rules ipsec.CACLRules
-
 	size := uint32(len(db))
-	if rules = s.cspd.AllocRules(size); rules == nil {
-		return nil, 0, fmt.Errorf("No memory")
+	if rules := s.cspd.AllocRules(size); rules != nil {
+		var index uint32
+		for _, value := range db {
+			if value.State != Completed || value.SPI == 0 {
+				continue
+			}
+
+			args := &ipsec.CACLParamsArgs{
+				CSPSelector: value.CSPSelector,
+				CSPValue:    value.CSPValue,
+			}
+			params := s.cspd.NewParams(args)
+
+			if err := s.cspd.SetRule(index, rules, params); err != nil {
+				log.Logger.Err("%v", err)
+				return nil, 0, err
+			}
+			index++
+		}
+
+		return rules, index, nil
 	}
-
-	var index uint32
-	for _, value := range db {
-		if value.State != Completed || value.SPI == 0 {
-			continue
-		}
-
-		args := &ipsec.CACLParamsArgs{
-			CSPSelector: value.CSPSelector,
-			CSPValue:    value.CSPValue,
-		}
-		params := s.cspd.NewParams(args)
-
-		if r := s.cspd.SetRule(index, rules, params); r != ipsec.LagopusResultOK {
-			return nil, 0, fmt.Errorf("Can't set rule for %v", s.string())
-		}
-		index++
-	}
-
-	return rules, index, nil
+	return nil, 0, fmt.Errorf("No memory")
 }
 
 func (s *spd) dumpRulesSPD(rules ipsec.CACLRules,
@@ -107,27 +105,27 @@ func (s *spd) makeSPD() error {
 	var err error
 
 	if rulesIn, sizeIn, err = s.newRules(s.dbs[ipsec.DirectionTypeIn]); err != nil {
-		log.Println(err)
+		log.Logger.Err("%v", err)
 		return err
 	}
 	defer s.freeRules(rulesIn)
 
 	if rulesOut, sizeOut, err = s.newRules(s.dbs[ipsec.DirectionTypeOut]); err != nil {
-		log.Println(err)
+		log.Logger.Err("%v", err)
 		return err
 	}
 	defer s.freeRules(rulesOut)
 
 	directions := []ipsec.DirectionType{ipsec.DirectionTypeIn, ipsec.DirectionTypeOut}
 	for _, direction := range directions {
-		cspd, err := s.cspd.ModuleCSPD(s.vrfIndex, direction)
-		if err == nil {
-			if r := s.cspd.Make(cspd, rulesIn, sizeIn,
-				rulesOut, sizeOut); r != ipsec.LagopusResultOK {
-				return fmt.Errorf("make, %v: %v", s.string(), r)
+		if cspd, err := s.cspd.ModuleCSPD(s.vrfIndex, direction); err == nil {
+			if err := s.cspd.Make(cspd, rulesIn, sizeIn,
+				rulesOut, sizeOut); err != nil {
+				log.Logger.Err("%v", err)
+				return err
 			}
 		} else {
-			log.Println(err)
+			log.Logger.Err("%v", err)
 			return err
 		}
 	}
@@ -141,14 +139,15 @@ func (s *spd) statsSPD() error {
 			cspd, err := s.cspd.ModuleCSPD(s.vrfIndex, direction)
 			if err == nil {
 				for _, value := range db {
-					var stat ipsec.CSPDStat
-					if r := s.cspd.Stat(cspd, &stat, value.SPI); r != ipsec.LagopusResultOK {
-						return fmt.Errorf("Stat, %v: %v", s.string(), r)
+					if stats, err := s.cspd.Stats(cspd, value.SPI); err == nil {
+						value.setSPStats(newSPStats(stats))
+					} else {
+						log.Logger.Err("%v", err)
+						return err
 					}
-					value.setSPStats(newSPStats(s.cspd.StatLiftimeCurrent(stat)))
 				}
 			} else {
-				log.Println(err)
+				log.Logger.Err("%v", err)
 				return err
 			}
 		} else {
@@ -163,7 +162,7 @@ func (s *spd) iterate(fn func(string, *SPValue) error) error {
 	for _, db := range s.dbs {
 		for key, value := range db {
 			if err := fn(key, value); err != nil {
-				log.Println(err)
+				log.Logger.Err("%v", err)
 				return err
 			}
 		}

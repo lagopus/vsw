@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,10 +16,19 @@
 
 package vswitch
 
+/*
+#cgo CFLAGS: -I${SRCDIR}/../include
+
+#include <linux/l2tp.h>
+#include "ipproto.h"
+
+*/
+import "C"
+
 import "syscall"
 
 // IP Protocol Type
-type IPProto int
+type IPProto uint8
 
 const (
 	IPP_AH       = IPProto(syscall.IPPROTO_AH)
@@ -43,7 +52,6 @@ const (
 	IPP_NONE     = IPProto(syscall.IPPROTO_NONE)
 	IPP_PIM      = IPProto(syscall.IPPROTO_PIM)
 	IPP_PUP      = IPProto(syscall.IPPROTO_PUP)
-	IPP_RAW      = IPProto(syscall.IPPROTO_RAW)
 	IPP_ROUTING  = IPProto(syscall.IPPROTO_ROUTING)
 	IPP_RSVP     = IPProto(syscall.IPPROTO_RSVP)
 	IPP_SCTP     = IPProto(syscall.IPPROTO_SCTP)
@@ -51,7 +59,8 @@ const (
 	IPP_TP       = IPProto(syscall.IPPROTO_TP)
 	IPP_UDP      = IPProto(syscall.IPPROTO_UDP)
 	IPP_UDPLITE  = IPProto(syscall.IPPROTO_UDPLITE)
-	IPP_ANY      = IPProto(-1)
+	IPP_L2TP     = IPProto(C.IPPROTO_L2TP)
+	IPP_ANY      = IPProto(C.IPPROTO_ANY)
 )
 
 func (ipp IPProto) String() string {
@@ -76,7 +85,6 @@ func (ipp IPProto) String() string {
 		IPP_NONE:     "NONE",
 		IPP_PIM:      "PIM",
 		IPP_PUP:      "PUP",
-		IPP_RAW:      "RAW",
 		IPP_ROUTING:  "ROUTING",
 		IPP_RSVP:     "RSVP",
 		IPP_SCTP:     "SCTP",
@@ -87,4 +95,8 @@ func (ipp IPProto) String() string {
 		IPP_ANY:      "ANY",
 	}
 	return s[ipp]
+}
+
+func (ipp IPProto) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + ipp.String() + `"`), nil
 }

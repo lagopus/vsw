@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,15 +21,12 @@ package ipsec
 import "C"
 import (
 	"fmt"
-	"log"
 	"net"
 	"time"
 
+	"github.com/lagopus/vsw/modules/tunnel/log"
 	"github.com/lagopus/vsw/vswitch"
 )
-
-// CSACtx struct sa_ctx.
-type CSACtx *C.struct_sa_ctx
 
 // CSPI spi.
 type CSPI C.uint32_t
@@ -43,7 +40,7 @@ type SAD interface {
 	PullLifetime(spi CSPI) (time.Time, uint64, error)
 	PullAcquired() (err error)
 	RegisterAcquireFunc(fn SadbAcquireFunc)
-	String() string
+	fmt.Stringer
 }
 
 // BaseCSAD Base SAD.
@@ -68,7 +65,7 @@ func (sad *BaseCSAD) setSaCtx() {
 		if m, err := module(sad.dir); err == nil {
 			if m.cmodule != nil {
 				sad.ctx = *C.ipsec_get_sad(m.cmodule, C.vrfindex_t(sad.vrfIndex))
-				log.Printf("get SADB-%v sa_ctx(%v) => %p", sad.dir, m, sad.ctx)
+				log.Logger.Debug(0, "get SADB-%v sa_ctx(%v) => %p", sad.dir, m, sad.ctx)
 			}
 		}
 	}

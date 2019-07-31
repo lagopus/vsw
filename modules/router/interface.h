@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,22 +19,22 @@
  *      @brief  Interface table.
  */
 
-#ifndef __LAGOPUS_MODULE_ROUTER_INTERFACE_H__
-#define __LAGOPUS_MODULE_ROUTER_INTERFACE_H__
+#ifndef VSW_MODULE_ROUTER_INTERFACE_H_
+#define VSW_MODULE_ROUTER_INTERFACE_H_
 
-#include <stdbool.h>
 #include <net/if.h>
+#include <stdbool.h>
 
+#include <rte_ether.h>
 #include <rte_hash.h>
 #include <rte_jhash.h>
-#include <rte_ether.h>
 
 #include "router_common.h"
 
 #define IS_IPV4_BROADCAST(x) \
 	((x) == (uint32_t)0xFFFFFFFF)
 
-#define INTERFACE_IS_SELF(i, a) (rte_hash_lookup((i)->self, (const void*)&(a)) >= 0)
+#define INTERFACE_IS_SELF(i, a) (rte_hash_lookup((i)->self, (const void *)&(a)) >= 0)
 
 enum {
 	INTERFACE_IP_SELF_UNICAST,
@@ -46,14 +46,13 @@ enum {
  * Interface table.
  */
 struct interface_table {
-	char name[RTE_HASH_NAMESIZE];
-	struct rte_hash *hashmap;	// Self interface hardware address.
-	struct rte_hash *self;		// Self if address to tap.
+	struct rte_hash *hashmap; // Self interface hardware address.
+	struct rte_hash *self;    // Self if address to tap.
 };
 
 /* Interface APIs. */
-bool
-interface_init(struct interface_table *interface_tbl, const char *name);
+struct interface_table *
+interface_init(const char *name);
 void interface_fini(struct interface_table *interface_tbl);
 
 // ip address
@@ -64,15 +63,15 @@ interface_ip_delete(struct interface_table *interface_table, struct interface_ad
 
 // inteface infomation.
 bool
-interface_entry_add(struct interface_table *interface_table, struct interface_entry *ie);
+interface_entry_add(struct router_context *ctx, struct interface_entry *ie);
 bool
-interface_entry_delete(struct interface_table *interface_table, struct interface_entry *ie);
+interface_entry_delete(struct router_context *ctx, struct interface_entry *ie);
 struct interface *
 interface_entry_get(struct interface_table *interface_table, uint32_t ifindex);
 
-// self address
+// mtu of the interface
 bool
-interface_is_self(struct interface_table *interface_table, uint32_t addr);
+interface_mtu_update(struct interface_table *interface_table, struct interface_entry *ie);
 
-#endif /* __LAGOPUS_MODULE_ROUTER_INTERFACE_H__ */
+#endif /* VSW_MODULE_ROUTER_INTERFACE_H_ */
 

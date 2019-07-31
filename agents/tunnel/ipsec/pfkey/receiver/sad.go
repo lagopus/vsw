@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ package receiver
 
 import (
 	"bytes"
-	"log"
 	"net"
 	"syscall"
 	"time"
@@ -28,6 +27,8 @@ import (
 	"github.com/lagopus/vsw/agents/tunnel/ipsec/sad"
 	"github.com/lagopus/vsw/modules/tunnel/ipsec"
 	"github.com/lagopus/vsw/vswitch"
+
+	"github.com/lagopus/vsw/modules/tunnel/log"
 )
 
 var mgrs [2]*sad.Mgr
@@ -72,7 +73,7 @@ func (s *sadbAddMsg) addSA(selector *sad.SASelector) error {
 	if !ok {
 		return syscall.EINVAL
 	}
-	log.Printf("SadbAddMsg: add sa spi %d\n", s.Sa.SadbSaSpi)
+	log.Logger.Info("SadbAddMsg: add sa spi %d", s.Sa.SadbSaSpi)
 	selector.SPI = sad.SPI(s.Sa.SadbSaSpi)
 	if err := addSA(selector, sav); err != nil {
 		return syscall.EEXIST
@@ -85,16 +86,16 @@ func (s *sadbUpdateMsg) updateSA(selector *sad.SASelector) error {
 	if !ok {
 		return syscall.EINVAL
 	}
-	sav2, err := findSAByIP(selector, sav.LocalEPIP.IP, sav.RemoteEPIP.IP)
+	sav2, err := findSAByIP(selector, sav.LocalEPIP, sav.RemoteEPIP)
 	if err != nil {
 		return syscall.EEXIST
 	}
-	log.Printf("SadbUpdateMsg: update sa spi %d\n", s.Sa.SadbSaSpi)
-	sav2.CipherAlgo = sav.CipherAlgo
+	log.Logger.Info("SadbUpdateMsg: update sa spi %d", s.Sa.SadbSaSpi)
+	sav2.CipherAlgoType = sav.CipherAlgoType
 	sav2.CipherKey = sav.CipherKey
-	sav2.AuthAlgo = sav.AuthAlgo
+	sav2.AuthAlgoType = sav.AuthAlgoType
 	sav2.AuthKey = sav.AuthKey
-	sav2.AeadAlgo = sav.AeadAlgo
+	sav2.AeadAlgoType = sav.AeadAlgoType
 	sav2.AeadKey = sav.AeadKey
 	sav2.Protocol = sav.Protocol
 	sav2.Flags = sav.Flags
@@ -110,6 +111,16 @@ func (s *sadbUpdateMsg) updateSA(selector *sad.SASelector) error {
 	if s.SoftLifetime != nil {
 		sav2.LifeTimeSoft = sav.LifeTimeSoft
 		sav2.LifeTimeByteSoft = sav.LifeTimeByteSoft
+	}
+	if s.SoftLifetime != nil {
+		sav2.LifeTimeSoft = sav.LifeTimeSoft
+		sav2.LifeTimeByteSoft = sav.LifeTimeByteSoft
+	}
+	if s.NatTType != nil {
+		sav2.EncapType = sav.EncapType
+		sav2.EncapProtocol = sav.EncapProtocol
+		sav2.EncapSrcPort = sav.EncapSrcPort
+		sav2.EncapDstPort = sav.EncapDstPort
 	}
 	return nil
 }
@@ -161,106 +172,177 @@ func deleteSA(selector *sad.SASelector) {
 	mgrs[1].DeleteSA(selector)
 }
 
+var encTbl = map[uint8]ipsec.CipherAlgo{
+	pfkey.SADB_EALG_NONE:     ipsec.CipherAlgoNull,
+	pfkey.SADB_X_EALG_AESCBC: ipsec.CipherAlgoAesCbc,
+	pfkey.SADB_X_EALG_AESCTR: ipsec.CipherAlgoAesCtr,
+	pfkey.SADB_EALG_3DESCBC:  ipsec.CipherAlgo3desCbc,
+}
+
+var aeadTbl = map[uint8]ipsec.AeadAlgo{
+	pfkey.SADB_X_EALG_AES_GCM_ICV16: ipsec.AeadAlgoGcm,
+}
+
+var authTbl = map[uint8]ipsec.AuthAlgo{
+	pfkey.SADB_AALG_NONE:     ipsec.AuthAlgoNull,
+	pfkey.SADB_AALG_SHA1HMAC: ipsec.AuthAlgoSha1Hmac,
+}
+
 func getSupportedAuth() *[]pfkey.SadbAlg {
-	s := []pfkey.SadbAlg{
-		{
-			SadbAlgID:      pfkey.SADB_AALG_NONE,
-			SadbAlgMinbits: ipsec.SupportedAuthAlgo[ipsec.AuthAlgoTypeNull].KeyLen,
-			SadbAlgMaxbits: ipsec.SupportedAuthAlgo[ipsec.AuthAlgoTypeNull].KeyLen,
-		},
-		{
-			SadbAlgID:      pfkey.SADB_AALG_SHA1HMAC,
-			SadbAlgMinbits: ipsec.SupportedAuthAlgo[ipsec.AuthAlgoTypeSha1Hmac].KeyLen,
-			SadbAlgMaxbits: ipsec.SupportedAuthAlgo[ipsec.AuthAlgoTypeSha1Hmac].KeyLen,
-		},
+	s := []pfkey.SadbAlg{}
+	// Auth algo.
+	for auth, algo := range authTbl {
+		algoInfo := ipsec.SupportedAuthAlgo[algo]
+		minKeyLen := algoInfo.MinKeyLen
+		maxKeyLen := algoInfo.MaxKeyLen
+		a := pfkey.SadbAlg{
+			SadbAlgID:      auth,
+			SadbAlgMinbits: minKeyLen,
+			SadbAlgMaxbits: maxKeyLen,
+		}
+		s = append(s, a)
 	}
 
 	return &s
 }
 
 func getSupportedEnc() *[]pfkey.SadbAlg {
-	s := []pfkey.SadbAlg{
-		{
-			SadbAlgID:      pfkey.SADB_EALG_NONE,
-			SadbAlgIvlen:   uint8(ipsec.SupportedCipherAlgo[ipsec.CipherAlgoTypeNull].IvLen),
-			SadbAlgMinbits: ipsec.SupportedCipherAlgo[ipsec.CipherAlgoTypeNull].KeyLen * 8,
-			SadbAlgMaxbits: ipsec.SupportedCipherAlgo[ipsec.CipherAlgoTypeNull].KeyLen * 8,
-		},
-		{
-			SadbAlgID:      pfkey.SADB_X_EALG_AESCBC,
-			SadbAlgIvlen:   uint8(ipsec.SupportedCipherAlgo[ipsec.CipherAlgoTypeAesCbc].IvLen),
-			SadbAlgMinbits: ipsec.SupportedCipherAlgo[ipsec.CipherAlgoTypeAesCbc].KeyLen * 8,
-			SadbAlgMaxbits: ipsec.SupportedCipherAlgo[ipsec.CipherAlgoTypeAesCbc].KeyLen * 8,
-		},
-		{
-			SadbAlgID:      pfkey.SADB_X_EALG_AES_GCM_ICV16,
-			SadbAlgIvlen:   uint8(ipsec.SupportedAeadAlgo[ipsec.AeadAlgoTypeGcm].IvLen),
-			SadbAlgMinbits: ipsec.SupportedAeadAlgo[ipsec.AeadAlgoTypeGcm].KeyLen * 8,
-			SadbAlgMaxbits: ipsec.SupportedAeadAlgo[ipsec.AeadAlgoTypeGcm].KeyLen * 8,
-		},
-		{
-			SadbAlgID:      pfkey.SADB_X_EALG_AESCTR,
-			SadbAlgIvlen:   uint8(ipsec.SupportedCipherAlgo[ipsec.CipherAlgoTypeAesCtr].IvLen),
-			SadbAlgMinbits: ipsec.SupportedCipherAlgo[ipsec.CipherAlgoTypeAesCtr].KeyLen * 8,
-			SadbAlgMaxbits: ipsec.SupportedCipherAlgo[ipsec.CipherAlgoTypeAesCtr].KeyLen * 8,
-		},
+	s := []pfkey.SadbAlg{}
+	// Cipher algo.
+	for enc, algo := range encTbl {
+		algoInfo := ipsec.SupportedCipherAlgo[algo]
+		minKeyLen := algoInfo.MinKeyLen
+		maxKeyLen := algoInfo.MaxKeyLen
+		// Prerequisites: same length of IV.
+		ivLen := uint8(algoInfo.Algos[minKeyLen].IvLen)
+		a := pfkey.SadbAlg{
+			SadbAlgID:      enc,
+			SadbAlgIvlen:   ivLen,
+			SadbAlgMinbits: minKeyLen * 8,
+			SadbAlgMaxbits: maxKeyLen * 8,
+		}
+		s = append(s, a)
+	}
+	// AEAD algo.
+	for aead, algo := range aeadTbl {
+		algoInfo := ipsec.SupportedAeadAlgo[algo]
+		minKeyLen := algoInfo.MinKeyLen
+		maxKeyLen := algoInfo.MaxKeyLen
+		// Prerequisites: same length of IV.
+		ivLen := uint8(algoInfo.Algos[minKeyLen].IvLen)
+		a := pfkey.SadbAlg{
+			SadbAlgID:      aead,
+			SadbAlgIvlen:   ivLen,
+			SadbAlgMinbits: minKeyLen * 8,
+			SadbAlgMaxbits: maxKeyLen * 8,
+		}
+		s = append(s, a)
 	}
 
 	return &s
 }
 
-var encTbl = map[uint8]ipsec.CipherAlgoType{
-	pfkey.SADB_EALG_NONE:     ipsec.CipherAlgoTypeNull,
-	pfkey.SADB_X_EALG_AESCBC: ipsec.CipherAlgoTypeAesCbc,
-	pfkey.SADB_X_EALG_AESCTR: ipsec.CipherAlgoTypeAesCtr,
+func (s *sadbAddMsg) validCipherAlgo(algo ipsec.CipherAlgo,
+	sav *sad.SAValue) bool {
+
+	if algoInfo, ok := ipsec.SupportedCipherAlgo[algo]; ok {
+		keyLen := s.EncKey.SadbKey.SadbKeyBits / 8
+		if value, ok := algoInfo.Algos[keyLen]; ok {
+			sav.CipherAlgoType = value.Type
+			sav.CipherKey = append(sav.CipherKey,
+				(*s.EncKey.Key)[:value.KeyLen]...)
+			return true
+		}
+	}
+
+	log.Logger.Err("no encAlgo(Cipher): %v, KeyBits: %v",
+		s.Sa.SadbSaEncrypt, s.EncKey.SadbKey.SadbKeyBits)
+	return false
 }
 
-var authTbl = map[uint8]ipsec.AuthAlgoType{
-	pfkey.SADB_AALG_NONE:     ipsec.AuthAlgoTypeNull,
-	pfkey.SADB_AALG_SHA1HMAC: ipsec.AuthAlgoTypeSha1Hmac,
+func (s *sadbAddMsg) validAuthAlgo(algo ipsec.AuthAlgo,
+	sav *sad.SAValue) bool {
+
+	if algoInfo, ok := ipsec.SupportedAuthAlgo[algo]; ok {
+		keyLen := s.AuthKey.SadbKey.SadbKeyBits / 8
+		if value, ok := algoInfo.Algos[keyLen]; ok {
+			sav.AuthAlgoType = value.Type
+			sav.AuthKey = append(sav.AuthKey,
+				(*s.AuthKey.Key)[:value.KeyLen]...)
+			return true
+		}
+	}
+
+	log.Logger.Err("no authAlgo: %v, KeyBits: %v",
+		s.Sa.SadbSaAuth, s.AuthKey.SadbKey.SadbKeyBits)
+	return false
 }
-var aeadTbl = map[uint8]ipsec.AeadAlgoType{
-	pfkey.SADB_X_EALG_AES_GCM_ICV16: ipsec.AeadAlgoTypeGcm,
+
+func (s *sadbAddMsg) validAeadAlgo(algo ipsec.AeadAlgo,
+	sav *sad.SAValue) bool {
+
+	if algoInfo, ok := ipsec.SupportedAeadAlgo[algo]; ok {
+		keyLen := s.EncKey.SadbKey.SadbKeyBits / 8
+		if value, ok := algoInfo.Algos[keyLen]; ok {
+			sav.AeadAlgoType = value.Type
+			sav.AeadKey = append(sav.AeadKey,
+				(*s.EncKey.Key)[:value.KeyLen]...)
+			return true
+		}
+	}
+
+	log.Logger.Err("no encAlgo(AEAD): %v, KeyBits: %v",
+		s.Sa.SadbSaEncrypt, s.EncKey.SadbKey.SadbKeyBits)
+	return false
 }
 
 func (s *sadbAddMsg) toSadbSaSAV() (*sad.SAValue, bool) {
 	if s.Sa == nil {
-		log.Printf("invalid sa: %v", s.Sa)
+		log.Logger.Err("invalid sa: %v", s.Sa)
 		return nil, false
 	}
-	var ok bool
 	sav := sad.SAValue{
 		CSAValue: ipsec.CSAValue{
 			Flags: ipsec.IP4Tunnel,
 		},
 	}
 
-	if sav.CipherAlgo, ok = encTbl[s.Sa.SadbSaEncrypt]; ok {
+	if algo, ok := encTbl[s.Sa.SadbSaEncrypt]; ok {
 		// Cipher/Auth algo.
-		sav.CipherKey = append(sav.CipherKey,
-			(*s.EncKey.Key)[:s.EncKey.SadbKey.SadbKeyBits/8]...)
-		if sav.AuthAlgo, ok = authTbl[s.Sa.SadbSaAuth]; !ok {
-			log.Printf("no authAlgo: %v", s.Sa.SadbSaAuth)
+		//// Cipher algo.
+		if ok := s.validCipherAlgo(algo, &sav); !ok {
+			log.Logger.Err("no encAlgo(Cipher): %v", s.Sa.SadbSaEncrypt)
 			return nil, ok
 		}
-		sav.AuthKey = append(sav.AuthKey,
-			(*s.AuthKey.Key)[:s.AuthKey.SadbKey.SadbKeyBits/8]...)
-	} else if sav.AeadAlgo, ok = aeadTbl[s.Sa.SadbSaEncrypt]; ok {
+
+		//// Auth algo.
+		if algo, ok := authTbl[s.Sa.SadbSaAuth]; ok {
+			if ok := s.validAuthAlgo(algo, &sav); !ok {
+				log.Logger.Err("no authAlgo: %v", s.Sa.SadbSaAuth)
+				return nil, ok
+			}
+		} else {
+			log.Logger.Err("no authAlgo: %v", s.Sa.SadbSaAuth)
+			return nil, ok
+		}
+	} else if algo, ok := aeadTbl[s.Sa.SadbSaEncrypt]; ok {
 		// AEAD algo.
-		sav.AeadKey = append(sav.AeadKey,
-			(*s.EncKey.Key)[:s.EncKey.SadbKey.SadbKeyBits/8]...)
+		if ok := s.validAeadAlgo(algo, &sav); !ok {
+			log.Logger.Err("no encAlgo(AEAD): %v", s.Sa.SadbSaEncrypt)
+			return nil, ok
+		}
 	} else {
-		log.Printf("no encAlgo: %v", s.Sa.SadbSaEncrypt)
+		log.Logger.Err("no encAlgo: %v", s.Sa.SadbSaEncrypt)
 		return nil, ok
 	}
 
 	sav.State = sad.SAState(s.Sa.SadbSaState)
-	sav.LocalEPIP = *s.SrcAddress.ToIPNet()
-	sav.RemoteEPIP = *s.DstAddress.ToIPNet()
+	sav.LocalEPIP = s.SrcAddress.ToIPNet().IP
+	sav.RemoteEPIP = s.DstAddress.ToIPNet().IP
 	// XXX: NOT support lifetime allocations
 	now := time.Now()
 	if s.HardLifetime != nil {
-		log.Printf("SadbAddMsg: spi %d, hard addtime %d\n", s.Sa.SadbSaSpi,
+		log.Logger.Info("SadbAddMsg: spi %d, hard addtime %d", s.Sa.SadbSaSpi,
 			s.HardLifetime.SadbLifetimeAddtime)
 		if s.HardLifetime.SadbLifetimeAddtime != 0 {
 			sav.LifeTimeHard = now.Add(time.Duration(
@@ -272,7 +354,7 @@ func (s *sadbAddMsg) toSadbSaSAV() (*sad.SAValue, bool) {
 
 	}
 	if s.SoftLifetime != nil {
-		log.Printf("SadbAddMsg: spi %d, soft addtime %d\n", s.Sa.SadbSaSpi,
+		log.Logger.Info("SadbAddMsg: spi %d, soft addtime %d", s.Sa.SadbSaSpi,
 			s.SoftLifetime.SadbLifetimeAddtime)
 		if s.SoftLifetime.SadbLifetimeAddtime != 0 {
 			sav.LifeTimeSoft = now.Add(time.Duration(
@@ -284,14 +366,27 @@ func (s *sadbAddMsg) toSadbSaSAV() (*sad.SAValue, bool) {
 		sav.LifeTimeByteSoft = s.SoftLifetime.SadbLifetimeBytes
 	}
 	sav.LifeTimeCurrent = now
-	sav.Protocol = ipsec.SecurityProtocolTypeESP //XXX
+	sav.Protocol = ipsec.SecurityProtocolTypeESP //Only ESP supported.
+	if s.NatTType != nil {
+		if s.NatTType.SadbXNatTTypeType != uint8(ipsec.UDPEncapESPinUDP) ||
+			s.NatTSrcPort == nil || s.NatTDstPort == nil {
+			log.Logger.Err("natt invalid params: type %v, sport %v, dport %v", s.NatTType.SadbXNatTTypeType, s.NatTSrcPort, s.NatTDstPort)
+			return nil, false
+		}
+		sav.EncapType = ipsec.UDPEncapESPinUDP //Only UDP Encap supported.
+		sav.EncapProtocol = ipsec.EncapProtoUDP
+		sav.EncapSrcPort = s.NatTSrcPort.SadbXNatTPortPort
+		sav.EncapDstPort = s.NatTDstPort.SadbXNatTPortPort
+	}
 	return &sav, true
 }
 
 var encRTbl = map[ipsec.CipherAlgoType]uint8{
-	ipsec.CipherAlgoTypeNull:   pfkey.SADB_EALG_NONE,
-	ipsec.CipherAlgoTypeAesCbc: pfkey.SADB_X_EALG_AESCBC,
-	ipsec.CipherAlgoTypeAesCtr: pfkey.SADB_X_EALG_AESCTR,
+	ipsec.CipherAlgoTypeNull:      pfkey.SADB_EALG_NONE,
+	ipsec.CipherAlgoTypeAes128Cbc: pfkey.SADB_X_EALG_AESCBC,
+	ipsec.CipherAlgoTypeAes256Cbc: pfkey.SADB_X_EALG_AESCBC,
+	ipsec.CipherAlgoTypeAes128Ctr: pfkey.SADB_X_EALG_AESCTR,
+	ipsec.CipherAlgoType3desCbc:   pfkey.SADB_EALG_3DESCBC,
 }
 
 var authRTbl = map[ipsec.AuthAlgoType]uint8{
@@ -300,7 +395,7 @@ var authRTbl = map[ipsec.AuthAlgoType]uint8{
 }
 
 var aeadRTbl = map[ipsec.AeadAlgoType]uint8{
-	ipsec.AeadAlgoTypeGcm: pfkey.SADB_X_EALG_AES_GCM_ICV16,
+	ipsec.AeadAlgoTypeAes128Gcm: pfkey.SADB_X_EALG_AES_GCM_ICV16,
 }
 
 func (s *sadbGetMsg) toSadbGetMsgReply(sav *sad.SAValue, spi uint32) (*sadbGetMsgReply, bool) {
@@ -311,8 +406,8 @@ func (s *sadbGetMsg) toSadbGetMsgReply(sav *sad.SAValue, spi uint32) (*sadbGetMs
 
 	var aKey *pfkey.KeyPair
 	var eKey *pfkey.KeyPair
-	if enc, ok := encRTbl[sav.CipherAlgo]; ok {
-		if auth, ok := authRTbl[sav.AuthAlgo]; ok {
+	if enc, ok := encRTbl[sav.CipherAlgoType]; ok {
+		if auth, ok := authRTbl[sav.AuthAlgoType]; ok {
 			sa.SadbSaEncrypt = enc
 			sa.SadbSaAuth = auth
 			aKey = pfkey.ToKeyPair(&sav.AuthKey)
@@ -320,7 +415,7 @@ func (s *sadbGetMsg) toSadbGetMsgReply(sav *sad.SAValue, spi uint32) (*sadbGetMs
 		} else {
 			return nil, false
 		}
-	} else if enc, ok := aeadRTbl[sav.AeadAlgo]; ok {
+	} else if enc, ok := aeadRTbl[sav.AeadAlgoType]; ok {
 		sa.SadbSaEncrypt = enc
 		eKey = pfkey.ToKeyPair(&sav.AeadKey)
 	} else {
@@ -329,11 +424,11 @@ func (s *sadbGetMsg) toSadbGetMsgReply(sav *sad.SAValue, spi uint32) (*sadbGetMs
 
 	sAddr := pfkey.AddrPair{
 		Addr:     pfkey.SadbAddress{}, // XXX: to set proto, prefixlen?
-		SockAddr: pfkey.ToSockaddr(&sav.LocalEPIP),
+		SockAddr: pfkey.ToSockaddr(&net.IPNet{IP: sav.LocalEPIP}),
 	}
 	dAddr := pfkey.AddrPair{
 		Addr:     pfkey.SadbAddress{}, // XXX: to set proto, prefixlen?
-		SockAddr: pfkey.ToSockaddr(&sav.RemoteEPIP),
+		SockAddr: pfkey.ToSockaddr(&net.IPNet{IP: sav.RemoteEPIP}),
 	}
 	cTime := pfkey.SadbLifetime{
 		SadbLifetimeBytes:   sav.LifeTimeByteCurrent,
@@ -370,10 +465,10 @@ func sadbExpire(vrfIndex vswitch.VRFIndex, dir ipsec.DirectionType, spi sad.SPI,
 
 	if kind == sad.SoftLifetimeExpired {
 		s.expireMsg(sav, uint32(spi), true)
-		log.Printf("send soft expire message: spi %d\n", uint32(spi))
+		log.Logger.Info("send soft expire message: spi %d", uint32(spi))
 	} else {
 		s.expireMsg(sav, uint32(spi), false)
-		log.Printf("send hard expire message: spi %d\n", uint32(spi))
+		log.Logger.Info("send hard expire message: spi %d", uint32(spi))
 	}
 	smsg := pfkey.SadbMsgTransport{
 		sadbMsg,
@@ -406,7 +501,7 @@ func sadbExpire(vrfIndex vswitch.VRFIndex, dir ipsec.DirectionType, spi sad.SPI,
 	buf := bytes.Buffer{}
 	err := smsg.Serialize(&buf)
 	if err != nil {
-		log.Printf("SadbExpire: error: %v\n", err)
+		log.Logger.Err("SadbExpire: error: %v", err)
 		return false
 	}
 	con := &connections.Connections{}
@@ -420,19 +515,19 @@ func (s *sadbExpireMsg) expireMsg(sav *sad.SAValue, spi uint32, isSoft bool) {
 		SadbSaState: uint8(sav.State),
 	}
 	var ok bool
-	if s.sa.SadbSaEncrypt, ok = encRTbl[sav.CipherAlgo]; ok {
-		s.sa.SadbSaAuth, _ = authRTbl[sav.AuthAlgo]
+	if s.sa.SadbSaEncrypt, ok = encRTbl[sav.CipherAlgoType]; ok {
+		s.sa.SadbSaAuth, _ = authRTbl[sav.AuthAlgoType]
 	} else {
-		s.sa.SadbSaEncrypt, _ = aeadRTbl[sav.AeadAlgo]
+		s.sa.SadbSaEncrypt, _ = aeadRTbl[sav.AeadAlgoType]
 	}
 
 	s.srcAddress = &pfkey.AddrPair{
 		Addr:     pfkey.SadbAddress{}, // XXX: to set proto, prefixlen?
-		SockAddr: pfkey.ToSockaddr(&sav.LocalEPIP),
+		SockAddr: pfkey.ToSockaddr(&net.IPNet{IP: sav.LocalEPIP}),
 	}
 	s.dstAddress = &pfkey.AddrPair{
 		Addr:     pfkey.SadbAddress{}, // XXX: to set proto, prefixlen?
-		SockAddr: pfkey.ToSockaddr(&sav.RemoteEPIP),
+		SockAddr: pfkey.ToSockaddr(&net.IPNet{IP: sav.RemoteEPIP}),
 	}
 	s.currentLifetime = &pfkey.SadbLifetime{
 		SadbLifetimeBytes:   sav.LifeTimeByteCurrent,
@@ -480,7 +575,7 @@ func sadbAcquire(vrfIndex vswitch.VRFIndex, spEntryID uint32, src *net.IPNet, ds
 	buf := bytes.Buffer{}
 	err := smsg.Serialize(&buf)
 	if err != nil {
-		log.Printf("SadbAcquire: error: %v\n", err)
+		log.Logger.Err("SadbAcquire: error: %v", err)
 		return false
 	}
 	con := &connections.Connections{}

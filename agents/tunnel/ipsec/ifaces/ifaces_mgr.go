@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,12 +18,12 @@ package ifaces
 
 import (
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
 	"github.com/lagopus/vsw/modules/tunnel/ipsec"
-	"github.com/lagopus/vsw/modules/tunnel/ipsec/tick"
+	"github.com/lagopus/vsw/modules/tunnel/log"
+	"github.com/lagopus/vsw/modules/tunnel/tick"
 	"github.com/lagopus/vsw/vswitch"
 )
 
@@ -58,16 +58,6 @@ func newIfaceMgr() *Mgr {
 }
 
 func init() {
-	mgr := GetMgr()
-	accessor := &ipsec.IfaceAccessor{
-		SetVRFIndexFn: mgr.SetVRFIndex,
-		SetRingFn:     mgr.SetRing,
-		UnsetRingFn:   mgr.UnsetRing,
-		SetTTLFn:      mgr.SetTTL,
-		SetTOSFn:      mgr.SetTOS,
-	}
-
-	ipsec.RegisterAccessor(accessor)
 	if err := addTickTask(); err != nil {
 		panic("Can't add tick-task in Iface mgr.")
 	}
@@ -79,10 +69,10 @@ func addTickTask() error {
 	var task *tick.Task
 	var err error
 	if task, err = tick.NewTask("ifaceSetQueues", tickTackFunc, nil); err == nil {
-		ticker := tick.GetTicker()
+		ticker := ipsec.GetTicker()
 		return ticker.RegisterTask(task)
 	}
-	log.Println(err)
+	log.Logger.Err("%v", err)
 	return err
 }
 
@@ -94,6 +84,16 @@ func tickTackFunc(now time.Time, args []interface{}) error {
 
 func (mgr *Mgr) setModified(direction ipsec.DirectionType) {
 	mgr.dbs[direction].isModified = true
+}
+
+func (mgr *Mgr) cifaces(direction ipsec.DirectionType) (ipsec.Iface, error) {
+	if db, ok := mgr.dbs[direction]; ok {
+		if db.cifaces != nil {
+			return db.cifaces, nil
+		}
+		return nil, fmt.Errorf("cifaces is nil")
+	}
+	return nil, fmt.Errorf("not found db")
 }
 
 func (mgr *Mgr) iface(direction ipsec.DirectionType,
@@ -115,12 +115,15 @@ func (mgr *Mgr) pushIfaces(direction ipsec.DirectionType, db *db) error {
 	var array []ipsec.CIface
 	var err error
 	if array, err = db.cifaces.AllocArray(); err != nil {
+		log.Logger.Err("%v", err)
 		return err
 	}
 	defer db.cifaces.FreeArray(array)
 
 	for vifIndex, iface := range db.ifaces {
-		db.cifaces.SetCIface(&array[vifIndex], &iface.CIfaceValue)
+		if iface.vrfIndex() != nil {
+			db.cifaces.SetCIface(&array[vifIndex], &iface.CIfaceValue)
+		}
 	}
 	err = db.cifaces.PushIfaces(direction, array)
 
@@ -150,22 +153,43 @@ func (mgr *Mgr) push() error {
 
 // SetVRFIndex Set VRF index.
 func (mgr *Mgr) SetVRFIndex(vifIndex vswitch.VIFIndex,
-	vrfIndex vswitch.VRFIndex) {
+	vrfIndex *vswitch.VRFIndex) {
 	mgr.lock.Lock()
 	defer mgr.lock.Unlock()
 
-	log.Printf("vif index: %v, Set vrf index(%v)", vifIndex, vrfIndex)
+	log.Logger.Info("vif index: %v, Set vrf index(%v)", vifIndex, *vrfIndex)
 
 	for direction := range mgr.dbs {
 		var iface *iface
 		var err error
 		if iface, err = mgr.iface(direction, vifIndex); err != nil {
 			// ignore
-			log.Printf("%v", err)
+			log.Logger.Info("ignore: %v", err)
 			return
 		}
 
 		iface.setVRFIndex(vrfIndex)
+		mgr.setModified(direction)
+	}
+}
+
+// UnsetVRFIndex Unset VRF index.
+func (mgr *Mgr) UnsetVRFIndex(vifIndex vswitch.VIFIndex) {
+	mgr.lock.Lock()
+	defer mgr.lock.Unlock()
+
+	log.Logger.Info("vif index: %v", vifIndex)
+
+	for direction := range mgr.dbs {
+		var iface *iface
+		var err error
+		if iface, err = mgr.iface(direction, vifIndex); err != nil {
+			// ignore
+			log.Logger.Info("ignore: %v", err)
+			return
+		}
+
+		iface.unsetVRFIndex()
 		mgr.setModified(direction)
 	}
 }
@@ -175,14 +199,14 @@ func (mgr *Mgr) SetRing(vifIndex vswitch.VIFIndex, rings *ipsec.Rings) {
 	mgr.lock.Lock()
 	defer mgr.lock.Unlock()
 
-	log.Printf("vif index: %v, Set ring(%v)", vifIndex, rings)
+	log.Logger.Info("vif index: %v, Set ring(%v)", vifIndex, rings)
 
 	for direction := range mgr.dbs {
 		var iface *iface
 		var err error
 		if iface, err = mgr.iface(direction, vifIndex); err != nil {
 			// ignore
-			log.Printf("%v", err)
+			log.Logger.Info("ignore: %v", err)
 			return
 		}
 
@@ -196,14 +220,14 @@ func (mgr *Mgr) UnsetRing(vifIndex vswitch.VIFIndex) {
 	mgr.lock.Lock()
 	defer mgr.lock.Unlock()
 
-	log.Printf("vif index: %v, Unset ring", vifIndex)
+	log.Logger.Info("vif index: %v, Unset ring", vifIndex)
 
 	for direction := range mgr.dbs {
 		var iface *iface
 		var err error
 		if iface, err = mgr.iface(direction, vifIndex); err != nil {
 			// ignore
-			log.Printf("%v", err)
+			log.Logger.Info("ignore: %v", err)
 			return
 		}
 
@@ -218,7 +242,7 @@ func (mgr *Mgr) SetTTL(vifIndex vswitch.VIFIndex,
 	mgr.lock.Lock()
 	defer mgr.lock.Unlock()
 
-	log.Printf("vif index: %v, Set TTL(%v)",
+	log.Logger.Info("vif index: %v, Set TTL(%v)",
 		vifIndex, ttl)
 
 	for direction := range mgr.dbs {
@@ -226,7 +250,7 @@ func (mgr *Mgr) SetTTL(vifIndex vswitch.VIFIndex,
 		var err error
 		if iface, err = mgr.iface(direction, vifIndex); err != nil {
 			// ignore
-			log.Printf("%v", err)
+			log.Logger.Info("ignore: %v", err)
 			return
 		}
 
@@ -241,7 +265,7 @@ func (mgr *Mgr) SetTOS(vifIndex vswitch.VIFIndex,
 	mgr.lock.Lock()
 	defer mgr.lock.Unlock()
 
-	log.Printf("vif index: %v, Set TOS(%v)",
+	log.Logger.Info("vif index: %v, Set TOS(%v)",
 		vifIndex, tos)
 
 	for direction := range mgr.dbs {
@@ -249,13 +273,72 @@ func (mgr *Mgr) SetTOS(vifIndex vswitch.VIFIndex,
 		var err error
 		if iface, err = mgr.iface(direction, vifIndex); err != nil {
 			// ignore
-			log.Printf("%v", err)
+			log.Logger.Info("ignore: %v", err)
 			return
 		}
 
 		iface.setTOS(tos)
 		mgr.setModified(direction)
 	}
+}
+
+// Stats Get stats.
+func (mgr *Mgr) Stats(vifIndex vswitch.VIFIndex,
+	direction ipsec.DirectionType) *ipsec.CIfaceStats {
+	mgr.lock.Lock()
+	defer mgr.lock.Unlock()
+
+	log.Logger.Info("vif index: %v, Get Stats(%v)",
+		vifIndex, direction)
+
+	var cifaces ipsec.Iface
+	var err error
+	if cifaces, err = mgr.cifaces(direction); err != nil {
+		// ignore
+		log.Logger.Info("ignore: %v", err)
+		return &ipsec.CIfaceStats{}
+	}
+
+	// get stats pointer.
+	var s *ipsec.CIfaceStats
+	s, err = cifaces.Stats(direction, vifIndex)
+	if err != nil {
+		// ignore
+		log.Logger.Info("ignore: %v", err)
+		return &ipsec.CIfaceStats{}
+	}
+	// copy.
+	stats := *s
+	return &stats
+}
+
+// ResetStats Reset stats.
+func (mgr *Mgr) ResetStats(vifIndex vswitch.VIFIndex,
+	direction ipsec.DirectionType) {
+	mgr.lock.Lock()
+	defer mgr.lock.Unlock()
+
+	log.Logger.Info("vif index: %v, Reset Stats(%v)",
+		vifIndex, direction)
+
+	var cifaces ipsec.Iface
+	var err error
+	if cifaces, err = mgr.cifaces(direction); err != nil {
+		// ignore
+		log.Logger.Info("ignore: %v", err)
+		return
+	}
+
+	// get stats pointer.
+	var s *ipsec.CIfaceStats
+	s, err = cifaces.Stats(direction, vifIndex)
+	if err != nil {
+		// ignore
+		log.Logger.Info("ignore: %v", err)
+		return
+	}
+
+	*s = ipsec.CIfaceStats{}
 }
 
 // ClearIfaces Clear.

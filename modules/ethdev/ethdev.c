@@ -1,5 +1,5 @@
 /*
- * Copyright 2017 Nippon Telegraph and Telephone Corporation.
+ * Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,11 +18,11 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 #include <rte_config.h>
 #include <rte_mbuf.h>
 #include <rte_ethdev.h>
 
-//#define DEBUG
 #include "logger.h"
 #include "ethdev.h"
 #include "packet.h"
@@ -31,6 +31,14 @@ static void ethdev_rx_trunk(struct ethdev_rx_instance *, struct rte_mbuf **, int
 static void ethdev_rx_access(struct ethdev_rx_instance *, struct rte_mbuf **, int);
 static void ethdev_tx_trunk(struct ethdev_tx_instance *, struct rte_mbuf **, int);
 static void ethdev_tx_access(struct ethdev_tx_instance *, struct rte_mbuf **, int);
+
+static uint32_t log_id = 0;
+
+#define ETHDEV_DEBUG(fmt, x...)		vsw_msg_debug(log_id, 0, fmt, ## x)
+#define ETHDEV_INFO(fmt, x...)		vsw_msg_info(log_id, fmt, ## x)
+#define ETHDEV_WARNING(fmt, x...)	vsw_msg_warning(log_id, fmt, ## x)
+#define ETHDEV_ERROR(fmt, x...)		vsw_msg_error(log_id, fmt, ## x)
+#define ETHDEV_FATAL(fmt, x...)		vsw_msg_fatal(log_id, fmt, ## x)
 
 struct ethdev_runtime {
 	struct ethdev_instance *devs[RTE_MAX_ETHPORTS];
@@ -41,7 +49,7 @@ struct ethdev_runtime {
 };
 
 static bool
-ethdev_unregister_instance(void *p, struct lagopus_instance *base)
+ethdev_unregister_instance(void *p, struct vsw_instance *base)
 {
 	struct ethdev_runtime *r = p;
 	struct ethdev_instance *i = (struct ethdev_instance*)base;
@@ -86,12 +94,12 @@ ethdev_register_instance(struct ethdev_runtime *r, struct ethdev_instance *i)
 }
 
 static bool
-ethdev_tx_register_instance(void *p, struct lagopus_instance *base)
+ethdev_tx_register_instance(void *p, struct vsw_instance *base)
 {
 	struct ethdev_runtime *r = p;
 	struct ethdev_tx_instance *i = (struct ethdev_tx_instance*)base;
 
-	LAGOPUS_DEBUG("%s: %s=%p", __func__, i->common.base.name, i->common.base.input);
+	ETHDEV_DEBUG("%s: %s=%p", __func__, i->common.base.name, i->common.base.input);
 
 	if (!ethdev_register_instance(r, (struct ethdev_instance*)i))
 		return false;
@@ -107,7 +115,7 @@ ethdev_tx_register_instance(void *p, struct lagopus_instance *base)
 }
 
 static bool
-ethdev_rx_register_instance(void *p, struct lagopus_instance *base)
+ethdev_rx_register_instance(void *p, struct vsw_instance *base)
 {
 	struct ethdev_runtime *r = p;
 	struct ethdev_rx_instance *i = (struct ethdev_rx_instance*)base;
@@ -128,56 +136,52 @@ ethdev_rx_register_instance(void *p, struct lagopus_instance *base)
 }
 
 static bool
-ethdev_control_instance(void *p, struct lagopus_instance *base, void *param)
+ethdev_control_instance(void *p, struct vsw_instance *base, void *param)
 {
-	struct ethdev_runtime *r = p;
 	struct ethdev_control_param *ep = param;
 	struct ethdev_instance *i = (struct ethdev_instance*)base;
 
-	LAGOPUS_DEBUG("%s: name=%s cmd=%d vid=%d output=%p\n", __func__, base->name, ep->cmd, ep->vid, ep->output);
+	ETHDEV_DEBUG("%s: name=%s cmd=%d vid=%d output=%p\n", __func__, base->name, ep->cmd, ep->vid, ep->output);
 
 	switch (ep->cmd) {
 	case ETHDEV_CMD_ADD_VID:
 		i->base.outputs[ep->vid] = ep->output;
 		i->index[ep->vid] = ep->index;
+		i->counters[ep->vid] = ep->counter;
 		if (!i->trunk)
 			i->vid = ep->vid;
 		break;
 	case ETHDEV_CMD_DELETE_VID:
 		i->base.outputs[ep->vid] = NULL;
 		i->index[ep->vid] = VIF_INVALID_INDEX;
+		i->counters[ep->vid] = NULL;
 		if (!i->trunk)
 			i->vid = 0;
-		break;
-	case ETHDEV_CMD_SET_TRUNK_MODE:
-		i->tx = ethdev_tx_trunk;
-		i->rx = ethdev_rx_trunk;
-		i->trunk = true;
-		break;
-	case ETHDEV_CMD_SET_ACCESS_MODE:
-		i->tx = ethdev_tx_access;
-		i->rx = ethdev_rx_access;
-		i->trunk = false;
 		break;
 	case ETHDEV_CMD_SET_NATIVE_VID:
 		if (i->trunk) {
 			if (i->vid != 0) {
 				i->base.outputs[i->vid] = NULL;
 				i->index[ep->vid] = VIF_INVALID_INDEX;
+				i->counters[ep->vid] = NULL;
 			}
 			i->vid = ep->vid;
 			i->base.outputs[ep->vid] = ep->output;
 			i->index[ep->vid] = ep->index;
+			i->counters[ep->vid] = ep->counter;
 		}
 		break;
 	default:
+		// All other cases should have been processed in
+		// ethdev_{tx,rx}_control_instance().
 		return false;
 	}
 	return true;
 }
 
 static inline bool
-ethdev_update_forward_table(struct ethdev_rx_instance *i, struct ethdev_control_param *ep, fwd_type_t type) {
+ethdev_update_forward_table(struct ethdev_rx_instance *i, struct ethdev_control_param *ep,
+			    vsw_ether_dst_t type) {
 	if (ep->output != NULL) {
 		// Any matching packets shall be forwarded to the same ring (e.g. router)
 		if (!i->fwd[ep->vid]) {
@@ -189,16 +193,15 @@ ethdev_update_forward_table(struct ethdev_rx_instance *i, struct ethdev_control_
 		i->fwd_type[ep->vid] |= type;
 	} else {
 		i->fwd_type[ep->vid] &= ~type;
-		if (i->fwd_type[ep->vid] == ETHDEV_FWD_TYPE_NONE)
+		if (i->fwd_type[ep->vid] == VSW_ETHER_DST_UNKNOWN)
 			i->fwd[ep->vid] = NULL;
 	}
 	return true;
 }
 
 static bool
-ethdev_rx_control_instance(void *p, struct lagopus_instance *base, void *param)
+ethdev_rx_control_instance(void *p, struct vsw_instance *base, void *param)
 {
-	struct ethdev_runtime *r = p;
 	struct ethdev_control_param *ep = param;
 	struct ethdev_rx_instance *ri = (struct ethdev_rx_instance*)base;
 	struct ethdev_instance *i = (struct ethdev_instance*)base;
@@ -218,21 +221,25 @@ ethdev_rx_control_instance(void *p, struct lagopus_instance *base, void *param)
 		return true;
 
 	case ETHDEV_CMD_SET_DST_SELF_FORWARD:
-		return ethdev_update_forward_table(ri, ep, ETHDEV_FWD_TYPE_SELF);
+		return ethdev_update_forward_table(ri, ep, VSW_ETHER_DST_SELF);
 	case ETHDEV_CMD_SET_DST_BC_FORWARD:
-		return ethdev_update_forward_table(ri, ep, ETHDEV_FWD_TYPE_BC);
+		return ethdev_update_forward_table(ri, ep, VSW_ETHER_DST_BROADCAST);
 	case ETHDEV_CMD_SET_DST_MC_FORWARD:
-		return ethdev_update_forward_table(ri, ep, ETHDEV_FWD_TYPE_MC);
+		return ethdev_update_forward_table(ri, ep, VSW_ETHER_DST_MULTICAST);
+
+	// The followings are processed in ethdev_control_instance()
+	case ETHDEV_CMD_ADD_VID:
+	case ETHDEV_CMD_DELETE_VID:
+	case ETHDEV_CMD_SET_NATIVE_VID:
+		break;
 	}
 	return ethdev_control_instance(p, base, param);
 }
 
 static bool
-ethdev_tx_control_instance(void *p, struct lagopus_instance *base, void *param)
+ethdev_tx_control_instance(void *p, struct vsw_instance *base, void *param)
 {
-	struct ethdev_runtime *r = p;
 	struct ethdev_control_param *ep = param;
-	struct ethdev_tx_instance *ti = (struct ethdev_tx_instance*)base;
 	struct ethdev_instance *i = (struct ethdev_instance*)base;
 
 	switch (ep->cmd) {
@@ -250,6 +257,12 @@ ethdev_tx_control_instance(void *p, struct lagopus_instance *base, void *param)
 		i->tx = ethdev_tx_access;
 		i->trunk = false;
 		return true;
+
+	// The followings are processed in ethdev_control_instance()
+	case ETHDEV_CMD_ADD_VID:
+	case ETHDEV_CMD_DELETE_VID:
+	case ETHDEV_CMD_SET_NATIVE_VID:
+		break;
 	}
 	return ethdev_control_instance(p, base, param);
 }
@@ -264,23 +277,38 @@ create_mempool(const char *prefix, unsigned n, uint16_t data_room_size)
 	return rte_pktmbuf_pool_create(pool_name, n, 32, 0, data_room_size, socket_id);
 }
 
+static void
+update_logid()
+{
+	int id = vsw_log_getid("ethdev");
+	if (id >= 0)
+		log_id = (uint32_t)id;
+}
+
 static void*
 ethdev_rx_init(void *param)
 {
 	struct ethdev_runtime *r;
 	struct ethdev_runtime_param *p = param;
 
+	update_logid();
+
+	if (p->iopl_required && rte_eal_iopl_init() != 0) {
+		ETHDEV_ERROR("rte_eal_iopl_init() failed");
+		return NULL;
+	}
+
 	if (p == NULL || p->pool == NULL) {
-		LAGOPUS_DEBUG("ETHDEV: no mempool passed.");
+		ETHDEV_ERROR("no mempool passed.");
 		return NULL;
 	}
 
 	if (!(r = calloc(1, sizeof(struct ethdev_runtime)))) {
-		LAGOPUS_DEBUG("ETHDEV: calloc() failed. Can't start.");
+		ETHDEV_ERROR("calloc() failed. Can't start.");
 		return NULL;
 	}
 
-	LAGOPUS_DEBUG("ETHDEV: Starting bridge RX backend on slave core %u", rte_lcore_id());
+	ETHDEV_DEBUG("Starting bridge RX backend on slave core %u", rte_lcore_id());
 	r->max_port_id = -1;
 	r->pool = p->pool;
 
@@ -293,59 +321,48 @@ ethdev_tx_init(void *param)
 	struct ethdev_runtime *r;
 	struct ethdev_runtime_param *p = param;
 
+	update_logid();
+
+	if (p->iopl_required && rte_eal_iopl_init() != 0) {
+		ETHDEV_ERROR("rte_eal_iopl_init() failed");
+		return NULL;
+	}
+
 	if (!(r = calloc(1, sizeof(struct ethdev_runtime)))) {
-		LAGOPUS_DEBUG("ETHDEV: calloc() failed. Can't start.");
+		ETHDEV_ERROR("calloc() failed. Can't start.");
 		return NULL;
 	}
 
 	r->hdr_pool = create_mempool("ethdev-hdr-pool", ETHDEV_MBUF_LEN, 2 * RTE_PKTMBUF_HEADROOM);
 	if (r->hdr_pool == NULL) {
-		LAGOPUS_DEBUG("ETHDEV: create_mempol() for header failed.");
+		ETHDEV_ERROR("create_mempol() for header failed.");
 		free(r);
 		return NULL;
 	}
 
 	r->cln_pool = create_mempool("ethdev-cln-pool", ETHDEV_MBUF_LEN, 0);
 	if (r->cln_pool == NULL) {
-		LAGOPUS_DEBUG("ETHDEV: create_mempol() for clone failed.");
+		ETHDEV_ERROR("create_mempol() for clone failed.");
 		rte_mempool_free(r->hdr_pool);
 		free(r);
 		return NULL;
 	}
 
-	LAGOPUS_DEBUG("ETHDEV: Starting bridge TX backend on slave core %u", rte_lcore_id());
+	ETHDEV_DEBUG("Starting bridge TX backend on slave core %u", rte_lcore_id());
 	r->max_port_id = -1;
 
 	return r;
 }
 
-static inline fwd_type_t
-ethdev_mark_and_check_next_module(struct rte_mbuf *mbuf, struct ether_addr *self, vifindex_t index)
+static inline void
+ethdev_set_metadata(struct rte_mbuf *mbuf, vifindex_t index)
 {
-	fwd_type_t fwd = ETHDEV_FWD_TYPE_NONE;
-	struct lagopus_packet_metadata *md = LAGOPUS_MBUF_METADATA(mbuf);
-	memset((void*)md, 0, sizeof(struct vif_metadata));
-
-	// check if the packet is sent to me
-	struct ether_hdr *hdr = rte_pktmbuf_mtod(mbuf, struct ether_hdr *);
-
-	if (is_same_ether_addr(&hdr->d_addr, self)) {
-		md->md_vif.flags |= LAGOPUS_MD_SELF;
-		fwd = ETHDEV_FWD_TYPE_SELF;
-	} else {
-		md->md_vif.flags &= ~LAGOPUS_MD_SELF;
-
-		if (is_multicast_ether_addr(&hdr->d_addr))
-			fwd = ETHDEV_FWD_TYPE_MC;
-		else if (is_broadcast_ether_addr(&hdr->d_addr))
-			fwd = ETHDEV_FWD_TYPE_BC;
-	}
-
-	md->md_vif.in_vif = index;
-	md->md_vif.out_vif = VIF_INVALID_INDEX;
-	md->md_vif.local = false;
-
-	return fwd;
+	struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
+	struct vsw_common_metadata metadata = {
+		.in_vif = index,
+		.out_vif = VIF_INVALID_INDEX,
+	};
+	md->common = metadata;
 }
 
 static void
@@ -355,8 +372,10 @@ ethdev_rx_trunk(struct ethdev_rx_instance *e, struct rte_mbuf **mbufs, int rx_co
 	vifindex_t *index = e->common.index;
 	struct rte_ring **outputs = e->common.base.outputs;
 	struct rte_ring **fwd = e->fwd;
-	fwd_type_t *ft = e->fwd_type;
+	vsw_ether_dst_t *ft = e->fwd_type;
 	struct ether_addr *self_addr = &e->self_addr;
+	struct vsw_counter *c = e->common.counter;
+	struct vsw_counter **counters = e->common.counters;
 
 	// TRUNK Mode
 	for (int i = 0; i < rx_count; i++) {
@@ -369,7 +388,7 @@ ethdev_rx_trunk(struct ethdev_rx_instance *e, struct rte_mbuf **mbufs, int rx_co
 				mbuf->ol_flags |= PKT_RX_VLAN | PKT_RX_VLAN_STRIPPED;
 			} else {
 				rte_pktmbuf_free(mbuf);
-				e->rx_dropped++;
+				c->in_discards++;
 				continue;
 			}
 		}
@@ -378,19 +397,27 @@ ethdev_rx_trunk(struct ethdev_rx_instance *e, struct rte_mbuf **mbufs, int rx_co
 		// is not optimal.
 		uint16_t vlan_id = mbuf->vlan_tci & 0xfff;
 		struct rte_ring *output = outputs[vlan_id];
-		bool enqueued = false;
-
-		if (output) {
-			if (ethdev_mark_and_check_next_module(mbuf, self_addr, index[vlan_id]) & ft[vlan_id])
-				output = fwd[vlan_id];
-			enqueued = (rte_ring_enqueue(output, mbuf) == 0);
+		if (!output) {
+			// Invalid VID
+			rte_pktmbuf_free(mbuf);
+			c->in_discards++;
+			continue;
 		}
 
-		if (enqueued) {
-			e->rx_count++;
+		struct vsw_counter *vc = counters[vlan_id];
+		vsw_ether_dst_t dt = vsw_check_ether_dst_and_self(mbuf, self_addr);
+		VSW_ETHER_UPDATE_IN_COUNTER2(c, vc, dt);
+
+		ethdev_set_metadata(mbuf, index[vlan_id]);
+		if (dt & ft[vlan_id])
+			output = fwd[vlan_id];
+
+		if (rte_ring_enqueue(output, mbuf) == 0) {
+			vc->in_octets += mbuf->pkt_len;
 		} else {
 			rte_pktmbuf_free(mbuf);
-			e->rx_dropped++;
+			c->in_discards++;
+			vc->in_discards++;
 		}
 	}
 }
@@ -414,25 +441,36 @@ ethdev_rx_access(struct ethdev_rx_instance *e, struct rte_mbuf **mbufs, int rx_c
 	vifindex_t index = e->common.index[vid];
 	struct rte_ring *output = e->common.base.outputs[vid];
 	struct rte_ring *fwd_output = e->fwd[vid];
-	fwd_type_t ft = e->fwd_type[vid];
+	vsw_ether_dst_t ft = e->fwd_type[vid];
 
 	struct ether_addr *self_addr = &e->self_addr;
 
 	unsigned count = 0;
 	unsigned fwd_count = 0;
 
+	struct vsw_counter *c = e->common.counter;
+
 	for (int i = 0; i < rx_count; i++) {
 		struct rte_mbuf *mbuf = mbufs[i];
+
 		struct ether_hdr *eh = rte_pktmbuf_mtod(mbuf, struct ether_hdr *);
 
 		// Drop packets with tags
 		if (eh->ether_type == rte_cpu_to_be_16(ETHER_TYPE_VLAN)) {
 			rte_pktmbuf_free(mbuf);
-			e->rx_dropped++;
+			c->in_discards++;
 			continue;
 		}
 
-		if (ethdev_mark_and_check_next_module(mbuf, self_addr, index) & ft)
+		ethdev_set_metadata(mbuf, index);
+
+		vsw_ether_dst_t dt = vsw_check_ether_dst_and_self(mbuf, self_addr);
+
+		// For ACCESS mode, the counter will anyway be the same
+		// for interface and subinterface.
+		VSW_ETHER_UPDATE_IN_COUNTER(c, dt);
+
+		if (dt & ft)
 			fwd_mbufs[fwd_count++] = mbuf;
 		else
 			in_mbufs[count++] = mbuf;
@@ -450,12 +488,8 @@ ethdev_rx_access(struct ethdev_rx_instance *e, struct rte_mbuf **mbufs, int rx_c
 	if (fwd_output)
 		fwd_sent = rte_ring_enqueue_burst(fwd_output, (void * const*)fwd_mbufs, fwd_count, NULL);
 
-	unsigned total_sent = sent + fwd_sent;
-
-	LAGOPUS_DEBUG("ETHDEV: Rcv'd %d/%d packets for %d.", total_sent, rx_count, e->common.port_id);
-
-	e->rx_count += total_sent;
-	e->rx_dropped += rx_count - total_sent;
+	unsigned discarded = rx_count - sent - fwd_sent;
+	c->in_discards += discarded;
 
 	ethdev_free_mbufs(in_mbufs, count, sent);
 	ethdev_free_mbufs(fwd_mbufs, fwd_count, fwd_sent);
@@ -475,20 +509,11 @@ ethdev_rx_process(void *p)
 		// RX and process incoming packets
 		uint16_t rx_count = rte_eth_rx_burst(port_id, 0, mbufs, e->nb_rx_desc);
 		if (rx_count > 0) {
-			LAGOPUS_DEBUG("port_id=%d, rx_count=%d, vid=%d\n", port_id, rx_count, e->common.vid);
+			ETHDEV_DEBUG("port_id=%d, rx_count=%d, vid=%d\n", port_id, rx_count, e->common.vid);
 			e->common.rx(e, mbufs, rx_count);
 		}
 	}
 	return true;
-}
-
-static inline void
-ethdev_tx_burst(struct ethdev_tx_instance *e, struct rte_mbuf **mbufs, int count, int tx_count)
-{
-	unsigned sent = rte_eth_tx_burst(e->common.port_id, 0, mbufs, count);
-	e->tx_count += sent;
-	e->tx_dropped += tx_count - sent;
-	ethdev_free_mbufs(mbufs, count, sent);
 }
 
 /*
@@ -605,58 +630,118 @@ ethdev_insert_vlan(struct rte_mbuf *m, struct rte_mempool *hdr_pool, struct rte_
 	return hdr;
 }
 
+#define DISCARD_MBUF(m, i, s) {								\
+	rte_pktmbuf_free((m)[i]); 							\
+	(s)--; 										\
+	memmove(&(m)[i], &(m)[i + 1], sizeof(struct rte_mbuf *) * ((s) - (i)));		\
+}
+
+
+
 static void
 ethdev_tx_trunk(struct ethdev_tx_instance *e, struct rte_mbuf **mbufs, int tx_count)
 {
-	struct rte_mbuf *out_mbufs[ETHDEV_MBUF_LEN]; // FIXME
 	struct rte_ring **outputs = e->common.base.outputs;
 	uint16_t vid = e->common.vid;
-	int cnt = 0;
+	int cnt = tx_count;
 	struct rte_mempool *hp = e->r->hdr_pool;
 	struct rte_mempool *cp = e->r->cln_pool;
+	struct vsw_counter *c = e->common.counter;
+	struct vsw_counter *nc = e->common.counters[vid];
+	struct vsw_counter **counters = e->common.counters;
 
-	for (int i = 0; i < tx_count; i++) {
+	for (int i = 0; i < cnt; i++) {
 		struct rte_mbuf *mbuf = mbufs[i];
 
-		if (!outputs[mbuf->vlan_tci & 0xfff]) {
+		vsw_ether_dst_t dt = vsw_check_ether_dst(mbuf);
+
+		VSW_ETHER_UPDATE_OUT_COUNTER(c, dt);
+
+		uint16_t vlan_id = mbuf->vlan_tci & 0xfff;
+
+		if (!outputs[vlan_id]) {
 			// Invalid VID
-			rte_pktmbuf_free(mbuf);
+			DISCARD_MBUF(mbufs, i, cnt);
+			c->out_discards++;
 			continue;
 		}
 
-		if (mbuf->vlan_tci != vid) {
+		// Some vPMD doesn't support multi-segment mbuf.
+		if ((e->force_linearize) && (mbuf->next)) {
+			if (rte_pktmbuf_linearize(mbuf) != 0) {
+				DISCARD_MBUF(mbufs, i, cnt);
+				c->out_discards++;
+				continue;
+			}
+		}
+
+		if (vlan_id != vid) {
 			// Tag none-Native VID
 			struct rte_mbuf *tagged_mbuf = ethdev_insert_vlan(mbuf, hp, cp);
 			if (tagged_mbuf != NULL) {
-				out_mbufs[cnt++] = tagged_mbuf;
+				mbufs[i] = tagged_mbuf;
+
+				struct vsw_counter *vc = counters[vlan_id];
+				VSW_ETHER_UPDATE_OUT_COUNTER(vc, dt);
+				vc->out_octets += mbuf->pkt_len;
 			} else {
-				rte_pktmbuf_free(mbuf);
+				DISCARD_MBUF(mbufs, i, cnt);
+				c->out_discards++;
 			}
 		} else {
-			// Native VID
-			out_mbufs[cnt++] = mbuf;
+			VSW_ETHER_UPDATE_OUT_COUNTER(nc, dt);
+			nc->out_octets += mbuf->pkt_len;
 		}
 	}
-	ethdev_tx_burst(e, out_mbufs, cnt, tx_count);
+
+	unsigned sent = rte_eth_tx_burst(e->common.port_id, 0, mbufs, cnt);
+	c->out_discards += cnt - sent;
+
+	// Count up discarded packets for each VLAN
+	while (unlikely(sent < cnt)) {
+		struct rte_mbuf *mbuf = mbufs[sent];
+		uint16_t vlan_id = mbuf->vlan_tci & 0xfff;
+		struct vsw_counter *vc = (vlan_id == vid) ? nc : counters[vlan_id];
+
+		vc->out_discards++;
+		vc->out_octets -= mbuf->pkt_len;
+
+		rte_pktmbuf_free(mbuf);
+		sent++;
+	}
 }
 
 static void
 ethdev_tx_access(struct ethdev_tx_instance *e, struct rte_mbuf **mbufs, int tx_count)
 {
-	struct rte_mbuf *out_mbufs[ETHDEV_MBUF_LEN]; // FIXME
 	uint16_t vid = e->common.vid;
-	int cnt = 0;
+	int cnt = tx_count;
+	struct vsw_counter *c = e->common.counter;
 
-	for (int i = 0; i < tx_count; i++) {
+	for (int i = 0; i < cnt; i++) {
 		struct rte_mbuf *mbuf = mbufs[i];
 
+		vsw_ether_dst_t dt = vsw_check_ether_dst(mbuf);
+		VSW_ETHER_UPDATE_OUT_COUNTER(c, dt);
+
 		if (unlikely(mbuf->vlan_tci != vid)) {
-			rte_pktmbuf_free(mbuf);
+			DISCARD_MBUF(mbufs, i, cnt);
+			c->out_discards++;
 			continue;
 		}
-		out_mbufs[cnt++] = mbuf;
+
+		// Some vPMD doesn't support multi-segment mbuf.
+		if ((e->force_linearize) && (mbuf->next)) {
+			if (rte_pktmbuf_linearize(mbuf) != 0) {
+				DISCARD_MBUF(mbufs, i, cnt);
+				c->out_discards++;
+			}
+		}
 	}
-	ethdev_tx_burst(e, out_mbufs, cnt, tx_count);
+
+	unsigned sent = rte_eth_tx_burst(e->common.port_id, 0, mbufs, cnt);
+	ethdev_free_mbufs(mbufs, cnt, sent);
+	c->out_discards += cnt - sent;
 }
 
 static bool
@@ -676,7 +761,7 @@ ethdev_tx_process(void *p)
 		// TX outoing packets
 		if (tx_count > 0) {
 			uint16_t vid = e->common.vid;
-			LAGOPUS_DEBUG("port_id=%d, tx_count=%d, vid=%d\n", port_id, tx_count, vid);
+			ETHDEV_DEBUG("port_id=%d, tx_count=%d, vid=%d\n", port_id, tx_count, vid);
 			e->common.tx(e, mbufs, tx_count);
 		}
 	}
@@ -700,7 +785,7 @@ ethdev_deinit(void *p)
 	free(r);
 }
 
-struct lagopus_runtime_ops ethdev_rx_runtime_ops = {
+struct vsw_runtime_ops ethdev_rx_runtime_ops = {
 	.init = ethdev_rx_init,
 	.process = ethdev_rx_process,
 	.deinit = ethdev_deinit,
@@ -710,7 +795,7 @@ struct lagopus_runtime_ops ethdev_rx_runtime_ops = {
 	.control_instance = ethdev_rx_control_instance,
 };
 
-struct lagopus_runtime_ops ethdev_tx_runtime_ops = {
+struct vsw_runtime_ops ethdev_tx_runtime_ops = {
 	.init = ethdev_tx_init,
 	.process = ethdev_tx_process,
 	.deinit = ethdev_deinit,

@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -35,36 +35,15 @@ const (
 	DefaultTOS int8 = C.DEFAULT_TOS
 )
 
-// SetVRFIndexFunc Func of setVRFIndex.
-type SetVRFIndexFunc func(vswitch.VIFIndex, vswitch.VRFIndex)
-
-// SetRingFunc Func of setRing.
-type SetRingFunc func(vswitch.VIFIndex, *Rings)
-
-// UnsetRingFunc Func of unsetRing.
-type UnsetRingFunc func(vswitch.VIFIndex)
-
-// SetTTLFunc Func of setTTL.
-type SetTTLFunc func(vswitch.VIFIndex, uint8)
-
-// SetTOSFunc Func of setTOS.
-type SetTOSFunc func(vswitch.VIFIndex, int8)
-
-// IfaceAccessor Accessor of Iface.
-type IfaceAccessor struct {
-	SetVRFIndexFn SetVRFIndexFunc
-	SetRingFn     SetRingFunc
-	UnsetRingFn   UnsetRingFunc
-	SetTTLFn      SetTTLFunc
-	SetTOSFn      SetTOSFunc
-}
-
 // CIface struct iface.
 type CIface C.struct_iface
 
+// CIfaceStats iface_stats_t.
+type CIfaceStats C.iface_stats_t
+
 // CIfaceValue Value of iface.
 type CIfaceValue struct {
-	VRFIndex vswitch.VRFIndex
+	VRFIndex *vswitch.VRFIndex
 	VIFIndex vswitch.VIFIndex
 	Input    *dpdk.Ring
 	Output   *dpdk.Ring
@@ -75,10 +54,12 @@ type CIfaceValue struct {
 // Iface CIfaces interface.
 type Iface interface {
 	PushIfaces(direction DirectionType, array []CIface) error
+	Stats(direction DirectionType,
+		index vswitch.VIFIndex) (*CIfaceStats, error)
 	AllocArray() ([]CIface, error)
 	FreeArray(array []CIface)
 	SetCIface(ciface *CIface, value *CIfaceValue)
-	String() string
+	fmt.Stringer
 }
 
 // BaseCIfaces
@@ -132,6 +113,22 @@ func (i *BaseCIfaces) PushIfaces(direction DirectionType, array []CIface) error 
 	return nil
 }
 
+// Stats Get Stats.
+func (i *BaseCIfaces) Stats(direction DirectionType,
+	index vswitch.VIFIndex) (*CIfaceStats, error) {
+	if err := i.setModuleCIfaces(direction); err != nil {
+		return nil, err
+	}
+
+	var st *CIfaceStats
+	if r := LagopusResult(C.ifaces_get_stats(i.cifaces,
+		C.vifindex_t(index),
+		(**C.iface_stats_t)(unsafe.Pointer(&st)))); r != LagopusResultOK {
+		return nil, fmt.Errorf("%v, Fail ifaces_get_stats()", i)
+	}
+	return st, nil
+}
+
 // AllocArray Alloc array of struct iface.
 func (i *BaseCIfaces) AllocArray() ([]CIface, error) {
 	if array := C.ifaces_alloc_array(C.size_t(MaxVIFEntries)); array != nil {
@@ -149,10 +146,12 @@ func (i *BaseCIfaces) FreeArray(array []CIface) {
 func (i *BaseCIfaces) SetCIface(ciface *CIface, value *CIfaceValue) {
 	a := (*C.struct_iface)((unsafe.Pointer(ciface)))
 	ci := C.struct_iface{
-		vrf_index: C.vrfindex_t(value.VRFIndex),
 		vif_index: C.vifindex_t(value.VIFIndex),
 		ttl:       C.uint8_t(value.TTL),
 		tos:       C.int8_t(value.TOS),
+	}
+	if value.VRFIndex != nil {
+		ci.vrf_index = C.vrfindex_t(*value.VRFIndex)
 	}
 	if value.Input != nil {
 		ci.input = (*C.struct_rte_ring)(unsafe.Pointer(value.Input))
@@ -179,42 +178,4 @@ func NewCIfaces() *CIfaces {
 // String String.
 func (i *CIfaces) String() string {
 	return "CIfaces"
-}
-
-// Rings.
-
-// Rings Input/Output rings.
-type Rings struct {
-	inputInbound  *dpdk.Ring
-	inputOutbound *dpdk.Ring
-	output        *dpdk.Ring
-}
-
-// NewRings Create Rings.
-func NewRings(inputInbound *dpdk.Ring, inputOutbound *dpdk.Ring,
-	output *dpdk.Ring) *Rings {
-	return &Rings{
-		inputInbound:  inputInbound,
-		inputOutbound: inputOutbound,
-		output:        output,
-	}
-}
-
-// Input Get input ring.
-func (rs *Rings) Input(direction DirectionType) *dpdk.Ring {
-	if direction == DirectionTypeIn {
-		return rs.inputInbound
-	}
-	return rs.inputOutbound
-}
-
-// Output Get output ring.
-func (rs *Rings) Output() *dpdk.Ring {
-	return rs.output
-}
-
-// String String.
-func (rs *Rings) String() string {
-	return fmt.Sprintf("inputInbound: %p, inputOutbound, %p, output: %p",
-		rs.inputInbound, rs.inputOutbound, rs.output)
 }

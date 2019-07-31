@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,14 +19,14 @@ package spd
 import (
 	"fmt"
 	"hash/fnv"
-	"log"
 	"net"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/lagopus/vsw/modules/tunnel/ipsec"
-	"github.com/lagopus/vsw/modules/tunnel/ipsec/tick"
+	"github.com/lagopus/vsw/modules/tunnel/log"
+	"github.com/lagopus/vsw/modules/tunnel/tick"
 	"github.com/lagopus/vsw/vswitch"
 )
 
@@ -66,10 +66,10 @@ func addTickTask() error {
 	var task *tick.Task
 	var err error
 	if task, err = tick.NewTask("spdMake", tickTackFunc, nil); err == nil {
-		ticker := tick.GetTicker()
+		ticker := ipsec.GetTicker()
 		return ticker.RegisterTask(task)
 	}
-	log.Println(err)
+	log.Logger.Err("%v", err)
 	return err
 }
 
@@ -78,7 +78,7 @@ func tickTackFunc(now time.Time, args []interface{}) error {
 
 	mgr.expiredSP(now)
 	if err := mgr.statsSPD(); err != nil {
-		log.Println(err)
+		log.Logger.Err("%v", err)
 		return err
 	}
 
@@ -165,7 +165,7 @@ func (mgr *Mgr) makeSPD() error {
 			var err error
 			for _, spd := range vrf.spds {
 				if err = spd.makeSPD(); err != nil {
-					log.Println(err)
+					log.Logger.Err("%v", err)
 					vrf.isModified = false
 					return err
 				}
@@ -191,7 +191,7 @@ func (mgr *Mgr) statsSPD() error {
 	for _, vrf := range mgr.vrfs {
 		for _, spd := range vrf.spds {
 			if err = spd.statsSPD(); err != nil {
-				log.Println(err)
+				log.Logger.Err("%v", err)
 				return err
 			}
 		}

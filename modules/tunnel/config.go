@@ -1,5 +1,5 @@
 //
-// Copyright 2017 Nippon Telegraph and Telephone Corporation.
+// Copyright 2017-2019 Nippon Telegraph and Telephone Corporation.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ package tunnel
 import (
 	"sync"
 
+	"github.com/lagopus/vsw/modules/tunnel/vxlan"
 	"github.com/lagopus/vsw/vswitch"
 )
 
@@ -39,34 +40,50 @@ func newModuleConfigs() *ModuleConfigs {
 
 // ModuleConfig Config of tunnel module.
 type ModuleConfig struct {
+	// CoreBind
+	CoreBind bool `toml:"core_bind"`
 	// InboundCore
 	InboundCore uint `toml:"inbound_core"`
 	// OutboundCore
 	OutboundCore uint `toml:"outbound_core"`
+	// InboundCoreMask
+	InboundCoreMask uint `toml:"inbound_core_mask"`
+	// OutboundCoreMask
+	OutboundCoreMask uint   `toml:"outbound_core_mask"`
+	AgingTime        uint64 `toml:"aging_time"`
+	RuleFile         string `toml:"rule_file"`
 }
 
 func newModuleConfig() *ModuleConfig {
 	return &ModuleConfig{
-		InboundCore:  defaultInboundCore,
-		OutboundCore: defaultOutboundCore,
+		CoreBind:         defaultCoreBind,
+		InboundCore:      defaultInboundCore,
+		OutboundCore:     defaultOutboundCore,
+		InboundCoreMask:  defaultInboundCoreMask,
+		OutboundCoreMask: defaultOutboundCoreMask,
+		AgingTime:        vxlan.DefaultAgingTime,
+		RuleFile:         defaultRuleFile,
 	}
 }
 
-func getModuleConfig(p ProtocolType) *ModuleConfig {
+// GetModuleConfig Get ModuleConfig.
+func GetModuleConfig(p ProtocolType) (*ModuleConfig, error) {
 	configLock.Lock()
 	defer configLock.Unlock()
 
 	if configs == nil {
 		configs = newModuleConfigs()
+		configs.Tunnels[IPsec.String()] = newModuleConfig()
 		configs.Tunnels[IPIP.String()] = newModuleConfig()
 		configs.Tunnels[GRE.String()] = newModuleConfig()
+		configs.Tunnels[L2GRE.String()] = newModuleConfig()
+		configs.Tunnels[VXLAN.String()] = newModuleConfig()
 
 		_, configErr := vswitch.GetConfig().Decode(configs)
 		if configErr != nil {
-			log.Printf("[%s] decode failed: %v", ModuleName, configErr)
+			return nil, configErr
 		}
-		log.Printf("[%s] configs: %#v", ModuleName, configs)
 	}
 
-	return configs.Tunnels[p.String()]
+	return configs.Tunnels[p.String()], nil
 }

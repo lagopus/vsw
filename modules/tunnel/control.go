@@ -24,6 +24,7 @@ import "C"
 
 import (
 	"net"
+	"unsafe"
 
 	"github.com/lagopus/vsw/vswitch"
 )
@@ -31,6 +32,19 @@ import (
 //
 // L3
 //
+
+func toL3CParam(from *C.struct_l3tun_control_param) *C.struct_l3tun_control_param {
+	to := (*C.struct_l3tun_control_param)(C.calloc(1, C.sizeof_struct_l3tun_control_param))
+	if to == nil {
+		return nil
+	}
+	*to = *from
+	return to
+}
+
+func freeL3CParam(cparam *C.struct_l3tun_control_param) {
+	C.free(unsafe.Pointer(cparam))
+}
 
 func createL3SetAddressTypeCmdParam(addressType vswitch.AddressFamily) *C.struct_l3tun_control_param {
 	return &C.struct_l3tun_control_param{
@@ -91,6 +105,19 @@ func createL3SetDisableCmdParam() *C.struct_l3tun_control_param {
 //
 // L2
 //
+
+func toL2CParam(from *C.struct_l2tun_control_param) *C.struct_l2tun_control_param {
+	to := (*C.struct_l2tun_control_param)(C.calloc(1, C.sizeof_struct_l2tun_control_param))
+	if to == nil {
+		return nil
+	}
+	*to = *from
+	return to
+}
+
+func freeL2CParam(cparam *C.struct_l2tun_control_param) {
+	C.free(unsafe.Pointer(cparam))
+}
 
 func createL2SetAddressTypeCmdParam(addressType vswitch.AddressFamily) *C.struct_l2tun_control_param {
 	return &C.struct_l2tun_control_param{

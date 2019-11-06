@@ -129,7 +129,12 @@ func (him *HostifModule) RecvBulk(ctx context.Context, in *pb.Null) (*pb.BulkPac
 		for i := uint(0); i < rxc; i++ {
 			m := mbufs[i]
 			md := (*vswitch.Metadata)(m.Metadata())
-			name := vswitch.GetVIFByIndex(md.InVIF()).Name()
+			inVIF := vswitch.GetVIFByIndex(md.InVIF())
+			if inVIF == nil {
+				m.Free()
+				continue
+			}
+			name := inVIF.Name()
 
 			pkts[i] = &pb.Packet{
 				Len:       uint32(m.DataLen()),

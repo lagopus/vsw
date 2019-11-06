@@ -54,6 +54,7 @@ type VIF struct {
 	lastChange time.Time
 	*IPAddrs
 	*Neighbours
+	*VRRP
 }
 
 type vifManager struct {
@@ -90,6 +91,10 @@ func newVIF(i *Interface, name string) (*VIF, error) {
 	v.IPAddrs = newIPAddrs(v)
 	v.Neighbours = newNeighbours(v)
 	v.base = newSubInstance(i.base, v.name)
+	v.VRRP = newVRRP(v)
+	if v.VRRP == nil {
+		return nil, fmt.Errorf("VRRP creation failed: %v", name)
+	}
 
 	vifMgr.vifs[name] = v
 	vifMgr.indices[v.index] = v
@@ -116,22 +121,17 @@ func (v *VIF) setVIFInstance(vi VIFInstance) error {
 // If the VIF is associated VRF, the VIF is automatically
 // deleted from the VRF.
 func (v *VIF) Free() {
-	v.mutex.Lock()
-	defer v.mutex.Unlock()
-
 	if v.vrf != nil {
 		v.vrf.DeleteVIF(v)
-		v.vrf = nil
 	}
 	if v.vsi != nil {
 		v.vsi.DeleteVIF(v)
-		v.vsi = nil
 	}
 
-	v.iface.deleteVIF(v)
 	if v.instance != nil {
 		v.instance.Free()
 	}
+	v.iface.deleteVIF(v)
 
 	vifMgr.mutex.Lock()
 	defer vifMgr.mutex.Unlock()
@@ -206,6 +206,11 @@ func (v *VIF) enable() error {
 }
 
 func (v *VIF) disable() {
+	if v.tunnel != nil {
+		v.tunnel.VRF().deleteL3Tunnel(v)
+		v.tunnel.SetVRF(nil)
+	}
+
 	v.instance.Disable()
 	noti.Notify(notifier.Update, v, false)
 }
@@ -220,6 +225,9 @@ func (v *VIF) disconnect(match VswMatch, param interface{}) error {
 
 // Enable enables the VIF.
 func (v *VIF) Enable() error {
+	v.mutex.Lock()
+	defer v.mutex.Unlock()
+
 	if !v.enabled {
 		if err := v.enable(); err != nil {
 			return err
@@ -232,6 +240,9 @@ func (v *VIF) Enable() error {
 
 // Disable disables the VIF.
 func (v *VIF) Disable() {
+	v.mutex.Lock()
+	defer v.mutex.Unlock()
+
 	if v.enabled {
 		if v.output != nil {
 			v.disable()
@@ -247,6 +258,14 @@ func (v *VIF) Input() *dpdk.Ring {
 	return v.base.Input()
 }
 
+// BridgeInput returns an input ring that should be used by Bridge.
+func (v *VIF) BridgeInput() *dpdk.Ring {
+	if v.base.module.moduleType == TypeRIF {
+		return v.base.Inbound()
+	}
+	return v.base.Input()
+}
+
 // Outbound returns an input ring for outbounds packets, i.e. Lagopus to external.
 // Returned ring is same as the one returned by Input.
 func (v *VIF) Outbound() *dpdk.Ring {
@@ -256,6 +275,7 @@ func (v *VIF) Outbound() *dpdk.Ring {
 // Inbound returns an input ring for inbounds packets, i.e. external to Lagopus.
 // If the underlying interface supports secondary input, then secondary input ring is returned.
 // Otherwise, the ring same as Outbound is returned.
+// VSI must use the ring returned by this method.
 func (v *VIF) Inbound() *dpdk.Ring {
 	return v.base.Inbound()
 }
@@ -273,6 +293,9 @@ func (v *VIF) Rules() *Rules {
 }
 
 func (v *VIF) setOutput(output *dpdk.Ring) error {
+	v.mutex.Lock()
+	defer v.mutex.Unlock()
+
 	if v.output != nil && output != nil {
 		return errors.New("VIF is already associated.")
 	}
@@ -317,6 +340,9 @@ func (v *VIF) VID() VID {
 
 // SetVID sets VLAN Tag of the VIF
 func (v *VIF) SetVID(vid VID) error {
+	v.mutex.Lock()
+	defer v.mutex.Unlock()
+
 	if v.vid == vid {
 		return nil
 	}
@@ -363,6 +389,9 @@ func (v *VIF) Dump() string {
 
 // Called when VIF is connected to or disconnected from VSI.
 func (v *VIF) setVSI(vsi *VSI) error {
+	v.mutex.Lock()
+	defer v.mutex.Unlock()
+
 	if v.vsi != nil && vsi != nil {
 		return fmt.Errorf("%v is already associated with %v", v, vsi)
 	}
@@ -381,7 +410,11 @@ func (v *VIF) setVRF(vrf *VRF) error {
 
 	v.vrf = vrf
 	v.instance.SetVRF(vrf)
-
+	if vrf != nil {
+		v.setVRRPObserver(vrf)
+	} else {
+		v.setVRRPObserver(nil)
+	}
 	return nil
 }
 
@@ -394,6 +427,9 @@ func (v *VIF) VRF() *VRF {
 // SetTAP associate tap with the VIF.
 // Returns error if the VIF already has an associted TAP.
 func (v *VIF) SetTAP(tap *os.File) error {
+	v.mutex.Lock()
+	defer v.mutex.Unlock()
+
 	if tap != nil && v.tap != nil {
 		return errors.New("TAP already set.")
 	}
@@ -499,6 +535,21 @@ func (v *VIF) isNAPTEnabled() bool {
 
 func (v *VIF) Interface() *Interface {
 	return v.iface
+}
+
+func (v *VIF) DeleteIPAddr(ip IPAddr) error {
+	// Delete ip address from ipaddr
+	if err := v.IPAddrs.DeleteIPAddr(ip); err != nil {
+		return err
+	}
+
+	// Delete vrrp groups
+	for _, vg := range v.listVRRPGroup(ip) {
+		if err := v.DeleteVRRPGroup(ip, vg.VirtualRouterId); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // VIFs returns a slice of all registered VIF.

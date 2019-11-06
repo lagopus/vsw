@@ -133,6 +133,11 @@ func (a *agent) Init() error {
 		log.Logger.Info("%v: Load config file: %v", a, conf.RuleFile)
 	}
 
+	log.Logger.Info("Supported %d cipher algos, %d auth algos, %d aead algos",
+		len(ipsec.SupportedCipherAlgoByType),
+		len(ipsec.SupportedAuthAlgoByType),
+		len(ipsec.SupportedAeadAlgoByType))
+
 	return nil
 }
 

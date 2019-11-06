@@ -97,8 +97,7 @@ func NewMAT(name string) (*VSI, error) {
 
 func (v *VSI) Free() {
 	vsiMgr.mutex.Lock()
-	delete(vsiMgr.vsi, v.name)
-	vsiMgr.mutex.Unlock()
+	defer vsiMgr.mutex.Unlock()
 
 	for _, b := range v.bridges {
 		b.free()
@@ -108,6 +107,8 @@ func (v *VSI) Free() {
 		v.mat.free()
 		v.mat = nil
 	}
+
+	delete(vsiMgr.vsi, v.name)
 }
 
 func (v *VSI) String() string {
@@ -195,6 +196,7 @@ func (v *VSI) DeleteVID(vid VID) {
 	if b, exists := v.bridges[vid]; exists {
 		b.free()
 		delete(v.active, vid)
+		delete(v.bridges, vid)
 	}
 }
 
@@ -234,10 +236,22 @@ func (v *VSI) AddVIF(vif *VIF) error {
 	if !ok {
 		return fmt.Errorf("VID %d not registered.", vif.vid)
 	}
+
+	// We've already registered the VIF
+	if _, exists := b.vifs[vif]; exists {
+		return nil
+	}
+
 	if err := vif.setVSI(v); err != nil {
 		return err
 	}
-	return b.addVIF(vif)
+
+	if err := b.addVIF(vif); err != nil {
+		vif.setVSI(nil)
+		return err
+	}
+
+	return nil
 }
 
 // DeleteVIF deletes VIF from the bridge.
@@ -246,7 +260,6 @@ func (v *VSI) DeleteVIF(vif *VIF) error {
 	if !ok {
 		return fmt.Errorf("VID %d not registered.", vif.vid)
 	}
-	vif.setVSI(nil)
 	return b.deleteVIF(vif)
 }
 

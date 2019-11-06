@@ -56,13 +56,10 @@ func init() {
 		vrfs: map[vswitch.VRFIndex]*vrf{},
 		lock: sync.RWMutex{},
 	}
-	log.Logger.Info("created Inbound/Outbound SAMgr")
 	// Register tick
 	if registerTickTask() != nil {
 		panic("Can't add tick-task in SAD mgr")
 	}
-	log.Logger.Info("registerd SAMgr tick-task")
-	log.Logger.Info("SAMgr initialize complete")
 }
 
 func registerTickTask() error {

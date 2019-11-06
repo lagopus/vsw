@@ -52,14 +52,14 @@
 			     sizeof(struct ipv4_hdr))
 #define DONT_RECORD_RR (uint32_t *)(-1)
 
-typedef bool (*parse_options_t)(struct ipv4_hdr *, struct router_mbuf_metadata *,
+typedef bool (*parse_options_t)(struct ipv4_hdr *, struct vsw_packet_metadata*,
 				struct interface_table *);
 
-static bool parse_options_rr_enable(struct ipv4_hdr *, struct router_mbuf_metadata *,
+static bool parse_options_rr_enable(struct ipv4_hdr *, struct vsw_packet_metadata *,
 				    struct interface_table *);
-static bool parse_options_rr_disable(struct ipv4_hdr *, struct router_mbuf_metadata *,
+static bool parse_options_rr_disable(struct ipv4_hdr *, struct vsw_packet_metadata *,
 				     struct interface_table *);
-static bool parse_options_rr_ignore(struct ipv4_hdr *, struct router_mbuf_metadata *,
+static bool parse_options_rr_ignore(struct ipv4_hdr *, struct vsw_packet_metadata *,
 				    struct interface_table *);
 
 struct router_runtime {
@@ -88,17 +88,14 @@ init_tables(struct router_context *ctx) {
 		ROUTER_ERROR("router: %s: neighbor table initialize failed.", ctx->name);
 		// route finalize
 		route_fini(tbls->route);
-		rte_free(tbls->route);
 		return false;
 	}
 	if (!(tbls->interface = interface_init(ctx->name))) {
 		ROUTER_ERROR("router: %s: interface table initialize failed.", ctx->name);
 		// route finalize
 		route_fini(tbls->route);
-		rte_free(tbls->route);
 		// neighbor finalize
 		neighbor_fini(tbls->neighbor);
-		rte_free(tbls->neighbor);
 		return false;
 	}
 
@@ -120,12 +117,6 @@ free_context(struct router_context *ctx) {
 	neighbor_fini(tbls->neighbor);
 	interface_fini(tbls->interface);
 	pbr_fini(tbls->pbr);
-
-	// free tables.
-	rte_free(tbls->route);
-	rte_free(tbls->neighbor);
-	rte_free(tbls->interface);
-	rte_free(tbls->pbr);
 
 	// free context
 	rte_free(ctx);
@@ -176,9 +167,10 @@ check_invalid_option(struct opt_base *opt, int opt_hdr_len) {
 // parse_options_rr_enable processes options that require to record a route as per RFC791.
 // The route is recorded to RR options after a source ip address decided.
 static bool
-parse_options_rr_enable(struct ipv4_hdr *hdr, struct router_mbuf_metadata *rmd,
+parse_options_rr_enable(struct ipv4_hdr *hdr, struct vsw_packet_metadata *md,
 			struct interface_table *iface_table) {
 
+	struct router_mbuf_metadata *rmd = (struct router_mbuf_metadata *)&md->udata;
 	uint8_t *start_of_opt = (uint8_t *)(&hdr[1]);
 	int opt_hdr_len = IPV4_HDR_OPT_LEN(hdr);
 	int offset = 0;
@@ -205,7 +197,7 @@ parse_options_rr_enable(struct ipv4_hdr *hdr, struct router_mbuf_metadata *rmd,
 
 			// check destination address
 			uint32_t dst_addr = ntohl(hdr->dst_addr);
-			if (!INTERFACE_IS_SELF(iface_table, dst_addr)) {
+			if (interface_ip_is_self(iface_table, dst_addr, md->common.in_vif)) {
 				// SSRR
 				if (opt->type == IPOPT_SSRR) {
 					ROUTER_ERROR("SSRR: dst is not self\n");
@@ -264,7 +256,7 @@ parse_options_rr_enable(struct ipv4_hdr *hdr, struct router_mbuf_metadata *rmd,
 
 // parse_options_rr_disable drops packets with options that require to record a route.
 static bool
-parse_options_rr_disable(struct ipv4_hdr *hdr, struct router_mbuf_metadata *rmd,
+parse_options_rr_disable(struct ipv4_hdr *hdr, struct vsw_packet_metadata *md,
 			 struct interface_table *iface_table) {
 
 	uint8_t *start_of_opt = (uint8_t *)(&hdr[1]);
@@ -295,7 +287,7 @@ parse_options_rr_disable(struct ipv4_hdr *hdr, struct router_mbuf_metadata *rmd,
 // parse_options_rr_ignore ignores options that require to record a route without processing
 // of the options.
 static bool
-parse_options_rr_ignore(struct ipv4_hdr *hdr, struct router_mbuf_metadata *rmd,
+parse_options_rr_ignore(struct ipv4_hdr *hdr, struct vsw_packet_metadata *rmd,
 			struct interface_table *iface_table) {
 
 	uint8_t *start_of_opt = (uint8_t *)(&hdr[1]);
@@ -524,6 +516,9 @@ process_self_addressed_mbuf(struct router_instance *ri, struct rte_mbuf *mbuf) {
 	for (int i = 0; i < ctx->rules_count; i++) {
 		struct rule *rule = &rules[i].rule;
 
+		struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
+		if (rule->in_vif != VIF_INVALID_INDEX && rule->in_vif != md->common.in_vif)
+			continue;
 		if (rule->proto != IPPROTO_ANY && rule->proto != iphdr->next_proto_id)
 			continue;
 		if (rule->srcip != 0 && rule->srcip != srcip)
@@ -545,7 +540,6 @@ process_self_addressed_mbuf(struct router_instance *ri, struct rte_mbuf *mbuf) {
 		if (ntohs(iphdr->fragment_offset) & IPV4_HDR_MF_FLAG) {
 			// set ring information to the first packet metadata,
 			// before reassembling.
-			struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
 			struct router_mbuf_metadata *rmd = (struct router_mbuf_metadata *)&md->udata;
 			rmd->rr = rules[i].rr;
 
@@ -590,7 +584,7 @@ lookup(struct rte_mbuf *mbuf, struct router_context *ctx) {
 	rmd->rr_loc = NULL;
 	rmd->sr_loc = NULL;
 	if (rmd->has_option) {
-		if (!ctx->parse_options(ipv4, rmd, ctx->tables.interface))
+		if (!ctx->parse_options(ipv4, md, ctx->tables.interface))
 			return NULL;
 	}
 
@@ -641,6 +635,9 @@ lookup(struct rte_mbuf *mbuf, struct router_context *ctx) {
 				// prioritize neighbor information.
 				nh->interface = interface_entry_get(ctx->tables.interface, ne->ifindex);
 			}
+			// Add reference of a nexthop that refer to a interface
+			if (nh->interface && !interface_nexthop_reference_add(nh->interface, nh))
+				return NULL;
 		}
 		ROUTER_DEBUG("[NEIGHBOR] ifindex: %d, ip: %s, mac: %s\n",
 			     ne->ifindex, ip2str(ne->ip_addr), mac2str(ne->mac_addr));
@@ -880,7 +877,7 @@ routing_packets(struct router_runtime *runtime, struct router_instance *ri, uint
 		}
 
 		// check all self interfaces.
-		if (INTERFACE_IS_SELF(ctx->tables.interface, dstip)) {
+		if (interface_ip_is_self(ctx->tables.interface, dstip, md->common.in_vif)) {
 			if (!process_self_addressed_mbuf(ri, mbuf)) {
 				ROUTER_DEBUG("Failed to process self-addressed packet.");
 				// We do not need to free mbuf here.
@@ -1080,10 +1077,12 @@ rule_delete(struct router_context *ctx, struct router_rule *r) {
 		    (o->rule.srcip == r->rule.srcip) &&
 		    (o->rule.proto == r->rule.proto) &&
 		    (o->rule.vni == r->rule.vni) &&
-		    (o->rule.dstport == r->rule.dstport)) {
+		    (o->rule.dstport == r->rule.dstport) &&
+		    (o->rule.in_vif == r->rule.in_vif)) {
 			put_router_ring(ctx, o->rr);
 			ctx->rules_count--;
 			ctx->rules[i] = ctx->rules[ctx->rules_count];
+			return true;
 		}
 	}
 
@@ -1386,6 +1385,8 @@ router_deinit(void *p) {
 
 		// free fragmentation table.
 		rte_ip_frag_table_destroy(ri->frag_tbl);
+
+		rte_hash_free(ri->reassemble_hash);
 	}
 
 	// free hash table

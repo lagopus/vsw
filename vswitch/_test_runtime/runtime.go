@@ -70,7 +70,6 @@ test_deinit(void *priv) {
 static bool
 test_register_instance(void *priv, struct vsw_instance *instance) {
 	struct test_runtime *r = priv;
-	char *name = priv;
 	vsw_printf("%s: %s (%s)", __func__, r->name, instance->name);
 
 	for (int n = 0; n < MAX_INSTANCE; n++) {
@@ -86,7 +85,6 @@ test_register_instance(void *priv, struct vsw_instance *instance) {
 static bool
 test_unregister_instance(void *priv, struct vsw_instance *instance) {
 	struct test_runtime *r = priv;
-	char *name = priv;
 	vsw_printf("%s: %s (%s)", __func__, r->name, instance->name);
 
 	for (int n = 0; n < MAX_INSTANCE; n++) {
@@ -102,7 +100,6 @@ test_unregister_instance(void *priv, struct vsw_instance *instance) {
 static bool
 test_control_instance(void *priv, struct vsw_instance *instance, void *param) {
 	struct test_runtime *r = priv;
-	char *name = priv;
 	vsw_printf("%s: %s (%s)", __func__, r->name, instance->name);
 	return true;
 }

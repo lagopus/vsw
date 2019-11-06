@@ -91,7 +91,7 @@ func (r *router) addVIF(vif *VIF) error {
 	}
 
 	// XXX: We should use BaseInstance.connect() (same for bridge)
-	if vif.Output() == nil {
+	if vif.Output() == nil && vif.base.module.moduleType != TypeRIF {
 		if err := vif.setOutput(r.base.input); err != nil {
 			r.instance.DeleteVIF(vif)
 			return err
@@ -110,7 +110,9 @@ func (r *router) deleteVIF(vif *VIF) {
 	}
 
 	// XXX: We should use BaseInstance.disconnect() (same for bridge)
-	vif.setOutput(nil)
+	if vif.base.module.moduleType != TypeRIF {
+		vif.setOutput(nil)
+	}
 }
 
 func (r *router) addOutputDevice(dev OutputDevice) error {

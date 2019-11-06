@@ -66,6 +66,7 @@ var testParams = map[VswMatch]interface{}{
 	MatchEthDst:      &net.HardwareAddr{},
 	MatchEthDstSelf:  nil,
 	MatchEthDstMC:    nil,
+	MatchEthDstBC:    nil,
 	MatchEthSrc:      &net.HardwareAddr{},
 	MatchEthTypeIPv4: nil,
 	MatchEthTypeIPv6: nil,
@@ -78,7 +79,22 @@ var testParams = map[VswMatch]interface{}{
 	MatchIPv4Dst:     &net.IP{},
 	MatchIPv4DstNet:  &IPAddr{},
 	MatchIPv4DstSelf: nil,
-	Match5Tuple:      NewFiveTuple(),
+	MatchIPv4DstInVIF: &ScopedAddress{
+		address: net.IPv4(192, 168, 1, 0),
+		vif:     &VIF{index: 1, name: "test-vif"},
+	},
+	Match5Tuple: &FiveTuple{
+		SrcIP:   CreateIPAddr(net.IPv4(10, 10, 0, 1)),
+		DstIP:   CreateIPAddr(net.IPv4(10, 10, 0, 2)),
+		DstPort: PortRange{Start: 4500},
+		Proto:   IPP_UDP,
+	},
+	MatchVxLAN: &VxLAN{
+		Src:     net.IPv4(10, 10, 0, 1),
+		Dst:     net.IPv4(10, 10, 0, 2),
+		DstPort: DefaultVxLANPort,
+		VNI:     100,
+	},
 }
 
 // A place holder for a dummy ring used through out the tests
@@ -149,6 +165,115 @@ func TestRule(t *testing.T) {
 	// remove all
 	t.Logf("Remove all rules")
 	r.removeAll()
+	checkCount(t, r, 0)
+}
+
+func TestRuleRemove(t *testing.T) {
+	// create parameters for remove
+	removeParams := testParams
+	removeParams[MatchIPv4DstInVIF] = &ScopedAddress{
+		address: net.IPv4(192, 168, 1, 0),
+		vif:     &VIF{index: 1, name: "test-vif"},
+	}
+	removeParams[Match5Tuple] = &FiveTuple{
+		SrcIP:   CreateIPAddr(net.IPv4(10, 10, 0, 1)),
+		DstIP:   CreateIPAddr(net.IPv4(10, 10, 0, 2)),
+		DstPort: PortRange{Start: 4500},
+		Proto:   IPP_UDP,
+	}
+	removeParams[MatchVxLAN] = &VxLAN{
+		Src:     net.IPv4(10, 10, 0, 1),
+		Dst:     net.IPv4(10, 10, 0, 2),
+		DstPort: DefaultVxLANPort,
+		VNI:     100,
+	}
+
+	t.Logf("Creating a new Rules\n")
+	r := newRules()
+
+	// add all rules
+	t.Logf("Add all rules")
+	for k, v := range testParams {
+		if err := r.add(k, v, ruleRing); err != nil {
+			t.Fatalf("r.add failed: %v", err)
+		}
+	}
+	checkCount(t, r, len(testParams))
+	showRules(t, r)
+
+	// remove all rules
+	t.Logf("Remote all rules individualy")
+	for k, v := range removeParams {
+		if err := r.remove(k, v); err != nil {
+			t.Fatalf("r.remove failed: %v", err)
+		}
+	}
+	checkCount(t, r, 0)
+
+	// IP Address 4-byte form vs 16-byte form
+	t.Logf("Cases with different IP Address format in parameter")
+	// MatchIPv4DstInVIF
+	t.Logf("Add MatchIPv4DstInVIF rule")
+	if err := r.add(MatchIPv4DstInVIF, testParams[MatchIPv4DstInVIF], ruleRing); err != nil {
+		t.Fatalf("r.add failed: %v", err)
+	}
+	checkCount(t, r, 1)
+
+	sa := &ScopedAddress{
+		address: net.IP{192, 168, 1, 0},
+		vif:     &VIF{index: 1, name: "test-vif"},
+	}
+
+	t.Logf("Remove MatchIPv4DstInVIF rule")
+	if err := r.remove(MatchIPv4DstInVIF, sa); err != nil {
+		t.Fatalf("r.remove failed: %v", err)
+	}
+	checkCount(t, r, 0)
+
+	// Match5Tuple
+	t.Logf("Add Match5Tuple rule")
+	if err := r.add(Match5Tuple, testParams[Match5Tuple], ruleRing); err != nil {
+		t.Fatalf("r.add failed: %v", err)
+	}
+	checkCount(t, r, 1)
+
+	ft := &FiveTuple{
+		SrcIP: IPAddr{
+			IP:   net.IP{10, 10, 0, 1},
+			Mask: net.IPMask{0xff, 0xff, 0xff, 0xff},
+		},
+		DstIP: IPAddr{
+			IP:   net.IP{10, 10, 0, 2},
+			Mask: net.IPMask{0xff, 0xff, 0xff, 0xff},
+		},
+		DstPort: PortRange{Start: 4500},
+		Proto:   IPP_UDP,
+	}
+
+	t.Logf("Remove Match5Tuple rule")
+	if err := r.remove(Match5Tuple, ft); err != nil {
+		t.Fatalf("r.remove failed: %v", err)
+	}
+	checkCount(t, r, 0)
+
+	// MatchVxLAN
+	t.Logf("Add MatchVxLAN rule")
+	if err := r.add(MatchVxLAN, testParams[MatchVxLAN], ruleRing); err != nil {
+		t.Fatalf("r.add failed: %v", err)
+	}
+	checkCount(t, r, 1)
+
+	vxlan := &VxLAN{
+		Src:     net.IP{10, 10, 0, 1},
+		Dst:     net.IP{10, 10, 0, 2},
+		DstPort: DefaultVxLANPort,
+		VNI:     100,
+	}
+
+	t.Logf("Remove MatchVxLAN rule")
+	if err := r.remove(MatchVxLAN, vxlan); err != nil {
+		t.Fatalf("r.remove failed: %v", err)
+	}
 	checkCount(t, r, 0)
 }
 

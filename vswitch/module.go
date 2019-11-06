@@ -35,6 +35,8 @@ const (
 	TypeBridge
 	// Router Module
 	TypeRouter
+	// RIF Module
+	TypeRIF
 	// Other than any type listed above
 	TypeOther
 )
@@ -44,6 +46,7 @@ var moduleTypeString = [...]string{
 	TypeInterface: "Interface",
 	TypeBridge:    "Bridge", // XXX: Should OF bridge belongs to TypeBridge?
 	TypeRouter:    "Router",
+	TypeRIF:       "RIF",
 }
 
 func (mt ModuleType) String() string { return moduleTypeString[mt] }
@@ -69,7 +72,7 @@ type BaseInstance struct {
 type RingParam struct {
 	Count          uint // Number of mbufs to be queueable
 	SocketId       int  // Memory Socket ID
-	SecondaryInput bool // Set true to separate inbound and outbound rings. For TypeInterface only.
+	SecondaryInput bool // Set true to separate inbound and outbound rings. For TypeInterface and TypeRIF only.
 }
 
 var defaultRingParam = &RingParam{
@@ -111,8 +114,8 @@ func RegisterModule(moduleName string, factory InstanceFactory, rp *RingParam, t
 		return fmt.Errorf("No module factory for '%s' given", moduleName)
 	}
 
-	if t != TypeInterface && rp != nil && rp.SecondaryInput {
-		return errors.New("Only TypeInterface may enable SecondaryInput of RingParam")
+	if t != TypeInterface && t != TypeRIF && rp != nil && rp.SecondaryInput {
+		return errors.New("Only TypeInterface or TypeRIF may enable SecondaryInput of RingParam")
 	}
 
 	if _, ok := modules[moduleName]; ok {
@@ -191,7 +194,7 @@ func newInstance(moduleName, name string, priv interface{}) (*BaseInstance, erro
 
 	bi.rules = newRules()
 
-	if m.moduleType == TypeInterface {
+	if m.moduleType == TypeInterface || m.moduleType == TypeRIF {
 		bi.counter = NewCounter()
 	}
 
@@ -264,7 +267,7 @@ func (bi *BaseInstance) SecondaryInput() *dpdk.Ring {
 
 // Outbound returns an input ring for outbounds packets, i.e. Lagopus to external.
 // Returned ring is same as the one returned by Input.
-// Used by TypeInterface Only.
+// Used by TypeInterface and TypeRIF Only.
 func (bi *BaseInstance) Outbound() *dpdk.Ring {
 	return bi.input
 }
@@ -272,7 +275,7 @@ func (bi *BaseInstance) Outbound() *dpdk.Ring {
 // Inbound returns an input ring for inbounds packets, i.e. external to Lagopus.
 // If the underlying interface supports secondary input, then secondary input ring is returned.
 // Otherwise, the ring same as Outbound is returned.
-// Used by TypeInterface Only.
+// Used by TypeInterface and TypeRIF Only.
 func (bi *BaseInstance) Inbound() *dpdk.Ring {
 	if bi.input2 != nil {
 		return bi.input2
@@ -286,7 +289,7 @@ func (bi *BaseInstance) Rules() *Rules {
 }
 
 // Counter returns an instance of Counter.
-// Only TypeInterface has the valid instance.
+// Only TypeInterface and TypeRIF has the valid instance.
 // For other types, the value is always nil.
 func (bi *BaseInstance) Counter() *Counter {
 	return bi.counter

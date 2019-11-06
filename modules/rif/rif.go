@@ -51,6 +51,7 @@ type RIFInstance struct {
 	mtu      vswitch.MTU
 	mode     vswitch.VLANMode
 	enabled  bool
+	mutex    sync.Mutex
 }
 
 type RIFVIFInstance struct {
@@ -99,9 +100,9 @@ func getRIFService(coreID uint) (*rifService, error) {
 		return rs, nil
 	}
 
-	param := C.struct_rif_runtime_param{}
+	param := (*C.struct_rif_instance)(C.calloc(1, C.sizeof_struct_rif_instance))
 	ops := vswitch.LagopusRuntimeOps(unsafe.Pointer(&C.rif_runtime_ops))
-	rt, err := vswitch.NewRuntime(coreID, moduleName, ops, unsafe.Pointer(&param))
+	rt, err := vswitch.NewRuntime(coreID, moduleName, ops, unsafe.Pointer(param))
 	if err != nil {
 		return nil, err
 	}
@@ -163,6 +164,7 @@ func newRIFInstance(base *vswitch.BaseInstance, priv interface{}) (vswitch.Insta
 	// set rif_instance parameter
 	r.param.base.name = C.CString(base.Name())
 	r.param.base.input = (*C.struct_rte_ring)(unsafe.Pointer(base.Input()))
+	r.param.base.input2 = (*C.struct_rte_ring)(unsafe.Pointer(base.SecondaryInput()))
 	r.param.base.outputs = &r.param.o[0]
 	r.param.counter = (*C.struct_vsw_counter)(unsafe.Pointer(r.counter))
 	r.param.mtu = C.int(r.mtu)
@@ -243,7 +245,11 @@ func (c devcmd) String() string {
 }
 
 func (r *RIFInstance) control(cmd devcmd, rv *RIFVIFInstance, out *dpdk.Ring, mtu vswitch.MTU) error {
-	p := &C.struct_rif_control_param{cmd: C.rif_cmd_t(cmd)}
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	p := &r.param.control
+	p.cmd = C.rif_cmd_t(cmd)
 
 	switch cmd {
 	case RIF_CMD_ADD_VID:
@@ -259,7 +265,11 @@ func (r *RIFInstance) control(cmd devcmd, rv *RIFVIFInstance, out *dpdk.Ring, mt
 
 	case RIF_CMD_SET_MAC:
 		// MAC Address
-		p.mac = (*C.struct_ether_addr)(unsafe.Pointer(&r.mac[0]))
+		if r.mac != nil {
+			fmt.Printf("%p\n", p.mac)
+			m := (*[1 << 30]byte)(unsafe.Pointer(&p.mac.addr_bytes))[:6:6]
+			copy(m, (r.mac)[:])
+		}
 
 	case RIF_CMD_DELETE_VID,
 		RIF_CMD_SET_DST_SELF_FORWARD,
@@ -364,6 +374,9 @@ func (rv *RIFVIFInstance) listener() {
 			continue
 		}
 
+		if n.Type == notifier.Delete {
+			rule.Ring = nil
+		}
 		switch rule.Match {
 		case vswitch.MatchAny:
 			// Default Output (The same as Output())
@@ -394,14 +407,6 @@ func (rv *RIFVIFInstance) Disable() {
 	rv.rif.control(RIF_CMD_DELETE_VID, rv, nil, 0)
 }
 
-func (rv *RIFVIFInstance) UpdateCounter() {
-	if rv.rif.mode == vswitch.AccessMode {
-		src := (*C.struct_vsw_counter)(unsafe.Pointer(rv.rif.counter))
-		dst := (*C.struct_vsw_counter)(unsafe.Pointer(rv.counter))
-		*dst = *src
-	}
-}
-
 func init() {
 	if l, err := vlog.New(moduleName); err == nil {
 		log = l
@@ -410,11 +415,12 @@ func init() {
 	}
 
 	rp := &vswitch.RingParam{
-		Count:    mbufLen,
-		SocketId: dpdk.SOCKET_ID_ANY, // XXX: This should be the same as socket running the runtime.
+		Count:          mbufLen,
+		SocketId:       dpdk.SOCKET_ID_ANY, // XXX: This should be the same as socket running the runtime.
+		SecondaryInput: true,
 	}
 
-	if err := vswitch.RegisterModule(moduleName, newRIFInstance, rp, vswitch.TypeInterface); err != nil {
+	if err := vswitch.RegisterModule(moduleName, newRIFInstance, rp, vswitch.TypeRIF); err != nil {
 		log.Fatalf("Failed to register a module '%s': %v", moduleName, err)
 	}
 }

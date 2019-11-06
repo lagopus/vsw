@@ -19,7 +19,6 @@
  *      @brief  Neighbor table use dpdk hash.
  */
 
-#include <assert.h>
 #include <inttypes.h>
 #include <rte_errno.h>
 #include <rte_malloc.h>
@@ -142,8 +141,11 @@ neighbor_entry_get(struct neighbor_table *nt, uint32_t ip) {
 		ROUTER_DEBUG("[NEIGH] no neighbor entry. ip = %s\n", ip2str(ip));
 		return NULL;
 	}
-	// Invalid parameter, assertion fail..
-	assert(ret >= 0);
+	// Lookup failed
+	if (ret < 0) {
+		ROUTER_ERROR("[NEIGH] rte_hash_lookup_data() failed, err = %d.", ret);
+		return false;
+	}
 
 	return neigh;
 }
@@ -163,8 +165,11 @@ neighbor_entry_delete(struct neighbor_table *nt, struct neighbor_entry *entry) {
 			    ip2str(entry->ip), ret);
 		return NULL;
 	}
-	// Invalid parameter, assertion fail..
-	assert(ret >= 0);
+	// Lookup failed
+	if (ret < 0) {
+		ROUTER_ERROR("[NEIGH] rte_hash_lookup_data() failed, err = %d.", ret);
+		return false;
+	}
 
 	if (neigh) {
 		if (rte_hash_del_key(nt->hashmap, &(entry->ip)) < 0) {
@@ -194,8 +199,11 @@ neighbor_entry_update(struct neighbor_table *nt, struct neighbor_entry *entry) {
 		print_neighbor_list(nt);
 		return true;
 	}
-	// Invalid parameter, assertion fail..
-	assert(ret >= 0);
+	// Lookup failed
+	if (ret < 0) {
+		ROUTER_ERROR("[NEIGH] rte_hash_lookup_data() failed, err = %d.", ret);
+		return false;
+	}
 
 	// Entry exists.
 	ether_addr_copy(&(entry->mac), &(neigh->mac_addr));
@@ -255,4 +263,5 @@ neighbor_fini(struct neighbor_table *nt) {
 	// Destroy hashmap for neighbor table.
 	if (nt->hashmap)
 		rte_hash_free(nt->hashmap);
+	rte_free(nt);
 }

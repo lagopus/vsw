@@ -174,6 +174,7 @@ func deleteSA(selector *sad.SASelector) {
 
 var encTbl = map[uint8]ipsec.CipherAlgo{
 	pfkey.SADB_EALG_NONE:     ipsec.CipherAlgoNull,
+	pfkey.SADB_EALG_NULL:     ipsec.CipherAlgoNull,
 	pfkey.SADB_X_EALG_AESCBC: ipsec.CipherAlgoAesCbc,
 	pfkey.SADB_X_EALG_AESCTR: ipsec.CipherAlgoAesCtr,
 	pfkey.SADB_EALG_3DESCBC:  ipsec.CipherAlgo3desCbc,
@@ -184,8 +185,10 @@ var aeadTbl = map[uint8]ipsec.AeadAlgo{
 }
 
 var authTbl = map[uint8]ipsec.AuthAlgo{
-	pfkey.SADB_AALG_NONE:     ipsec.AuthAlgoNull,
-	pfkey.SADB_AALG_SHA1HMAC: ipsec.AuthAlgoSha1Hmac,
+	pfkey.SADB_AALG_NONE:           ipsec.AuthAlgoNull,
+	pfkey.SADB_X_AALG_NULL:         ipsec.AuthAlgoNull,
+	pfkey.SADB_AALG_SHA1HMAC:       ipsec.AuthAlgoSha1Hmac,
+	pfkey.SADB_X_AALG_SHA2_256HMAC: ipsec.AuthAlgoSha256Hmac,
 }
 
 func getSupportedAuth() *[]pfkey.SadbAlg {
@@ -246,11 +249,20 @@ func (s *sadbAddMsg) validCipherAlgo(algo ipsec.CipherAlgo,
 	sav *sad.SAValue) bool {
 
 	if algoInfo, ok := ipsec.SupportedCipherAlgo[algo]; ok {
-		keyLen := s.EncKey.SadbKey.SadbKeyBits / 8
+		var key []byte
+		var keyLen uint16
+		if s.EncKey != nil && s.EncKey.Key != nil {
+			keyLen = s.EncKey.SadbKey.SadbKeyBits / 8
+			if keyLen <= uint16(len(*s.EncKey.Key)) {
+				key = (*s.EncKey.Key)[:keyLen]
+			}
+		}
 		if value, ok := algoInfo.Algos[keyLen]; ok {
 			sav.CipherAlgoType = value.Type
-			sav.CipherKey = append(sav.CipherKey,
-				(*s.EncKey.Key)[:value.KeyLen]...)
+
+			if key != nil {
+				sav.CipherKey = append(sav.CipherKey, key...)
+			}
 			return true
 		}
 	}
@@ -264,11 +276,20 @@ func (s *sadbAddMsg) validAuthAlgo(algo ipsec.AuthAlgo,
 	sav *sad.SAValue) bool {
 
 	if algoInfo, ok := ipsec.SupportedAuthAlgo[algo]; ok {
-		keyLen := s.AuthKey.SadbKey.SadbKeyBits / 8
+		var key []byte
+		var keyLen uint16
+		if s.AuthKey != nil && s.AuthKey.Key != nil {
+			keyLen = s.AuthKey.SadbKey.SadbKeyBits / 8
+			if keyLen <= uint16(len(*s.AuthKey.Key)) {
+				key = (*s.AuthKey.Key)[:keyLen]
+			}
+		}
 		if value, ok := algoInfo.Algos[keyLen]; ok {
 			sav.AuthAlgoType = value.Type
-			sav.AuthKey = append(sav.AuthKey,
-				(*s.AuthKey.Key)[:value.KeyLen]...)
+
+			if key != nil {
+				sav.AuthKey = append(sav.AuthKey, key...)
+			}
 			return true
 		}
 	}
@@ -282,11 +303,20 @@ func (s *sadbAddMsg) validAeadAlgo(algo ipsec.AeadAlgo,
 	sav *sad.SAValue) bool {
 
 	if algoInfo, ok := ipsec.SupportedAeadAlgo[algo]; ok {
-		keyLen := s.EncKey.SadbKey.SadbKeyBits / 8
+		var key []byte
+		var keyLen uint16
+		if s.EncKey != nil && s.EncKey.Key != nil {
+			keyLen = s.EncKey.SadbKey.SadbKeyBits / 8
+			if keyLen <= uint16(len(*s.EncKey.Key)) {
+				key = (*s.EncKey.Key)[:keyLen]
+			}
+		}
 		if value, ok := algoInfo.Algos[keyLen]; ok {
 			sav.AeadAlgoType = value.Type
-			sav.AeadKey = append(sav.AeadKey,
-				(*s.EncKey.Key)[:value.KeyLen]...)
+
+			if key != nil {
+				sav.AeadKey = append(sav.AeadKey, key...)
+			}
 			return true
 		}
 	}
@@ -382,7 +412,7 @@ func (s *sadbAddMsg) toSadbSaSAV() (*sad.SAValue, bool) {
 }
 
 var encRTbl = map[ipsec.CipherAlgoType]uint8{
-	ipsec.CipherAlgoTypeNull:      pfkey.SADB_EALG_NONE,
+	ipsec.CipherAlgoTypeNull:      pfkey.SADB_EALG_NULL,
 	ipsec.CipherAlgoTypeAes128Cbc: pfkey.SADB_X_EALG_AESCBC,
 	ipsec.CipherAlgoTypeAes256Cbc: pfkey.SADB_X_EALG_AESCBC,
 	ipsec.CipherAlgoTypeAes128Ctr: pfkey.SADB_X_EALG_AESCTR,
@@ -390,8 +420,9 @@ var encRTbl = map[ipsec.CipherAlgoType]uint8{
 }
 
 var authRTbl = map[ipsec.AuthAlgoType]uint8{
-	ipsec.AuthAlgoTypeNull:     pfkey.SADB_AALG_NONE,
-	ipsec.AuthAlgoTypeSha1Hmac: pfkey.SADB_AALG_SHA1HMAC,
+	ipsec.AuthAlgoTypeNull:       pfkey.SADB_X_AALG_NULL,
+	ipsec.AuthAlgoTypeSha1Hmac:   pfkey.SADB_AALG_SHA1HMAC,
+	ipsec.AuthAlgoTypeSha256Hmac: pfkey.SADB_X_AALG_SHA2_256HMAC,
 }
 
 var aeadRTbl = map[ipsec.AeadAlgoType]uint8{

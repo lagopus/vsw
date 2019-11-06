@@ -19,6 +19,7 @@ package vswitch
 import (
 	"errors"
 	"fmt"
+	"net"
 	"regexp"
 	"sync"
 
@@ -46,6 +47,8 @@ type VRF struct {
 	sadbOnce sync.Once
 	*RoutingTable
 	*PBR
+	vrrpref   uint
+	vrrpMutex sync.Mutex
 }
 
 type vrfManager struct {
@@ -198,16 +201,29 @@ func (v *VRF) IsEnabled() bool {
 }
 
 func (v *VRF) Enable() error {
-	if !v.enabled {
-		if err := v.tap.enable(); err != nil {
-			return err
-		}
-		if err := v.router.enable(); err != nil {
+	if v.enabled {
+		return nil
+	}
+	if err := v.tap.enable(); err != nil {
+		return err
+	}
+	// Even if vrf is enabled, hostif may not be enabled.
+	if v.hostif != nil {
+		if err := v.hostif.enable(); err != nil {
+			// If activation of hostif fails,
+			// disable other functions.
 			v.tap.disable()
 			return err
 		}
-		v.enabled = true
 	}
+	if err := v.router.enable(); err != nil {
+		v.tap.disable()
+		if v.hostif != nil {
+			v.hostif.disable()
+		}
+		return err
+	}
+	v.enabled = true
 	return nil
 }
 
@@ -215,6 +231,9 @@ func (v *VRF) Disable() {
 	if v.enabled {
 		v.router.disable()
 		v.tap.disable()
+		if v.hostif != nil {
+			v.hostif.disable()
+		}
 		v.enabled = false
 	}
 }
@@ -346,6 +365,14 @@ func (v *VRF) DeleteVIF(vif *VIF) error {
 		return fmt.Errorf("Can't find %v in the VRF.", vif)
 	}
 
+	// Delete routes related a vif as notifications about deletion of the routes
+	// is not notified from netlink when the vif is deleted from a vrf.
+	for _, route := range v.ListEntries() {
+		if route.Dev.VIFIndex() == vif.VIFIndex() {
+			v.DeleteEntry(route)
+		}
+	}
+
 	v.tap.disconnect(MatchOutVIF, vif)
 	vif.disconnect(MatchEthDstSelf, nil)
 	vif.disconnect(MatchEthDstBC, nil)
@@ -359,6 +386,66 @@ func (v *VRF) DeleteVIF(vif *VIF) error {
 	noti.Notify(notifier.Delete, v, vif)
 
 	return nil
+}
+
+// Called only when VRRP is added to VIF
+func (v *VRF) vrrpEnabled(vif *VIF) {
+	v.vrrpMutex.Lock()
+	defer v.vrrpMutex.Unlock()
+
+	var ipv4dst *ScopedAddress
+	var err error
+
+	if ipv4dst, err = NewScopedAddress(VRRPMcastAddr.IP, vif); err != nil {
+		return
+	}
+
+	// Create only one hostif for vrf
+	if v.hostif == nil {
+		hostifName := v.name + "-hostif"
+		if v.hostif, err = newInstance(hostifModule, hostifName, v.name); err != nil {
+			return
+		} else {
+			if v.enabled {
+				if err = v.hostif.enable(); err != nil {
+					goto error
+				}
+			}
+		}
+	}
+
+	// Add packet forwarding rule
+	// router -> hostif
+	// VRRP advertisement multicast address.
+	if err = v.router.connect(v.hostif.Input(), MatchIPv4DstInVIF, ipv4dst); err != nil {
+		goto error
+	}
+	v.vrrpref++
+
+	return
+
+error:
+	if v.vrrpref == 0 {
+		v.hostif.free()
+		v.hostif = nil
+	}
+}
+
+// Called only when VRRP is deleted from VIF
+func (v *VRF) vrrpDisabled(vif *VIF) {
+	v.vrrpMutex.Lock()
+	defer v.vrrpMutex.Unlock()
+
+	ipv4dst, err := NewScopedAddress(VRRPMcastAddr.IP, vif)
+	if err != nil {
+		return
+	}
+	v.router.disconnect(MatchIPv4DstInVIF, ipv4dst)
+	if v.hostif != nil && v.vrrpref == 1 {
+		v.hostif.free()
+		v.hostif = nil
+	}
+	v.vrrpref--
 }
 
 // VIF returns a slice of Vif Indices in the VRF.
@@ -408,6 +495,19 @@ func (v *VRF) HasSADatabases() bool {
 	return v.sadb != nil
 }
 
+func createFiveTuples(remotes []net.IP, local net.IP, proto IPProto, dstPort PortRange) []*FiveTuple {
+	fiveTuples := make([]*FiveTuple, len(remotes))
+	for i, remote := range remotes {
+		ft := NewFiveTuple()
+		ft.SrcIP = CreateIPAddr(remote)
+		ft.DstIP = CreateIPAddr(local)
+		ft.DstPort = dstPort
+		ft.Proto = proto
+		fiveTuples[i] = ft
+	}
+	return fiveTuples
+}
+
 func (v *VRF) addL3Tunnel(vif *VIF) error {
 	t := vif.Tunnel()
 	if t == nil {
@@ -424,29 +524,29 @@ func (v *VRF) addL3Tunnel(vif *VIF) error {
 	}
 
 	// Forward inbound packets to L3 Tunnel
-	local := t.LocalAddress()
-	for _, remote := range ra {
-		ft := NewFiveTuple()
-		ft.DstIP = CreateIPAddr(local)
-		ft.SrcIP = CreateIPAddr(remote)
-		ft.Proto = t.IPProto()
-
+	fts := createFiveTuples(ra, t.local, t.IPProto(), PortRange{})
+	for i, ft := range fts {
 		if err := v.router.connect(vif.Inbound(), Match5Tuple, ft); err != nil {
-			vif.disconnect(MatchIPv4Dst, remote)
+			vif.disconnect(MatchIPv4Dst, &ra[0])
+			for _, addedFt := range fts[0:i] {
+				v.router.disconnect(Match5Tuple, addedFt)
+			}
 			return fmt.Errorf("Adding a rule to router for L3 tunnel failed: %v", err)
 		}
+	}
 
-		// Add a rule for NAT Traversal, if the tunnel is IPSec.
-		if t.Security() == SecurityIPSec {
-			nat := NewFiveTuple()
-			nat.SrcIP = ft.SrcIP
-			nat.DstIP = ft.DstIP
-			nat.DstPort = PortRange{Start: 4500}
-			nat.Proto = IPP_UDP
-
+	// Add a rule for NAT Traversal, if the tunnel is IPSec.
+	if t.Security() == SecurityIPSec {
+		nats := createFiveTuples(ra, t.local, IPP_UDP, PortRange{Start: 4500})
+		for i, nat := range nats {
 			if err := v.router.connect(vif.Inbound(), Match5Tuple, nat); err != nil {
-				vif.disconnect(MatchIPv4Dst, remote)
-				v.router.disconnect(Match5Tuple, ft)
+				vif.disconnect(MatchIPv4Dst, &ra[0])
+				for _, ft := range fts {
+					v.router.disconnect(Match5Tuple, ft)
+				}
+				for _, addedNat := range nats[0:i] {
+					v.router.disconnect(Match5Tuple, addedNat)
+				}
 				return fmt.Errorf("Adding a rule for IPSec NAT traversal failed: %v", err)
 			}
 		}
@@ -455,9 +555,34 @@ func (v *VRF) addL3Tunnel(vif *VIF) error {
 	return nil
 }
 
-// TODO: Implement delete Tunnel
 func (v *VRF) deleteL3Tunnel(vif *VIF) {
-	logger.Warning("Deleting L3 Tunnel (%v) from VRF not supported", vif)
+	t := vif.Tunnel()
+
+	for _, ft := range createFiveTuples(t.remotes, t.local, t.IPProto(), PortRange{}) {
+		v.router.disconnect(Match5Tuple, ft)
+	}
+
+	if t.Security() == SecurityIPSec {
+		for _, nat := range createFiveTuples(t.remotes, t.local, IPP_UDP, PortRange{Start: 4500}) {
+			v.router.disconnect(Match5Tuple, nat)
+		}
+	}
+
+	vif.disconnect(MatchIPv4Dst, &(t.RemoteAddresses()[0]))
+}
+
+func createVxLANs(remotes []net.IP, local net.IP, dstPort uint16, vni uint32) []*VxLAN {
+	vxlans := make([]*VxLAN, len(remotes))
+	for i, remote := range remotes {
+		vxlan := &VxLAN{
+			Src:     remote,
+			Dst:     local,
+			DstPort: dstPort,
+			VNI:     vni,
+		}
+		vxlans[i] = vxlan
+	}
+	return vxlans
 }
 
 func (v *VRF) addL2Tunnel(i *Interface) error {
@@ -478,30 +603,26 @@ func (v *VRF) addL2Tunnel(i *Interface) error {
 	// Forward inbound packets to L2 Tunnel
 	switch e := t.EncapsMethod(); e {
 	case EncapsMethodGRE:
-		for _, remote := range ra {
-			ft := NewFiveTuple()
-			ft.SrcIP = CreateIPAddr(remote)
-			ft.DstIP = CreateIPAddr(t.LocalAddress())
-			ft.Proto = IPP_GRE
-
-			// TODO: We may want to roll back on error.
+		fts := createFiveTuples(ra, t.local, IPP_GRE, PortRange{})
+		for idx, ft := range fts {
 			if err := v.router.connect(i.Inbound(), Match5Tuple, ft); err != nil {
-				logger.Fatalf("Can't connect L2 tunnel to the router: %v", err)
+				i.disconnect(MatchIPv4Dst, &ra[0])
+				for _, addedFt := range fts[0:idx] {
+					v.router.disconnect(Match5Tuple, addedFt)
+				}
+				return fmt.Errorf("Can't connect L2 tunnel to the router: %v", err)
 			}
 		}
 
 	case EncapsMethodVxLAN:
-		for _, remote := range ra {
-			vxlan := &VxLAN{
-				Src:     remote,
-				Dst:     t.LocalAddress(),
-				DstPort: t.VxLANPort(),
-				VNI:     t.VNI(),
-			}
-
-			// TODO: We may want to roll back on error.
+		vxlans := createVxLANs(ra, t.local, t.vxlanPort, t.vni)
+		for idx, vxlan := range vxlans {
 			if err := v.router.connect(i.Inbound(), MatchVxLAN, vxlan); err != nil {
-				logger.Fatalf("Can't connect L2 tunnel to the router: %v", err)
+				i.disconnect(MatchIPv4Dst, &ra[0])
+				for _, addedVxLAN := range vxlans[0:idx] {
+					v.router.disconnect(Match5Tuple, addedVxLAN)
+				}
+				return fmt.Errorf("Can't connect L2 tunnel to the router: %v", err)
 			}
 		}
 
@@ -512,9 +633,21 @@ func (v *VRF) addL2Tunnel(i *Interface) error {
 	return nil
 }
 
-// TODO: Implement delete Tunnel
 func (v *VRF) deleteL2Tunnel(i *Interface) {
-	logger.Warning("Deleting L2 Tunnel (%v) from VRF not supported", i)
+	t := i.Tunnel()
+
+	switch e := t.EncapsMethod(); e {
+	case EncapsMethodGRE:
+		for _, ft := range createFiveTuples(t.remotes, t.local, IPP_GRE, PortRange{}) {
+			v.router.disconnect(Match5Tuple, ft)
+		}
+	case EncapsMethodVxLAN:
+		for _, vxlan := range createVxLANs(t.remotes, t.local, t.vxlanPort, t.vni) {
+			v.router.disconnect(MatchVxLAN, vxlan)
+		}
+	}
+
+	i.disconnect(MatchIPv4Dst, &(t.RemoteAddresses()[0]))
 }
 
 func (v *VRF) enableNAPT(vif *VIF) error {

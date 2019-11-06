@@ -31,78 +31,81 @@ import (
 type VswMatch int
 
 const (
-	MatchNone        VswMatch = iota // No rule
-	MatchAny                         // Default destination (arg: none)
-	MatchInVIF                       // Incoming VIF matched (arg: *VIF)
-	MatchOutVIF                      // Outgoing VIF matched (arg: *VIF)
-	MatchEthDst                      // Destination MAC address matched (arg: net.HardwareAddr)
-	MatchEthDstSelf                  // Packet heading to the router itself (arg: none)
-	MatchEthDstMC                    // Multicast (arg: none)
-	MatchEthDstBC                    // Broadcast (arg: none)
-	MatchEthSrc                      // Source MAC address matched (arg: net.HardwareAddr)
-	MatchEthTypeIPv4                 // IPv4 packet type (arg: none)
-	MatchEthTypeIPv6                 // IPv6 packet type (arg: none)
-	MatchEthTypeARP                  // ARP packet type (arg: none)
-	MatchEthType                     // Ether packet type matched (arg: dpdk.EtherType)
-	MatchVID                         // VLAN ID matched (arg: VID)
-	MatchIPv4Proto                   // IPv4 protocol type matched (arg: IPProto)
-	MatchIPv4Src                     // Source IPv4 address matched (arg: net.IP)
-	MatchIPv4SrcNet                  // Source IPv4 network address matched (arg: IPAddr)
-	MatchIPv4Dst                     // Destination IPv4 address matched (arg: net.IP)
-	MatchIPv4DstNet                  // Destination IPv4 network address matched (arg: IPAddr)
-	MatchIPv4DstSelf                 // IPv4 packet sent to the router itself (none)
-	Match5Tuple                      // 5-Tuple (arg: *FiveTuple)
-	MatchVxLAN                       // VxLAN (arg: *VxLAN)
+	MatchNone         VswMatch = iota // No rule
+	MatchAny                          // Default destination (arg: none)
+	MatchInVIF                        // Incoming VIF matched (arg: *VIF)
+	MatchOutVIF                       // Outgoing VIF matched (arg: *VIF)
+	MatchEthDst                       // Destination MAC address matched (arg: net.HardwareAddr)
+	MatchEthDstSelf                   // Packet heading to the router itself (arg: none)
+	MatchEthDstMC                     // Multicast (arg: none)
+	MatchEthDstBC                     // Broadcast (arg: none)
+	MatchEthSrc                       // Source MAC address matched (arg: net.HardwareAddr)
+	MatchEthTypeIPv4                  // IPv4 packet type (arg: none)
+	MatchEthTypeIPv6                  // IPv6 packet type (arg: none)
+	MatchEthTypeARP                   // ARP packet type (arg: none)
+	MatchEthType                      // Ether packet type matched (arg: dpdk.EtherType)
+	MatchVID                          // VLAN ID matched (arg: VID)
+	MatchIPv4Proto                    // IPv4 protocol type matched (arg: IPProto)
+	MatchIPv4Src                      // Source IPv4 address matched (arg: net.IP)
+	MatchIPv4SrcNet                   // Source IPv4 network address matched (arg: IPAddr)
+	MatchIPv4Dst                      // Destination IPv4 address matched (arg: net.IP)
+	MatchIPv4DstNet                   // Destination IPv4 network address matched (arg: IPAddr)
+	MatchIPv4DstSelf                  // IPv4 packet sent to the router itself (none)
+	MatchIPv4DstInVIF                 // IPv4 packet received from input VIF (arg: ScopedAddress)
+	Match5Tuple                       // 5-Tuple (arg: *FiveTuple)
+	MatchVxLAN                        // VxLAN (arg: *VxLAN)
 )
 
 var vswMatchStrings = map[VswMatch]string{
-	MatchAny:         "MatchAny",
-	MatchInVIF:       "MatchInVIF",
-	MatchOutVIF:      "MatchOutVIF",
-	MatchEthDst:      "MatchEthDst",
-	MatchEthDstSelf:  "MatchEthDstSelf",
-	MatchEthDstMC:    "MatchEthDstMC",
-	MatchEthDstBC:    "MatchEthDstBC",
-	MatchEthSrc:      "MatchEthSrc",
-	MatchEthTypeIPv4: "MatchEthTypeIPv4",
-	MatchEthTypeIPv6: "MatchEthTypeIPv6",
-	MatchEthTypeARP:  "MatchEthTypeARP",
-	MatchEthType:     "MatchEthType",
-	MatchVID:         "MatchVID",
-	MatchIPv4Proto:   "MatchIPv4Proto",
-	MatchIPv4Src:     "MatchIPv4Src",
-	MatchIPv4SrcNet:  "MatchIPv4SrcNet",
-	MatchIPv4Dst:     "MatchIPv4Dst",
-	MatchIPv4DstNet:  "MatchIPv4DstNet",
-	MatchIPv4DstSelf: "MatchIPv4DstSelf",
-	Match5Tuple:      "Match5Tuple",
-	MatchVxLAN:       "MatchVxLAN",
+	MatchAny:          "MatchAny",
+	MatchInVIF:        "MatchInVIF",
+	MatchOutVIF:       "MatchOutVIF",
+	MatchEthDst:       "MatchEthDst",
+	MatchEthDstSelf:   "MatchEthDstSelf",
+	MatchEthDstMC:     "MatchEthDstMC",
+	MatchEthDstBC:     "MatchEthDstBC",
+	MatchEthSrc:       "MatchEthSrc",
+	MatchEthTypeIPv4:  "MatchEthTypeIPv4",
+	MatchEthTypeIPv6:  "MatchEthTypeIPv6",
+	MatchEthTypeARP:   "MatchEthTypeARP",
+	MatchEthType:      "MatchEthType",
+	MatchVID:          "MatchVID",
+	MatchIPv4Proto:    "MatchIPv4Proto",
+	MatchIPv4Src:      "MatchIPv4Src",
+	MatchIPv4SrcNet:   "MatchIPv4SrcNet",
+	MatchIPv4Dst:      "MatchIPv4Dst",
+	MatchIPv4DstNet:   "MatchIPv4DstNet",
+	MatchIPv4DstSelf:  "MatchIPv4DstSelf",
+	MatchIPv4DstInVIF: "MatchIPv4DstInVIF",
+	Match5Tuple:       "Match5Tuple",
+	MatchVxLAN:        "MatchVxLAN",
 }
 
 func (vm VswMatch) String() string { return vswMatchStrings[vm] }
 
 var paramTypes = map[VswMatch]reflect.Type{
-	MatchAny:         nil,
-	MatchInVIF:       reflect.TypeOf((*VIF)(nil)),
-	MatchOutVIF:      reflect.TypeOf((*VIF)(nil)),
-	MatchEthDst:      reflect.TypeOf((*net.HardwareAddr)(nil)),
-	MatchEthDstSelf:  nil,
-	MatchEthDstMC:    nil,
-	MatchEthDstBC:    nil,
-	MatchEthSrc:      reflect.TypeOf((*net.HardwareAddr)(nil)),
-	MatchEthTypeIPv4: nil,
-	MatchEthTypeIPv6: nil,
-	MatchEthTypeARP:  nil,
-	MatchEthType:     reflect.TypeOf(dpdk.EtherType(0)),
-	MatchVID:         reflect.TypeOf(VID(0)),
-	MatchIPv4Proto:   reflect.TypeOf(IPProto(0)),
-	MatchIPv4Src:     reflect.TypeOf((*net.IP)(nil)),
-	MatchIPv4SrcNet:  reflect.TypeOf((*IPAddr)(nil)),
-	MatchIPv4Dst:     reflect.TypeOf((*net.IP)(nil)),
-	MatchIPv4DstNet:  reflect.TypeOf((*IPAddr)(nil)),
-	MatchIPv4DstSelf: nil,
-	Match5Tuple:      reflect.TypeOf((*FiveTuple)(nil)),
-	MatchVxLAN:       reflect.TypeOf((*VxLAN)(nil)),
+	MatchAny:          nil,
+	MatchInVIF:        reflect.TypeOf((*VIF)(nil)),
+	MatchOutVIF:       reflect.TypeOf((*VIF)(nil)),
+	MatchEthDst:       reflect.TypeOf((*net.HardwareAddr)(nil)),
+	MatchEthDstSelf:   nil,
+	MatchEthDstMC:     nil,
+	MatchEthDstBC:     nil,
+	MatchEthSrc:       reflect.TypeOf((*net.HardwareAddr)(nil)),
+	MatchEthTypeIPv4:  nil,
+	MatchEthTypeIPv6:  nil,
+	MatchEthTypeARP:   nil,
+	MatchEthType:      reflect.TypeOf(dpdk.EtherType(0)),
+	MatchVID:          reflect.TypeOf(VID(0)),
+	MatchIPv4Proto:    reflect.TypeOf(IPProto(0)),
+	MatchIPv4Src:      reflect.TypeOf((*net.IP)(nil)),
+	MatchIPv4SrcNet:   reflect.TypeOf((*IPAddr)(nil)),
+	MatchIPv4Dst:      reflect.TypeOf((*net.IP)(nil)),
+	MatchIPv4DstNet:   reflect.TypeOf((*IPAddr)(nil)),
+	MatchIPv4DstSelf:  nil,
+	MatchIPv4DstInVIF: reflect.TypeOf((*ScopedAddress)(nil)),
+	Match5Tuple:       reflect.TypeOf((*FiveTuple)(nil)),
+	MatchVxLAN:        reflect.TypeOf((*VxLAN)(nil)),
 }
 
 const ruleNotificationBuffer = 10
@@ -185,6 +188,30 @@ func (r *Rules) notify(op notifier.Type, rule Rule) {
 	}
 }
 
+// Convert IP Address format to 16-byte form
+// because we use reflect.DeepEqual() to remove a rule
+// if a matching rule is MatchIPv4DstInVIF or Match5Tuple, MatchVxLAN.
+func to16(param interface{}) interface{} {
+	switch v := param.(type) {
+	case *ScopedAddress:
+		sa := *v
+		sa.address = v.address.To16()
+		return &sa
+	case *FiveTuple:
+		ft := *v
+		ft.SrcIP.IP = v.SrcIP.IP.To16()
+		ft.DstIP.IP = v.DstIP.IP.To16()
+		return &ft
+	case *VxLAN:
+		vxlan := *v
+		vxlan.Src = v.Src.To16()
+		vxlan.Dst = v.Dst.To16()
+		return &vxlan
+	default:
+		return v
+	}
+}
+
 func (r *Rules) add(match VswMatch, param interface{}, ring *dpdk.Ring) error {
 	var rule Rule
 
@@ -216,19 +243,33 @@ func (r *Rules) add(match VswMatch, param interface{}, ring *dpdk.Ring) error {
 	return nil
 }
 
-func (r *Rules) remove(match VswMatch, param interface{}) error {
+func (r *Rules) deleteRule(i int, match VswMatch, rule Rule) {
 	rules := r.rules[match]
+	l := len(rules) - 1
+	rules[i] = rules[l]
+	rules[l] = Rule{}
 
-	for i, rule := range rules {
-		if rule.Param == param {
-			l := len(rules) - 1
-			rules[i] = rules[l]
-			rules[l] = Rule{}
+	r.rules[match] = rules[:l]
+	r.notify(notifier.Delete, rule)
+}
 
-			r.rules[match] = rules[:l]
-			r.notify(notifier.Delete, rule)
-
-			return nil
+func (r *Rules) remove(match VswMatch, param interface{}) error {
+	switch match {
+	case MatchIPv4DstInVIF, Match5Tuple, MatchVxLAN:
+		// Convert IP Address format to 16-byte form.
+		p := to16(param)
+		for i, rule := range r.rules[match] {
+			if reflect.DeepEqual(to16(rule.Param), p) {
+				r.deleteRule(i, match, rule)
+				return nil
+			}
+		}
+	default:
+		for i, rule := range r.rules[match] {
+			if rule.Param == param {
+				r.deleteRule(i, match, rule)
+				return nil
+			}
 		}
 	}
 

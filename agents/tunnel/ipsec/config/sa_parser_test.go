@@ -158,6 +158,52 @@ func (suite *testSAParserTestSuite) TestParse3DESCBC() {
 	_ = mgr.DeleteSA(selector)
 }
 
+func (suite *testSAParserTestSuite) TestParseSha256Hmac() {
+
+	/*
+		expectedValue := &sad.SAValue{
+			CipherAlgoType: ipsec.CipherAlgoTypeAes128Cbc,
+			CipherKey: []byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+				0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff},
+			AuthAlgoType: ipsec.AuthAlgoTypeSha256Hma,
+			AuthKey: []byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+				0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+				0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+				0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff},
+			LocalEPIP: net.IPNet{
+				IP:   net.ParseIP("172.16.1.1").To4(),
+				Mask: net.CIDRMask(32, 32),
+			},
+			RemoteEPIP: net.IPNet{
+				IP:   net.ParseIP("172.16.1.2").To4(),
+				Mask: net.CIDRMask(32, 32),
+			},
+			Flags: ipsec.IP4Tunnel,
+		}
+	*/
+
+	confStr := "out 3 vrf 1 cipher_algo 3des-cbc " +
+		"cipher_key 00:11:22:33:44:55:66:77:88:99:" +
+		"aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77 " +
+		"auth_algo sha256-128-hmac auth_key " +
+		"00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff " +
+		"mode ipv4-tunnel udp 4500 4500 src 172.16.1.1 dst 172.16.1.2"
+	mgr := sad.GetMgr(ipsec.DirectionTypeOut)
+
+	err := saParser.Parse(strings.Fields(confStr))
+	suite.Empty(err)
+
+	// not check expectedValue == sa value.
+	// inStat is internally generated. So do not compare.
+
+	// delete.
+	selector := &sad.SASelector{
+		VRFIndex: 1,
+		SPI:      3,
+	}
+	_ = mgr.DeleteSA(selector)
+}
+
 func (suite *testSAParserTestSuite) TestParseErrorBadParam() {
 	// Bad param length.
 	confStr := "out"

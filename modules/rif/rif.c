@@ -25,9 +25,12 @@
 #include "logger.h"
 #include "rif.h"
 #include "packet.h"
+#include "ether.h"
 
-static void rif_proc_trunk(struct rte_mempool *, struct rif_instance *, struct rte_mbuf **, int);
-static void rif_proc_access(struct rte_mempool *, struct rif_instance *, struct rte_mbuf **, int);
+static void rif_proc_tx_trunk(struct rte_mempool *, struct rif_instance *, struct rte_mbuf **, int);
+static void rif_proc_rx_trunk(struct rte_mempool *, struct rif_instance *, struct rte_mbuf **, int);
+static void rif_proc_tx_access(struct rte_mempool *, struct rif_instance *, struct rte_mbuf **, int);
+static void rif_proc_rx_access(struct rte_mempool *, struct rif_instance *, struct rte_mbuf **, int);
 
 #define RIF_DEFAULT_RIFS_CAP 256
 
@@ -76,7 +79,8 @@ rif_register_instance(void *p, struct vsw_instance *base)
 		i->fwd_type[n] = VSW_ETHER_DST_UNKNOWN;
 	}
 
-	i->proc = rif_proc_access;
+	i->proc_tx = rif_proc_tx_access;
+	i->proc_rx = rif_proc_rx_access;
 
 	return true;
 }
@@ -144,14 +148,16 @@ rif_control_instance(void *p, struct vsw_instance *base, void *param)
 		i->mtu = ep->mtu;
 		return true;
 	case RIF_CMD_SET_MAC:
-		ether_addr_copy(ep->mac, &i->self_addr);
+		ether_addr_copy(&ep->mac, &i->self_addr);
 		return true;
 	case RIF_CMD_SET_TRUNK_MODE:
-		i->proc = rif_proc_trunk;
+		i->proc_tx = rif_proc_tx_trunk;
+		i->proc_rx = rif_proc_rx_trunk;
 		i->trunk = true;
 		return true;
 	case RIF_CMD_SET_ACCESS_MODE:
-		i->proc = rif_proc_access;
+		i->proc_tx = rif_proc_tx_access;
+		i->proc_rx = rif_proc_rx_access;
 		i->trunk = false;
 		return true;
 	case RIF_CMD_SET_DST_SELF_FORWARD:
@@ -180,10 +186,59 @@ dup_mbuf(struct rte_mempool *mp, struct rte_mbuf *mbuf)
 }
 
 static void
-rif_proc_trunk(struct rte_mempool *mp, struct rif_instance *e, struct rte_mbuf **mbufs, int count)
+rif_proc_tx_trunk(struct rte_mempool *mp, struct rif_instance *e, struct rte_mbuf **mbufs, int count)
 {
 	vifindex_t *index = e->index;
 	struct rte_ring **outputs = e->base.outputs;
+	struct vsw_counter *c = e->counter;
+	struct vsw_counter **counters = e->counters;
+
+	// TRUNK Mode
+	for (int i = 0; i < count; i++) {
+		struct rte_mbuf *mbuf = mbufs[i];
+		uint16_t vlan_id = mbuf->vlan_tci & 0xfff;
+		vifindex_t vifidx = index[vlan_id];
+
+		if (vifidx == VIF_INVALID_INDEX) {
+			c->out_errors++;
+			rte_pktmbuf_free(mbuf);
+			continue;
+		}
+
+		struct vsw_counter *vc = counters[vlan_id];
+
+		// XXX: We shall optimize packets forwarding. Queueing packets one-by-one
+		// is not optimal.
+		if (mbuf->pkt_len <= e->mtu) {
+			if (rte_mbuf_refcnt_read(mbuf) > 1)
+				mbuf = dup_mbuf(mp, mbuf);
+
+			// In_vif is set to VIF index of RIF, so that VSI will not send back
+			// the packet during flooding.
+			struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
+			md->common.in_vif  = vifidx;
+			md->common.out_vif = VIF_INVALID_INDEX;
+
+			// VRF -> VSI
+			if (rte_ring_enqueue(outputs[vlan_id], mbuf) == 0) {
+				VSW_ETHER_UPDATE_OUT_COUNTER(c, vc, vsw_check_ether_dst(mbuf), mbuf->pkt_len);
+			} else {
+				rte_pktmbuf_free(mbuf);
+				c->out_discards++;
+				vc->out_discards++;
+			}
+		} else {
+			c->out_errors++;
+			vc->out_errors++;
+			rte_pktmbuf_free(mbuf);
+		}
+	}
+}
+
+static void
+rif_proc_rx_trunk(struct rte_mempool *mp, struct rif_instance *e, struct rte_mbuf **mbufs, int count)
+{
+	vifindex_t *index = e->index;
 	struct rte_ring **fwd = e->fwd;
 	vsw_ether_dst_t *ft = e->fwd_type;
 	struct vsw_counter *c = e->counter;
@@ -198,12 +253,7 @@ rif_proc_trunk(struct rte_mempool *mp, struct rif_instance *e, struct rte_mbuf *
 		vifindex_t vifidx = index[vlan_id];
 
 		if (vifidx == VIF_INVALID_INDEX) {
-			struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
-			if (md->common.out_vif == VIF_INVALID_INDEX) {
-				c->in_errors++;
-			} else {
-				c->out_errors++;
-			}
+			c->in_errors++;
 			rte_pktmbuf_free(mbuf);
 			continue;
 		}
@@ -217,89 +267,52 @@ rif_proc_trunk(struct rte_mempool *mp, struct rif_instance *e, struct rte_mbuf *
 				mbuf = dup_mbuf(mp, mbuf);
 
 			struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
-
-			// If out_vif is set to the VIF index of RIF, then the packet should
-			// be sent out from RIF to VSI, i.e. outgoing packet.
-			// In_vif is set to VIF index of RIF, so that VSI will not send back
-			// the packet during flooding.
-			vifindex_t out_vif = md->common.out_vif;
 			md->common.in_vif  = vifidx;
 			md->common.out_vif = VIF_INVALID_INDEX;
 
-			if (out_vif == vifidx) {
-				// VRF -> VSI
-				VSW_ETHER_UPDATE_OUT_COUNTER2(c, vc, vsw_check_ether_dst(mbuf));
+			// VSI -> VRF
+			vsw_ether_dst_t d = vsw_check_ether_dst_and_self(mbuf, self_addr);
 
-				if (rte_ring_enqueue(outputs[vlan_id], mbuf) == 0) {
-					c->out_octets += mbuf->pkt_len;
-					vc->out_octets += mbuf->pkt_len;
-				} else {
-					rte_pktmbuf_free(mbuf);
-					c->out_discards++;
-					vc->out_discards++;
+			bool sent = false;
+			if (d & ft[vlan_id]) {
+				if (rte_ring_enqueue(fwd[vlan_id], mbuf) == 0) {
+					sent = true;
+					VSW_ETHER_UPDATE_IN_COUNTER(c, vc, d, mbuf->pkt_len);
 				}
-			} else {
-				// VSI -> VRF
-				vsw_ether_dst_t d = vsw_check_ether_dst_and_self(mbuf, self_addr);
-				VSW_ETHER_UPDATE_IN_COUNTER2(c, vc, d);
+			}
 
-				if (d & ft[vlan_id]) {
-					if (rte_ring_enqueue(fwd[vlan_id], mbuf) == 0) {
-						c->in_octets += mbuf->pkt_len;
-						vc->in_octets += mbuf->pkt_len;
-					} else {
-						rte_pktmbuf_free(mbuf);
-						c->in_discards++;
-						vc->in_discards++;
-					}
-				}
+			if (!sent) {
+				rte_pktmbuf_free(mbuf);
+				c->in_discards++;
+				vc->in_discards++;
 			}
 		} else {
-			struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
-
-			if (md->common.out_vif == vifidx) {
-				c->out_errors++;
-				vc->out_errors++;
-			} else {
-				c->in_errors++;
-				vc->in_errors++;
-			}
-
+			c->in_errors++;
+			vc->in_errors++;
 			rte_pktmbuf_free(mbuf);
 		}
 	}
 }
 
 static void
-rif_proc_access(struct rte_mempool *mp, struct rif_instance *e, struct rte_mbuf **mbufs, int count)
+rif_proc_tx_access(struct rte_mempool *mp, struct rif_instance *e, struct rte_mbuf **mbufs, int count)
 {
 	struct rte_mbuf *outbound_mbufs[RIF_MBUF_LEN]; // FIXME
-	struct rte_mbuf *inbound_mbufs[RIF_MBUF_LEN]; // FIXME
-
 	uint16_t vid = e->vid;
 	vifindex_t index = e->index[vid];
 	struct rte_ring *outbound_output = e->base.outputs[vid];
-	struct rte_ring *inbound_output = e->fwd[vid];
-	vsw_ether_dst_t ft = e->fwd_type[vid];
 	struct vsw_counter *c = e->counter;
-
-	struct ether_addr *self_addr = &e->self_addr;
-
 	unsigned outbound_count = 0;
-	unsigned inbound_count = 0;
 
-	if (index == VIF_INVALID_INDEX) {
+	if (index == VIF_INVALID_INDEX || outbound_output == NULL) {
 		for (int i = 0; i < count; i++) {
-			struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbufs[i]);
-			if (md->common.out_vif == VIF_INVALID_INDEX) {
-				c->in_errors++;
-			} else {
-				c->out_errors++;
-			}
+			c->out_errors++;
 			rte_pktmbuf_free(mbufs[i]);
 		}
 		return;
 	}
+
+	struct vsw_counter *vc = e->counters[vid];
 
 	for (int i = 0; i < count; i++) {
 		struct rte_mbuf *mbuf = mbufs[i];
@@ -309,14 +322,86 @@ rif_proc_access(struct rte_mempool *mp, struct rif_instance *e, struct rte_mbuf 
 		// - exceeding MTU
 		if ((mbuf->pkt_len > e->mtu) ||
 		    ((mbuf->vlan_tci & 0xfff) != vid)) {
-			struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
+			c->out_errors++;
+			vc->out_errors++;
+			rte_pktmbuf_free(mbuf);
+			continue;
+		}
 
-			if (md->common.out_vif == index) {
-				c->out_errors++;
-			} else {
-				c->in_errors++;
-			}
+		if (rte_mbuf_refcnt_read(mbuf) > 1)
+			mbuf = dup_mbuf(mp, mbuf);
 
+		// In_vif is set to VIF index of RIF, so that VSI will not send back
+		// the packet during flooding.
+		struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
+		md->common.in_vif  = index;
+		md->common.out_vif = VIF_INVALID_INDEX;
+
+		// VRF -> VSI
+		vsw_ether_dst_t dst = vsw_check_ether_dst(mbuf);
+		VSW_ETHER_UPDATE_OUT_COUNTER(c, vc, dst, mbuf->pkt_len);
+
+		outbound_mbufs[outbound_count++] = mbuf;
+	}
+
+	unsigned outbound_sent = 0;
+
+	if (outbound_count > 0)
+		outbound_sent = rte_ring_enqueue_burst(outbound_output, (void * const*)outbound_mbufs, outbound_count, NULL);
+
+	if (unlikely(outbound_sent < outbound_count)) {
+		uint64_t discards = outbound_count - outbound_sent;
+		c->out_discards += discards;
+		vc->out_discards += discards;
+
+		uint64_t octets = 0;
+		while (unlikely(outbound_sent < outbound_count)) {
+			struct rte_mbuf *mbuf = mbufs[outbound_sent];
+
+			vsw_ether_dst_t dst = vsw_check_ether_dst(mbuf);
+			VSW_ETHER_DEC_OUT_COUNTER(c, vc, dst);
+			octets += mbuf->pkt_len;
+
+			rte_pktmbuf_free(mbuf);
+			outbound_sent++;
+		}
+		c->out_octets -= octets;
+		vc->out_octets -= octets;
+	}
+}
+
+static void
+rif_proc_rx_access(struct rte_mempool *mp, struct rif_instance *e, struct rte_mbuf **mbufs, int count)
+{
+	struct rte_mbuf *inbound_mbufs[RIF_MBUF_LEN]; // FIXME
+	uint16_t vid = e->vid;
+	vifindex_t index = e->index[vid];
+	struct rte_ring *inbound_output = e->fwd[vid];
+	vsw_ether_dst_t ft = e->fwd_type[vid];
+	struct vsw_counter *c = e->counter;
+	struct ether_addr *self_addr = &e->self_addr;
+	unsigned inbound_count = 0;
+
+	if (index == VIF_INVALID_INDEX) {
+		for (int i = 0; i < count; i++) {
+			c->in_errors++;
+			rte_pktmbuf_free(mbufs[i]);
+		}
+		return;
+	}
+
+	struct vsw_counter *vc = e->counters[vid];
+
+	for (int i = 0; i < count; i++) {
+		struct rte_mbuf *mbuf = mbufs[i];
+
+		// drop following packets
+		// - w/o appropriate VLAN ID
+		// - exceeding MTU
+		if ((mbuf->pkt_len > e->mtu) ||
+		    ((mbuf->vlan_tci & 0xfff) != vid)) {
+			c->in_errors++;
+			vc->in_errors++;
 			rte_pktmbuf_free(mbuf);
 			continue;
 		}
@@ -325,70 +410,45 @@ rif_proc_access(struct rte_mempool *mp, struct rif_instance *e, struct rte_mbuf 
 			mbuf = dup_mbuf(mp, mbuf);
 
 		struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
-		vsw_ether_dst_t *dst = (vsw_ether_dst_t*)md->udata;
-
-		// If out_vif is set to the VIF index of RIF, then the packet should
-		// be sent out from RIF to VSI, i.e. outgoing packet.
-		// In_vif is set to VIF index of RIF, so that VSI will not send back
-		// the packet during flooding.
-		vifindex_t out_vif = md->common.out_vif;
 		md->common.in_vif  = index;
 		md->common.out_vif = VIF_INVALID_INDEX;
 
-		if (out_vif == index) {
-			// VRF -> VSI
-			*dst = vsw_check_ether_dst(mbuf);
-			VSW_ETHER_UPDATE_OUT_COUNTER(c, *dst);
+		vsw_ether_dst_t dst = vsw_check_ether_dst_and_self(mbuf, self_addr);
 
-			outbound_mbufs[outbound_count++] = mbuf;
-			c->out_octets += mbuf->pkt_len;
+		if (dst & ft) {
+			inbound_mbufs[inbound_count++] = mbuf;
+			VSW_ETHER_UPDATE_IN_COUNTER(c, vc, dst, mbuf->pkt_len);
 		} else {
-			// VSI -> VRF
-			*dst = vsw_check_ether_dst_and_self(mbuf, self_addr);
-			VSW_ETHER_UPDATE_IN_COUNTER(c, *dst);
-
-			if (*dst & ft) {
-				inbound_mbufs[inbound_count++] = mbuf;
-				c->in_octets += mbuf->pkt_len;
-			} else {
-				rte_pktmbuf_free(mbuf);
-				c->in_discards++;
-			}
+			rte_pktmbuf_free(mbuf);
+			c->in_discards++;
+			vc->in_discards++;
 		}
 	}
 
 	// Queue incoming packets at once for ACCESS Mode
-	unsigned outbound_sent = 0;
 	unsigned inbound_sent = 0;
-
-	if ((outbound_output) && outbound_count > 0)
-		outbound_sent = rte_ring_enqueue_burst(outbound_output, (void * const*)outbound_mbufs, outbound_count, NULL);
 
 	if ((inbound_output) && inbound_count > 0)
 		inbound_sent = rte_ring_enqueue_burst(inbound_output, (void * const*)inbound_mbufs, inbound_count, NULL);
 
-	while (unlikely(outbound_sent < outbound_count)) {
-		struct rte_mbuf *mbuf = mbufs[outbound_sent];
-		struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
+	if (unlikely(inbound_sent < inbound_count)) {
+		uint64_t discards = inbound_count - inbound_sent;
+		c->in_discards += discards;
+		vc->in_discards += discards;
 
-		vsw_ether_dst_t *dst = (vsw_ether_dst_t*)md->udata;
-		c->out_octets -= mbuf->pkt_len;
-		VSW_ETHER_DEC_OUT_COUNTER(c, *dst);
+		uint64_t octets = 0;
+		while (unlikely(inbound_sent < inbound_count)) {
+			struct rte_mbuf *mbuf = mbufs[inbound_sent];
 
-		rte_pktmbuf_free(mbuf);
-		outbound_sent++;
-	}
+			vsw_ether_dst_t dst = vsw_check_ether_dst(mbuf);
+			VSW_ETHER_DEC_IN_COUNTER(c, vc, dst);
+			octets += mbuf->pkt_len;
 
-	while (unlikely(inbound_sent < inbound_count)) {
-		struct rte_mbuf *mbuf = mbufs[inbound_sent];
-		struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
-
-		vsw_ether_dst_t *dst = (vsw_ether_dst_t*)md->udata;
-		c->in_octets -= mbuf->pkt_len;
-		VSW_ETHER_DEC_IN_COUNTER(c, *dst);
-
-		rte_pktmbuf_free(mbuf);
-		inbound_sent++;
+			rte_pktmbuf_free(mbuf);
+			inbound_sent++;
+		}
+		c->in_octets -= octets;
+		vc->in_octets -= octets;
 	}
 }
 
@@ -443,16 +503,23 @@ rif_process(void *p)
 {
 	struct rif_runtime *r = p;
 	struct rte_mbuf *mbufs[RIF_MBUF_LEN]; // XXX: Should be configurable
+	uint16_t count;
 
 	for (int n = 0; n < r->rifs_len; n++) {
 		struct rif_instance *e = (struct rif_instance*)r->rifs[n];
 		if ((!e) || (!e->base.enabled))
 			continue;
 
-		// RX and process incoming packets
-		uint16_t count = rte_ring_dequeue_burst(e->base.input, (void **)mbufs, RIF_MBUF_LEN, NULL);
+		// VRF -> RIF -> VSI (TX, i.e. outbound)
+		count = rte_ring_dequeue_burst(e->base.input, (void **)mbufs, RIF_MBUF_LEN, NULL);
 		if (count > 0)
-			e->proc(r->pool, e, mbufs, count);
+			e->proc_tx(r->pool, e, mbufs, count);
+
+		// VSI -> RIF -> VRF (RX, i.e. inbound)
+		count = rte_ring_dequeue_burst(e->base.input2, (void **)mbufs, RIF_MBUF_LEN, NULL);
+		if (count > 0)
+			e->proc_rx(r->pool, e, mbufs, count);
+
 	}
 	return true;
 }

@@ -118,8 +118,22 @@ struct rule {
 	uint32_t srcip;
 	uint32_t vni;
 	uint16_t dstport;
+	vifindex_t in_vif;
 	uint8_t proto;
 };
+
+/**
+ *  * Nexthop information.
+ *   */
+typedef struct nexthop {
+	uint32_t gw;
+	uint32_t weight;
+	uint16_t ifindex;
+	uint8_t netmask;
+	uint8_t broadcast_type; /**< Broadcast type by route type of rtnetlink. */
+	struct interface *interface;
+	pbr_action_t action;
+} nexthop_t;
 
 // Interface type flags
 typedef enum {
@@ -181,20 +195,10 @@ struct interface {
 	bool directed_broadcast;
 	struct napt *napt;
 	struct interface_addr_entry addr[IPADDR_MAX_NUM];
+	uint32_t nexthop_num; // number of nexthop that refers the interface
+	uint32_t nexthops_cap; // capacity of nexthop list
+	nexthop_t **nexthops; // nexthop list
 };
-
-/**
- *  * Nexthop information.
- *   */
-typedef struct nexthop {
-	uint32_t gw;
-	uint32_t weight;
-	uint16_t ifindex;
-	uint8_t netmask;
-	uint8_t broadcast_type; /**< Broadcast type by route type of rtnetlink. */
-	struct interface *interface;
-	pbr_action_t action;
-} nexthop_t;
 
 /**
  * route entry
@@ -203,9 +207,7 @@ typedef struct nexthop {
 struct route_entry {
 	uint32_t dst;       /* Destination address. */
 	uint32_t prefixlen; /* Length of prefix. */
-	uint32_t gw;	/* Nexthop address. */
 	uint32_t netmask;
-	uint32_t ifindex;    /* Nexthop interface index. */
 	uint32_t scope;      /* Scope of interface. */
 	uint32_t route_type; /* Kind of route(for check broadcast)*/
 	uint32_t metric;
@@ -229,7 +231,6 @@ struct neighbor_entry {
  * PBR entry
  */
 struct pbr_entry {
-	int index;
 	int priority;
 	vifindex_t in_vif;
 	uint32_t src_addr;
@@ -239,7 +240,6 @@ struct pbr_entry {
 	range_t src_port;
 	range_t dst_port;
 	uint8_t protocol;
-	pbr_action_t action;
 
 	uint32_t nexthop_num;
 	nexthop_t *nexthops;
@@ -326,7 +326,7 @@ struct router_context {
 	struct router_ring *rrp[MAX_ROUTER_VIFS + 1];
 	int rr_count;
 
-	bool (*parse_options)(struct ipv4_hdr *, struct router_mbuf_metadata *,
+	bool (*parse_options)(struct ipv4_hdr *, struct vsw_packet_metadata *,
 			      struct interface_table *);
 };
 
@@ -341,6 +341,17 @@ struct router_instance {
 	struct rte_ip_frag_tbl *frag_tbl;       // for reassemble.
 	struct rte_ip_frag_death_row death_row; // for reassemble.
 	struct rte_hash *reassemble_hash;
+
+	struct router_control_param control;
+	union {
+		struct interface_entry interface_entry;
+		struct interface_addr_entry interface_addr_entry;
+		struct router_rule router_rule;
+		struct route_entry route_entry;
+		struct pbr_entry pbr_entry;
+		struct neighbor_entry neighbor_entry;
+		struct napt_config napt_config;
+	} p;
 };
 
 struct router_runtime_param {

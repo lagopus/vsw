@@ -1102,6 +1102,13 @@ vxlan_control_disable(struct l2tun_iface *iface,
 
   if (iface->inbound) {
     /* inbound. */
+    /* clear FDB. */
+    ret = vxlan_fdb_clear(iface);
+    if (unlikely(ret != LAGOPUS_RESULT_OK)) {
+      TUNNEL_PERROR(ret);
+      return ret;
+    }
+
     /* delete FDB. */
     /* NOTE: Delete from hashtable. But do not free entry. */
     /*       Free entries at vxlan_unregister_iface().     */

@@ -28,6 +28,7 @@
 #include <sys/socket.h>
 
 #include <rte_ether.h>
+#include <rte_hash_crc.h>
 #include <rte_ip.h>
 #include <rte_malloc.h>
 
@@ -36,6 +37,10 @@
 
 #include "packet.h"
 #include "router_log.h"
+
+// Increase capacity of nexthop list by 4,
+// as 4 nexthops is added when a route is added generally.
+#define NEXTHOPS_CAPACITY_INCREMENT 4
 
 static void
 print_interface_entry(char *str, struct interface *interface) {
@@ -61,6 +66,12 @@ print_interface_list(struct interface_table *interface_table) {
 				(void **)&interface, &next) >= 0) {
 		print_interface_entry("List", interface);
 	}
+}
+
+static uint32_t
+self_hash_func(const void *key, uint32_t length, uint32_t initval) {
+	assert(length == 8);
+	return rte_hash_crc_8byte(*(uint64_t *)key, initval);
 }
 
 /*** public functions ***/
@@ -101,8 +112,8 @@ interface_init(const char *name) {
 	struct rte_hash_parameters self_hash_params = {
 	    .name = hash_name,
 	    .entries = IPADDR_MAX_NUM, //MAX number of ip address.
-	    .key_len = sizeof(uint32_t),
-	    .hash_func = rte_jhash,
+	    .key_len = sizeof(uint64_t),
+	    .hash_func = self_hash_func,
 	    .hash_func_init_val = 0,
 	    .socket_id = rte_socket_id(),
 	};
@@ -128,6 +139,7 @@ interface_fini(struct interface_table *interface_table) {
 	uint32_t next = 0;
 	// Free all entries.
 	while (rte_hash_iterate(interface_table->hashmap, (const void **)&ifindex, (void **)&interface, &next) >= 0) {
+		rte_free(interface->nexthops);
 		rte_free(interface);
 	}
 	// Destroy hashmaps.
@@ -135,6 +147,13 @@ interface_fini(struct interface_table *interface_table) {
 		rte_hash_free(interface_table->hashmap);
 	if (interface_table->self)
 		rte_hash_free(interface_table->self);
+	rte_free(interface_table);
+}
+
+inline static uint64_t
+create_ip_key(uint32_t addr, vifindex_t idx) {
+	uint64_t key = (uint64_t)addr;
+	return ((key << 32) | idx);
 }
 
 /**
@@ -153,8 +172,12 @@ interface_ip_add(struct interface_table *interface_table, struct interface_addr_
 		ROUTER_DEBUG("[INTERFACE] no interface entry. ifindex = %d\n", ifindex);
 		return false;
 	}
-	// Invalid parameter, assertion fail..
-	assert(ret >= 0);
+
+	// Lookup failed
+	if (ret < 0) {
+		ROUTER_ERROR("[INTERFACE] rte_hash_lookup_data() failed, err = %d.", ret);
+		return false;
+	}
 
 	// full of ip address
 	if (interface->count == IPADDR_MAX_NUM)
@@ -174,7 +197,8 @@ interface_ip_add(struct interface_table *interface_table, struct interface_addr_
 	interface->count++;
 
 	// Add a address to hashmap for self.
-	if (rte_hash_add_key(interface_table->self, &addr) < 0) {
+	uint64_t key = create_ip_key(addr, ifindex);
+	if (rte_hash_add_key(interface_table->self, &key) < 0) {
 		ROUTER_ERROR("[INTERFACE] regist ip address to self table failed.");
 		return false;
 	}
@@ -201,8 +225,11 @@ interface_ip_delete(struct interface_table *interface_table, struct interface_ad
 		ROUTER_DEBUG("[NEIGH] no interface entry. ifindex = %d\n", ifindex);
 		return false;
 	}
-	// Invalid parameter, assertion fail..
-	assert(ret >= 0);
+	// Lookup failed
+	if (ret < 0) {
+		ROUTER_ERROR("[INTERFACE] rte_hash_lookup_data() failed, err = %d.", ret);
+		return false;
+	}
 
 	// Remove ip address.
 	for (int i = 0; i < interface->count; i++) {
@@ -211,7 +238,8 @@ interface_ip_delete(struct interface_table *interface_table, struct interface_ad
 			interface->addr[i].addr = interface->addr[interface->count].addr;
 
 			// Delete a address from hashmap for self.
-			if (rte_hash_del_key(interface_table->self, &addr) < 0) {
+			uint64_t key = create_ip_key(addr, ifindex);
+			if (rte_hash_del_key(interface_table->self, &key) < 0) {
 				ROUTER_INFO("[INTERFACE] Not found entry.");
 			}
 			break;
@@ -222,6 +250,52 @@ interface_ip_delete(struct interface_table *interface_table, struct interface_ad
 	if (VSW_LOG_DEBUG_ENABLED(router_log_id))
 		print_interface_list(interface_table);
 	return true;
+}
+
+inline bool
+interface_ip_is_self(struct interface_table *interface_table, uint32_t addr, vifindex_t ifindex) {
+	uint64_t key = create_ip_key(addr, ifindex);
+	return (rte_hash_lookup(interface_table->self, &key) >= 0);
+}
+
+/**
+ * Add a nexthop reference that refers to the interface,
+ * to delete the interface reference that the nexthop has
+ * when the interface is deleted.
+ */
+bool
+interface_nexthop_reference_add(struct interface *interface, nexthop_t *nh) {
+	if (interface->nexthops_cap <= interface->nexthop_num) {
+		size_t new_cap = interface->nexthops_cap + NEXTHOPS_CAPACITY_INCREMENT;
+		nexthop_t **new = (nexthop_t **)rte_realloc(interface->nexthops,
+							    sizeof(nexthop_t *) * new_cap, 0);
+
+		if (!new) {
+			ROUTER_ERROR("[INTERFACE] Error allocation nexthop list\n");
+			return false;
+		}
+
+		interface->nexthops = new;
+		interface->nexthops_cap = new_cap;
+	}
+
+	interface->nexthops[interface->nexthop_num] = nh;
+	interface->nexthop_num++;
+	return true;
+}
+
+/**
+ * Delete a nexthop reference if the nexthop is deleted.
+ */
+void
+interface_nexthop_reference_delete(struct interface *interface, nexthop_t *nh) {
+	for (int i = 0; i < interface->nexthop_num; i++) {
+		if (interface->nexthops[i] == nh) {
+			interface->nexthop_num--;
+			interface->nexthops[i] = interface->nexthops[interface->nexthop_num];
+			return;
+		}
+	}
 }
 
 /**
@@ -286,13 +360,21 @@ interface_entry_delete(struct router_context *ctx, struct interface_entry *ie) {
 		ROUTER_DEBUG("[NEIGH] no interface entry. ifindex = %d\n", ie->ifindex);
 		return false;
 	}
-	// Invalid parameter, assertion fail..
-	assert(ret >= 0);
+	// Lookup failed
+	if (ret < 0) {
+		ROUTER_ERROR("[INTERFACE] rte_hash_lookup_data() failed, err = %d.", ret);
+		return false;
+	}
+
+	// Delete the interace reference from nexthops that refer it.
+	for (int i = 0; i < interface->nexthop_num; i++)
+		interface->nexthops[i]->interface = NULL;
+	rte_free(interface->nexthops);
 
 	// Delete ip address from self table.
 	for (int i = 0; i < interface->count; i++) {
 		if (!interface_ip_delete(interface_table, &interface->addr[i])) {
-			ROUTER_INFO("[INTERFACE] %s: (%s) failed to delete ip address.");
+			ROUTER_INFO("[INTERFACE] failed to delete ip address %s from %d.", ip2str(interface->addr[i].addr), ie->ifindex);
 		}
 	}
 
@@ -326,8 +408,11 @@ interface_entry_get(struct interface_table *interface_table, uint32_t ifindex) {
 		ROUTER_INFO("[INTERFACE] Not found entry.");
 		return NULL;
 	}
-	// Invalid parameter, assertion fail..
-	assert(ret >= 0);
+	// Lookup failed
+	if (ret < 0) {
+		ROUTER_ERROR("[INTERFACE] rte_hash_lookup_data() failed, err = %d.", ret);
+		return false;
+	}
 
 	if (VSW_LOG_DEBUG_ENABLED(router_log_id)) {
 		print_interface_entry("Get", interface);
@@ -350,8 +435,11 @@ interface_mtu_update(struct interface_table *interface_table, struct interface_e
 		ROUTER_INFO("[INTERFACE] Not found entry in %s\n", __func__);
 		return false;
 	}
-	// Invalid parameter, assertion fail.
-	assert(ret >= 0);
+	// Lookup failed
+	if (ret < 0) {
+		ROUTER_ERROR("[INTERFACE] rte_hash_lookup_data() failed, err = %d.", ret);
+		return false;
+	}
 
 	// If the interface entry already exists, update MTU>
 	interface->base.mtu = ie->mtu;

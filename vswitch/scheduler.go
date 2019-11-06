@@ -200,14 +200,14 @@ func (s *scheduler) sender() {
 		req.param = r.param
 		req.enabled = C.bool(r.enabled)
 
+		s.resMutex.Lock()
+		s.results[s.seqno] = r.rc
+		s.resMutex.Unlock()
+
 		if usedRing.Enqueue(unsafe.Pointer(req)) != 0 {
 			logger.Printf("Can't send request buffer.")
 			continue
 		}
-
-		s.resMutex.Lock()
-		s.results[s.seqno] = r.rc
-		s.resMutex.Unlock()
 
 		// increment sequence number now
 		s.seqno++

@@ -55,6 +55,7 @@ type EthdevInstance struct {
 	tx_param    *C.struct_ethdev_tx_instance
 	cname       *C.char
 	enabled     bool
+	mutex       sync.Mutex
 
 	// XXX: Do we really need this?
 	mode      vswitch.VLANMode
@@ -123,13 +124,12 @@ func getRuntimeForEthdev(dev *dpdk.EthDev) (*ethdevRuntime, error) {
 	}
 
 	// Create runtime argument
-	param := C.struct_ethdev_runtime_param{
-		pool:          (*C.struct_rte_mempool)(unsafe.Pointer(pool)),
-		iopl_required: (C.bool)(dev.RequireIOPL()),
-	}
+	param := (*C.struct_ethdev_runtime_param)(C.calloc(1, C.sizeof_struct_ethdev_runtime_param))
+	param.pool = (*C.struct_rte_mempool)(unsafe.Pointer(pool))
+	param.iopl_required = (C.bool)(dev.RequireIOPL())
 
 	rxOps := vswitch.LagopusRuntimeOps(unsafe.Pointer(&C.ethdev_rx_runtime_ops))
-	rx_rt, err := vswitch.NewRuntime(config.RxCore, "ethdev_rx", rxOps, unsafe.Pointer(&param))
+	rx_rt, err := vswitch.NewRuntime(config.RxCore, "ethdev_rx", rxOps, unsafe.Pointer(param))
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +138,7 @@ func getRuntimeForEthdev(dev *dpdk.EthDev) (*ethdevRuntime, error) {
 	}
 
 	txOps := vswitch.LagopusRuntimeOps(unsafe.Pointer(&C.ethdev_tx_runtime_ops))
-	tx_rt, err := vswitch.NewRuntime(config.TxCore, "ethdev_tx", txOps, unsafe.Pointer(&param))
+	tx_rt, err := vswitch.NewRuntime(config.TxCore, "ethdev_tx", txOps, unsafe.Pointer(param))
 	if err != nil {
 		rx_rt.Terminate()
 		return nil, err
@@ -374,18 +374,6 @@ func (e *EthdevInstance) InterfaceMode() vswitch.VLANMode {
 	return e.mode
 }
 
-func (e *EthdevInstance) UpdateCounter() {
-	if s, err := e.dev.Stats(); err == nil {
-		c := (*C.struct_vsw_counter)(unsafe.Pointer(e.counter))
-		c.in_octets = C.uint64_t(s.InBytes)
-		c.out_octets = C.uint64_t(s.OutBytes)
-		c.in_errors = C.uint64_t(s.InErrors)
-		c.out_errors = C.uint64_t(s.OutErrors)
-	} else {
-		log.Err("Can't get ethdev stats: %v", err)
-	}
-}
-
 func (e *EthdevInstance) LinkStatus() bool {
 	link := e.dev.Link(false)
 	return link.StatusUp
@@ -429,18 +417,16 @@ type controlMsg struct {
 	counter *vswitch.Counter
 }
 
-func (c *controlMsg) create() *C.struct_ethdev_control_param {
-	return &C.struct_ethdev_control_param{
-		cmd:     C.ethdev_cmd_t(c.cmd),
-		vid:     C.int(c.vid),
-		output:  (*C.struct_rte_ring)(unsafe.Pointer(c.out)),
-		index:   C.vifindex_t(c.vif),
-		counter: (*C.struct_vsw_counter)(unsafe.Pointer(c.counter)),
-	}
-}
-
 func (e *EthdevInstance) control(cmd *controlMsg) error {
-	p := cmd.create()
+	e.mutex.Lock()
+	defer e.mutex.Unlock()
+
+	p := &e.tx_param.param
+	p.cmd = C.ethdev_cmd_t(cmd.cmd)
+	p.vid = C.int(cmd.vid)
+	p.output = (*C.struct_rte_ring)(unsafe.Pointer(cmd.out))
+	p.index = C.vifindex_t(cmd.vif)
+	p.counter = (*C.struct_vsw_counter)(unsafe.Pointer(cmd.counter))
 
 	rc, err := e.rx_instance.Control(unsafe.Pointer(p))
 	if rc == false || err != nil {
@@ -559,18 +545,6 @@ func (ev *EthdevVIFInstance) Enable() error {
 
 func (ev *EthdevVIFInstance) Disable() {
 	ev.iface.control(&controlMsg{cmd: ETHDEV_CMD_DELETE_VID, vid: ev.vif.VID()})
-}
-
-func (ev *EthdevVIFInstance) UpdateCounter() {
-	log.Info("%s: UpdateCounter() called.", ev.vif)
-	if ev.iface.mode == vswitch.AccessMode {
-		ev.iface.UpdateCounter()
-		src := (*C.struct_vsw_counter)(unsafe.Pointer(ev.iface.counter))
-		dst := (*C.struct_vsw_counter)(unsafe.Pointer(ev.counter))
-		log.Info("%s: Updating counter: %v -> %v", ev.vif, *src, *dst)
-		*dst = *src
-		log.Info("%s: Updated counter.", ev.vif)
-	}
 }
 
 ///////////////////////////////////////////////////////

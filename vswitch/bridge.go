@@ -114,19 +114,13 @@ func (b *bridge) baseInstance() *BaseInstance {
 }
 
 func (b *bridge) free() {
+	for vif := range b.vifs {
+		b.deleteVIF(vif)
+	}
 	b.base.free()
 }
 
 func (b *bridge) addVIF(vif *VIF) error {
-	if b.vid != vif.vid {
-		return fmt.Errorf("VID doesn't match (bridge VID=%v, VIF VID=%v)", b.vid, vif.vid)
-	}
-
-	// We've already registered the VIF
-	if _, exists := b.vifs[vif]; exists {
-		return nil
-	}
-
 	// Check if MTU needs to be updated
 	mtu := vif.MTU()
 	if b.mtu < mtu {
@@ -173,6 +167,7 @@ func (b *bridge) deleteVIF(vif *VIF) error {
 	// Disconnect VIF first
 	// XXX: We should use BaseInstance.disconnect()
 	vif.setOutput(nil)
+	vif.setVSI(nil)
 
 	return nil
 }

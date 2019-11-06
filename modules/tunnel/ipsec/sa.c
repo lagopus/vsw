@@ -63,6 +63,20 @@
 
 #define SA_DEBUG_PRINT_LEN 1024
 
+/**
+   @struct supported_cipher_algo
+   @brief Supported cipher algorithmes.
+   @detail
+     +----------------------+-------------+-------------+-------------+
+     |                      | Text config | PFkey       | OpenConfigd |
+     +----------------------+-------------+-------------+-------------+
+     | NULL                 | O           | O           | O           |
+     | 256 bit AES-CBC      | O           | O           | X           |
+     | 128 bit AES-CBC      | O           | O           | O           |
+     | 128 bit AES-COUNTER  | O           | O           | X           |
+     | 168 bit 3DES-EDE-CBC | O           | O           | X           |
+     +----------------------+-------------+-------------+-------------+
+*/
 const struct supported_cipher_algo cipher_algos[] = {
   {
     .keyword = "null",
@@ -106,6 +120,18 @@ const struct supported_cipher_algo cipher_algos[] = {
   }
 };
 
+/**
+   @struct supported_auth_algo
+   @brief Supported auth algorithmes.
+   @detail
+     +----------------------+-------------+-------------+-------------+
+     |                      | Text config | PFkey       | OpenConfigd |
+     +----------------------+-------------+-------------+-------------+
+     | NULL                 | O           | O           | O           |
+     | SHA1 HMAC            | O           | O           | O           |
+     | SHA2_256_128 HMAC    | O           | O           | X           |
+     +----------------------+-------------+-------------+-------------+
+*/
 const struct supported_auth_algo auth_algos[] = {
   {
     .keyword = "null",
@@ -123,14 +149,25 @@ const struct supported_auth_algo auth_algos[] = {
     .key_len = 20
   },
   {
-    .keyword = "sha256-hmac",
+    .keyword = "sha256-128-hmac",
     .algo = RTE_CRYPTO_AUTH_SHA256_HMAC,
-    .atype = AUTH_ALGO_SHA256_HMAC,
-    .digest_len = 12,
+    .atype = AUTH_ALGO_SHA256_128_HMAC,
+    .digest_len = 16,
     .key_len = 32
   }
 };
 
+/**
+   @struct supported_aead_algo
+   @brief Supported AEAD algorithmes.
+   @detail
+     +----------------------+-------------+-------------+-------------+
+     |                      | Text config | PFkey       | OpenConfigd |
+     +----------------------+-------------+-------------+-------------+
+     | 128 bit AES-GCM      | O           | O           | O           |
+     |   with 128 bit ICV   |             |             |             |
+     +----------------------+-------------+-------------+-------------+
+*/
 const struct supported_aead_algo aead_algos[] = {
   {
     .keyword = "aes-128-gcm",

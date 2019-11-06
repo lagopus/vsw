@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net"
 
 	pb "github.com/coreswitch/openconfigd/proto"
 	"github.com/lagopus/vsw/vswitch"
@@ -42,12 +43,15 @@ type ConfigAgent struct {
 	ocdConn        *connect
 	server         *Server
 
-	p          *parser
-	oc         *openconfig
-	updatedNI  map[*ni]struct{}
-	updatedIF  map[*iface]struct{}
-	pendingTIF map[string][]interface{}
-	Setting    ocdSetting `toml:"openconfig"`
+	setParser    *parser
+	deleteParser *parser
+	oc           *openconfig
+	updatedNI    map[*ni]struct{}
+	updatedIF    map[*iface]struct{}
+	deletedNI    map[*deletedNI]struct{}
+	deletedIF    map[*deletedIface]struct{}
+	pendingTIF   map[string][]interface{}
+	Setting      ocdSetting `toml:"openconfig"`
 
 	iface map[string]*vswitch.Interface
 	vif   map[string]*vswitch.VIF
@@ -187,7 +191,7 @@ func (c *ConfigAgent) getVIFInstance(i *vswitch.Interface, s *subiface) (*vswitc
 	return vif, nil
 }
 
-func (c *ConfigAgent) configSubinterface(iface *vswitch.Interface, s *subiface, vids map[vswitch.VID]struct{}, i *iface) error {
+func (c *ConfigAgent) processSetSubinterfaceCmd(iface *vswitch.Interface, s *subiface, vids map[vswitch.VID]struct{}, i *iface) error {
 	vif, err := c.getVIFInstance(iface, s)
 	if err != nil {
 		return err
@@ -203,11 +207,16 @@ func (c *ConfigAgent) configSubinterface(iface *vswitch.Interface, s *subiface, 
 
 	// Update IPAddress
 	for _, ip := range s.ipaddr {
-		vif.AddIPAddr(ip)
-	}
-	for _, ip := range vif.ListIPAddrs() {
-		if _, ok := s.ipaddr[ip.String()]; !ok {
-			vif.DeleteIPAddr(ip)
+		vif.AddIPAddr(ip.ip)
+
+		// There is no setting of VRRP
+		if ip.vrrp == nil {
+			continue
+		}
+		for _, vg := range ip.vrrp {
+			if err := vif.AddVRRPGroup(ip.ip, vg); err != nil {
+				log.Err("Can'n add VRRPGroup: %v, %v, %v", ip, vg, err)
+			}
 		}
 	}
 
@@ -270,7 +279,6 @@ func (c *ConfigAgent) configSubinterface(iface *vswitch.Interface, s *subiface, 
 	}
 
 	// Check if the VIF is associated with any NI
-	// NOTE: we MUST connect VIF to VSI first. Not otherway around.
 	for name := range s.ni {
 		if vsi, ok := c.vsi[name]; ok {
 			if err := vsi.AddVIF(vif); err != nil {
@@ -289,7 +297,7 @@ func (c *ConfigAgent) configSubinterface(iface *vswitch.Interface, s *subiface, 
 	return nil
 }
 
-func (c *ConfigAgent) configInterface(i *iface) error {
+func (c *ConfigAgent) processSetInterfaceCmd(i *iface) error {
 	iface, err := c.getInterfaceInstance(i)
 	if err != nil {
 		return err
@@ -335,7 +343,7 @@ func (c *ConfigAgent) configInterface(i *iface) error {
 
 	// Update subinterfaces
 	for _, s := range i.subs {
-		if err := c.configSubinterface(iface, s, vids, i); err != nil {
+		if err := c.processSetSubinterfaceCmd(iface, s, vids, i); err != nil {
 			return fmt.Errorf("VIF %s configuration failed: %v", s.name, err)
 		}
 	}
@@ -361,11 +369,13 @@ func (c *ConfigAgent) configInterface(i *iface) error {
 type networkInstance interface {
 	AddVIF(*vswitch.VIF) error
 	DeleteVIF(*vswitch.VIF) error
+	Disable()
+	Free()
 	VIF() []*vswitch.VIF
 	String() string
 }
 
-func configVswitchNI(ni *ni, vsw networkInstance) {
+func setVIFToNI(ni *ni, vsw networkInstance) {
 	// Add VIF
 	for name := range ni.vifs {
 		if vif := vswitch.GetVIFByName(name); vif != nil {
@@ -404,7 +414,7 @@ func (c *ConfigAgent) getVSI(ni *ni) (*vswitch.VSI, error) {
 	return vsi, nil
 }
 
-func (c *ConfigAgent) configVSI(ni *ni) error {
+func (c *ConfigAgent) processSetVSICmd(ni *ni) error {
 	vsi, err := c.getVSI(ni)
 	if err != nil {
 		return err
@@ -434,7 +444,7 @@ func (c *ConfigAgent) configVSI(ni *ni) error {
 	}
 
 	// Update VIF
-	configVswitchNI(ni, vsi)
+	setVIFToNI(ni, vsi)
 
 	// Set FDB Config
 	if ni.macLearning != vsi.MACLearning() {
@@ -485,7 +495,7 @@ func (c *ConfigAgent) getVRF(ni *ni) (*vswitch.VRF, error) {
 	return vrf, nil
 }
 
-func (c *ConfigAgent) configVRF(ni *ni) error {
+func (c *ConfigAgent) processSetVRFCmd(ni *ni) error {
 	vrf, err := c.getVRF(ni)
 	if err != nil {
 		return err
@@ -498,7 +508,7 @@ func (c *ConfigAgent) configVRF(ni *ni) error {
 		for _, t := range tifs {
 			switch v := t.(type) {
 			case *iface:
-				if err := c.configInterface(v); err != nil {
+				if err := c.processSetInterfaceCmd(v); err != nil {
 					log.Err("Interface %s configuration failed: %v", v.name, err)
 					continue
 				}
@@ -508,7 +518,7 @@ func (c *ConfigAgent) configVRF(ni *ni) error {
 					log.Err("Interface %s configuration failed: %v", v.iface.name, err)
 					continue
 				}
-				if err := c.configSubinterface(iface, v, nil, v.iface); err != nil {
+				if err := c.processSetSubinterfaceCmd(iface, v, nil, v.iface); err != nil {
 					log.Err("VIF %s configuration failed: %v", v.name, err)
 					continue
 				}
@@ -518,7 +528,7 @@ func (c *ConfigAgent) configVRF(ni *ni) error {
 	}
 
 	// Update VIF
-	configVswitchNI(ni, vrf)
+	setVIFToNI(ni, vrf)
 
 	// Update SAD
 	if ni.sad != nil {
@@ -638,6 +648,204 @@ func (c *ConfigAgent) configPBR(vrf *vswitch.VRF, name string, p *pe) error {
 }
 
 //
+// delete command related
+//
+func (c *ConfigAgent) deleteInterface(iface *vswitch.Interface) {
+	// delete config information
+	for _, vif := range iface.VIF() {
+		delete(c.vif, vif.String())
+	}
+	delete(c.iface, iface.String())
+
+	iface.Free()
+}
+
+func (c *ConfigAgent) deleteSubiface(vif *vswitch.VIF) {
+	// delete config information
+	delete(c.vif, vif.String())
+
+	vif.Free()
+}
+
+func deleteIPAddress(ipaddr vswitch.IPAddr, vif *vswitch.VIF) {
+	if err := vif.DeleteIPAddr(ipaddr); err != nil {
+		log.Err("Can't delete an ip address(%v) from %v: %v\n", ipaddr, vif, err)
+	}
+}
+
+func deleteVRRPGroup(vgs *deletedVRRPGroups, ip vswitch.IPAddr, vif *vswitch.VIF) {
+	for vrid, dvg := range vgs.vgs {
+		// If virtual address is not specified, delete VRRPGroup itself.
+		if dvg.self {
+			if err := vif.DeleteVRRPGroup(ip, vrid); err != nil {
+				log.Err("Can't delete an VRRPGroup(%v:%v): %v", ip, vrid, err)
+			}
+			continue
+		}
+		// If virtual address is specified,
+		// get target VRRPGroup and delete virtual addresses.
+		vg := vif.VRRPGroup(ip, vrid)
+		if vg == nil {
+			log.Err("VRRPGroup does not exist(%v:%v)", ip, vrid)
+			continue
+		}
+		for _, addr := range dvg.vaddrs {
+			vg.DeleteVirtualAddr(addr)
+		}
+	}
+}
+
+func deleteVIDFromInterface(vids []vswitch.VID, iface *vswitch.Interface) {
+	for _, vid := range vids {
+		if err := iface.DeleteVID(vid); err != nil {
+			log.Err("VID %v deletion failed: %v\n", vid, err)
+		}
+	}
+}
+
+func (c *ConfigAgent) processDeleteInterfaceCmd(di *deletedIface) error {
+	iface, ok := c.iface[di.name]
+	if !ok {
+		return errors.New("No such Interface")
+	}
+
+	if di.self {
+		c.deleteInterface(iface)
+		return nil
+	}
+
+	for _, s := range di.subs {
+		vif, ok := c.vif[s.name]
+		if !ok {
+			log.Err("VIF %s deletion failed: No such VIF", s.name)
+			continue
+		}
+
+		if s.self {
+			c.deleteSubiface(vif)
+			continue
+		}
+
+		for _, ipaddr := range s.ipaddr {
+			deleteIPAddress(ipaddr, c.vif[s.name])
+			delete(s.groups, ipaddr.IP.String())
+		}
+
+		for ipstr, vgs := range s.groups {
+			ip := createIPAddr(net.ParseIP(ipstr), 32)
+			deleteVRRPGroup(vgs, ip, vif)
+		}
+	}
+
+	deleteVIDFromInterface(di.vids, iface)
+	return nil
+}
+
+func (c *ConfigAgent) deleteVIFFromNI(vifs []string, vsw networkInstance) {
+	for _, name := range vifs {
+		if vif, ok := c.vif[name]; ok {
+			if err := vsw.DeleteVIF(vif); err != nil {
+				log.Err("Can't delete a VIF %v from %v: %v", name, vsw, err)
+			}
+		}
+	}
+}
+
+func (c *ConfigAgent) deleteVSI(vsi *vswitch.VSI) {
+	// delete config information
+	delete(c.vsi, vsi.String())
+
+	vsi.Free()
+}
+
+func deleteVIDFromVSI(vlans []vswitch.VID, vsi *vswitch.VSI) {
+	for _, vid := range vlans {
+		vsi.DeleteVID(vid)
+	}
+}
+
+func (c *ConfigAgent) processDeleteVSICmd(dni *deletedNI) error {
+	vsi, ok := c.vsi[dni.name]
+	if !ok {
+		return errors.New("No such VSI")
+	}
+
+	if dni.self {
+		c.deleteVSI(vsi)
+		return nil
+	}
+
+	c.deleteVIFFromNI(dni.vifs, vsi)
+
+	deleteVIDFromVSI(dni.vlans, vsi)
+	return nil
+}
+
+// Delete Tunnel interfaces that specify the VRF to be deleted as the destination.
+func (c *ConfigAgent) deleteTunnel(vrf *vswitch.VRF) {
+	// L2 tunnel
+	for _, iface := range c.iface {
+		if tun := iface.Tunnel(); tun == nil || tun.VRF() != vrf {
+			continue
+		}
+
+		c.deleteInterface(iface)
+	}
+	// L3 tunnel
+	for _, vif := range c.vif {
+		if tun := vif.Tunnel(); tun == nil || tun.VRF() != vrf {
+			continue
+		}
+		c.deleteSubiface(vif)
+	}
+}
+
+func (c *ConfigAgent) deleteVRF(vrf *vswitch.VRF) {
+	// delete config information
+	delete(c.vrf, vrf.String())
+
+	c.deleteTunnel(vrf)
+	vrf.Free()
+}
+
+func deleteSADEntry(sad []uint32, vrf *vswitch.VRF) {
+	for _, spi := range sad {
+		vrf.SADatabases().DeleteSADEntry(spi)
+	}
+}
+
+func deleteSPDEntry(spd []string, vrf *vswitch.VRF) {
+	for _, name := range spd {
+		vrf.SADatabases().DeleteSPDEntry(name)
+	}
+}
+
+func (c *ConfigAgent) processDeleteVRFCmd(dni *deletedNI) error {
+	vrf, ok := c.vrf[dni.name]
+	if !ok {
+		return errors.New("No such VRF")
+	}
+
+	if dni.self {
+		c.deleteVRF(vrf)
+		return nil
+	}
+
+	c.deleteVIFFromNI(dni.vifs, vrf)
+
+	deleteSADEntry(dni.sad, vrf)
+	deleteSPDEntry(dni.spd, vrf)
+	return nil
+}
+
+func (c *ConfigAgent) clearDeleteConfs() {
+	c.deletedNI = make(map[*deletedNI]struct{})
+	c.deletedIF = make(map[*deletedIface]struct{})
+	c.oc.dnis = make(map[string]*deletedNI)
+	c.oc.difs = make(map[string]*deletedIface)
+}
+
+//
 // control related
 //
 func (c *ConfigAgent) validate(configs []*pb.ConfigReply) bool {
@@ -647,30 +855,67 @@ func (c *ConfigAgent) validate(configs []*pb.ConfigReply) bool {
 
 func (c *ConfigAgent) commit(configs []*pb.ConfigReply) {
 	for _, config := range configs {
-		if config.Type == pb.ConfigType_DELETE {
-			log.Warning("Delete Not Supported yet; Requested to delete %v", config.Path)
-			continue
-		}
-
-		if i, err := c.p.parse(config.Path); err != nil {
-			if pe, ok := err.(parserError); !ok || pe != noMatchingSyntaxError {
-				log.Err("Error while parsing '%v': %v", config.Path, err)
+		switch config.Type {
+		case pb.ConfigType_SET:
+			if i, err := c.setParser.parse(config.Path); err != nil {
+				if pe, ok := err.(parserError); !ok || pe != noMatchingSyntaxError {
+					log.Err("Error while parsing set command '%v': %v",
+						config.Path, err)
+				}
+			} else {
+				log.Debug(0, "set command parsed: %v", config.Path)
+				switch v := i.(type) {
+				case *iface:
+					c.updatedIF[v] = struct{}{}
+				case *ni:
+					c.updatedNI[v] = struct{}{}
+				}
 			}
-		} else {
-			log.Debug(0, "parsed: %v", config.Path)
-			switch v := i.(type) {
-			case *iface:
-				c.updatedIF[v] = struct{}{}
-			case *ni:
-				c.updatedNI[v] = struct{}{}
+		case pb.ConfigType_DELETE:
+			if i, err := c.deleteParser.parse(config.Path); err != nil {
+				if pe, ok := err.(parserError); !ok || pe != noMatchingSyntaxError {
+					log.Err("Error while parsing delete command'%v': %v",
+						config.Path, err)
+				}
+			} else {
+				log.Debug(0, "delete command parsed: %v", config.Path)
+				switch v := i.(type) {
+				case *deletedIface:
+					c.deletedIF[v] = struct{}{}
+				case *deletedNI:
+					c.deletedNI[v] = struct{}{}
+				}
 			}
 		}
 	}
 }
 
 func (c *ConfigAgent) config() {
+	// delete command
+	for dni := range c.deletedNI {
+		switch dni.niType {
+		case NI_L2VSI:
+			if err := c.processDeleteVSICmd(dni); err != nil {
+				log.Err("VSI %s deletion failed: %v", dni.name, err)
+			}
+
+		case NI_L3VRF:
+			if err := c.processDeleteVRFCmd(dni); err != nil {
+				log.Err("VRF %s deletion failed: %v", dni.name, err)
+			}
+		}
+	}
+
+	for di := range c.deletedIF {
+		if err := c.processDeleteInterfaceCmd(di); err != nil {
+			log.Err("Interface %s deletion failed: %v", di.name, err)
+		}
+	}
+	c.clearDeleteConfs()
+
+	// set command
 	for iface := range c.updatedIF {
-		if err := c.configInterface(iface); err != nil {
+		if err := c.processSetInterfaceCmd(iface); err != nil {
 			log.Err("Interface %s configuration failed: %v", iface.name, err)
 		}
 	}
@@ -680,7 +925,7 @@ func (c *ConfigAgent) config() {
 		if ni.niType == NI_L3VRF {
 			continue
 		}
-		if err := c.configVSI(ni); err != nil {
+		if err := c.processSetVSICmd(ni); err != nil {
 			log.Err("VSI %s configuration failed: %v", ni.name, err)
 		}
 	}
@@ -689,7 +934,7 @@ func (c *ConfigAgent) config() {
 		if ni.niType != NI_L3VRF {
 			continue
 		}
-		if err := c.configVRF(ni); err != nil {
+		if err := c.processSetVRFCmd(ni); err != nil {
 			log.Err("VRF %s configuration failed: %v", ni.name, err)
 		}
 	}
@@ -800,6 +1045,7 @@ func (c *ConfigAgent) String() string {
 }
 
 func (c *ConfigAgent) updates() {
+	log.Debug(0, "--- update ---\n")
 	for id := range c.updatedNI {
 		log.Debug(0, "Network Instance: %v\n", id)
 		log.Debug(0, "-------------------\n")
@@ -809,6 +1055,16 @@ func (c *ConfigAgent) updates() {
 		log.Debug(0, "Interface: %v\n", id)
 		log.Debug(0, "-------------------\n")
 	}
+	log.Debug(0, "--- delete ---\n")
+	for v := range c.deletedNI {
+		log.Debug(0, "Network Instance: %v\n", v)
+		log.Debug(0, "--------------------\n")
+	}
+	for v := range c.deletedIF {
+		log.Debug(0, "Interface: %v\n", v)
+		log.Debug(0, "--------------------\n")
+	}
+	log.Debug(0, "--------------------\n")
 }
 
 func (c *ConfigAgent) DumpConfig() {
@@ -837,7 +1093,6 @@ func init() {
 			{"interfaces", "interface"},
 			{"network-instances", "network-instance"},
 		},
-		oc: newOpenConfig(),
 
 		iface: make(map[string]*vswitch.Interface),
 		vif:   make(map[string]*vswitch.VIF),
@@ -846,6 +1101,8 @@ func init() {
 
 		updatedNI:  make(map[*ni]struct{}),
 		updatedIF:  make(map[*iface]struct{}),
+		deletedNI:  make(map[*deletedNI]struct{}),
+		deletedIF:  make(map[*deletedIface]struct{}),
 		pendingTIF: make(map[string][]interface{}),
 
 		Setting: ocdSetting{
@@ -854,7 +1111,9 @@ func init() {
 			Listen: DefaultListenPort,
 		},
 	}
+	agent.oc = newOpenConfig(agent)
 
-	agent.p = newOpenConfigParser(agent.oc, ocdcSetSyntax)
+	agent.setParser = newOpenConfigParser(agent.oc, ocdcSetSyntax)
+	agent.deleteParser = newOpenConfigParser(agent.oc, ocdcDeleteSyntax)
 	vswitch.RegisterAgent(agent)
 }

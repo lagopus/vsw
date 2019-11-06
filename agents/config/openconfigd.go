@@ -27,6 +27,16 @@ import (
 	"google.golang.org/grpc"
 )
 
+func newOpenConfigParser(oc *openconfig, ocdcSyntax []*parserSyntax) *parser {
+	p := newParser(oc)
+	for _, s := range ocdcSyntax {
+		for _, e := range s.syntax {
+			p.register(s.prefix, e)
+		}
+	}
+	return p
+}
+
 type connect struct {
 	cliconn *grpc.ClientConn
 	stream  pb.Config_DoConfigClient
@@ -194,4 +204,52 @@ func (s *Server) Show(req *pb.ShowRequest, stream pb.Show_ShowServer) error {
 
 	sendReply(reply, stream)
 	return nil
+}
+
+//
+// set and delete commands relatee
+//
+
+// Configrations currently owned by openconfig
+type openconfig struct {
+	ca   *ConfigAgent
+	nis  map[string]*ni
+	ifs  map[string]*iface
+	dnis map[string]*deletedNI
+	difs map[string]*deletedIface
+}
+
+func newOpenConfig(ca *ConfigAgent) *openconfig {
+	return &openconfig{
+		ca:   ca,
+		nis:  make(map[string]*ni),
+		ifs:  make(map[string]*iface),
+		dnis: make(map[string]*deletedNI),
+		difs: make(map[string]*deletedIface),
+	}
+}
+
+func (o *openconfig) free() {
+	o.nis = make(map[string]*ni)
+	o.ifs = make(map[string]*iface)
+	o.dnis = make(map[string]*deletedNI)
+	o.difs = make(map[string]*deletedIface)
+}
+
+func (o *openconfig) getNetworkInstance(name string) *ni {
+	n, ok := o.nis[name]
+	if !ok {
+		n = newNetworkInstance(o, name)
+		o.nis[name] = n
+	}
+	return n
+}
+
+func (o *openconfig) getInterface(name string) *iface {
+	i, ok := o.ifs[name]
+	if !ok {
+		i = newInterface(o, name)
+		o.ifs[name] = i
+	}
+	return i
 }

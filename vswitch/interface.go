@@ -209,6 +209,7 @@ func (i *Interface) Free() {
 	ifMgr.mutex.Lock()
 	defer ifMgr.mutex.Unlock()
 
+	i.Tunnel().VRF().deleteL2Tunnel(i)
 	i.freeAllVIF()
 	i.base.free()
 	i.mac.free()
@@ -314,6 +315,7 @@ func (i *Interface) deleteVIF(vif *VIF) {
 			i.vifs[n] = i.vifs[l]
 			i.vifs[l] = nil
 			i.vifs = i.vifs[:l]
+			i.freeVID(v.vid, v)
 			return
 		}
 	}

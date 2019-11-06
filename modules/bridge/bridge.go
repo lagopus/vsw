@@ -75,6 +75,7 @@ type BridgeInstance struct {
 	macTable      *hashlist.HashList
 	ageOut        *hashlist.HashList
 	macTableCh    chan []vswitch.BridgeMACEntry
+	mutex         sync.Mutex
 }
 
 type MacEntry struct {
@@ -145,13 +146,12 @@ func getBridgeService() (*bridgeService, error) {
 		return nil, errors.New("Can't create a ringpair")
 	}
 
-	param := C.struct_bridge_runtime_param{
-		learn: (*C.struct_rte_ring)(unsafe.Pointer(rp.Rings[0])),
-		free:  (*C.struct_rte_ring)(unsafe.Pointer(rp.Rings[1])),
-	}
+	param := (*C.struct_bridge_runtime_param)(C.calloc(1, C.sizeof_struct_bridge_runtime_param))
+	param.learn = (*C.struct_rte_ring)(unsafe.Pointer(rp.Rings[0]))
+	param.free = (*C.struct_rte_ring)(unsafe.Pointer(rp.Rings[1]))
 
 	ops := vswitch.LagopusRuntimeOps(unsafe.Pointer(&C.bridge_runtime_ops))
-	rt, err := vswitch.NewRuntime(config.Core, moduleName, ops, unsafe.Pointer(&param))
+	rt, err := vswitch.NewRuntime(config.Core, moduleName, ops, unsafe.Pointer(param))
 	if err != nil {
 		return nil, err
 	}
@@ -462,12 +462,14 @@ const (
 // BridgeInstance interface
 //
 func (b *BridgeInstance) control(cmd bridgeCmd, ring *dpdk.Ring, mac *macAddress, vif *vswitch.VIF) error {
-	p := C.struct_bridge_control_param{
-		cmd:             C.bridge_cmd_t(cmd),
-		ring:            (*C.struct_rte_ring)(unsafe.Pointer(ring)),
-		mtu:             C.int(b.mtu),
-		max_mac_entries: C.int(b.macTableSize),
-	}
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+
+	p := &b.param.control
+	p.cmd = C.bridge_cmd_t(cmd)
+	p.ring = (*C.struct_rte_ring)(unsafe.Pointer(ring))
+	p.mtu = C.int(b.mtu)
+	p.max_mac_entries = C.int(b.macTableSize)
 
 	if mac != nil {
 		d := (*[1 << 30]byte)(unsafe.Pointer(&p.mac.addr_bytes))[:6:6]
@@ -478,7 +480,7 @@ func (b *BridgeInstance) control(cmd bridgeCmd, ring *dpdk.Ring, mac *macAddress
 		p.index = C.vifindex_t(vif.Index())
 	}
 
-	rc, err := b.instance.Control(unsafe.Pointer(&p))
+	rc, err := b.instance.Control(unsafe.Pointer(p))
 	if rc == false || err != nil {
 		return fmt.Errorf("%v Failed: %v", cmd, err)
 	}
@@ -488,7 +490,7 @@ func (b *BridgeInstance) control(cmd bridgeCmd, ring *dpdk.Ring, mac *macAddress
 func (b *BridgeInstance) AddVIF(vif *vswitch.VIF, mtu vswitch.MTU) error {
 	b.vifs[vif.Index()] = vif
 	b.mtu = mtu
-	return b.control(BRIDGE_CMD_VIF_ADD, vif.Input(), nil, vif)
+	return b.control(BRIDGE_CMD_VIF_ADD, vif.BridgeInput(), nil, vif)
 	// TODO: Check if VIF is RIF. If so, add its MAC address as a static entry.
 	// mac := ha2ma(vif.MACAddress())
 	// b.control(BRIDGE_CMD_RIF_ADD, vif.Input(), &mac, vif)
@@ -580,7 +582,7 @@ func (b *BridgeInstance) addMACEntry(mac macAddress, vifidx vswitch.VIFIndex) {
 
 	b.macTable.Add(mac, entry)
 	b.ageOut.Add(mac, &macAgeOut{mac, now + int64(b.agingTime)})
-	b.control(BRIDGE_CMD_MAC_ADD, vif.Input(), &mac, nil)
+	b.control(BRIDGE_CMD_MAC_ADD, vif.BridgeInput(), &mac, nil)
 }
 
 func (b *BridgeInstance) addStaticMACEntry(mac macAddress, vifidx vswitch.VIFIndex) {
@@ -612,7 +614,7 @@ func (b *BridgeInstance) addStaticMACEntry(mac macAddress, vifidx vswitch.VIFInd
 	}
 
 	b.macTable.Add(mac, entry)
-	b.control(BRIDGE_CMD_MAC_ADD, vif.Input(), &mac, nil)
+	b.control(BRIDGE_CMD_MAC_ADD, vif.BridgeInput(), &mac, nil)
 }
 
 func (b *BridgeInstance) deleteMACEntry(mac macAddress) {

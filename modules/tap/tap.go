@@ -276,7 +276,13 @@ func (t *TapInstance) Enable() error {
 		time.Sleep(vrfRetryInterval)
 	}
 
-	if err := syscall.SetsockoptString(rs, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, t.vrf); err != nil {
+	for i := 0; i < vrfRetryCount; i++ {
+		if err = syscall.SetsockoptString(rs, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, t.vrf); err == nil {
+			break
+		}
+		time.Sleep(vrfRetryInterval)
+	}
+	if err != nil {
 		syscall.Close(rs)
 		return fmt.Errorf("Can't set SO_BINDTODEVICE: %v", err)
 	}

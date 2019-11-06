@@ -27,6 +27,7 @@ import (
 	_ "github.com/lagopus/vsw/agents/debugsh"
 	_ "github.com/lagopus/vsw/agents/netlink"
 	_ "github.com/lagopus/vsw/agents/tunnel/ipsec"
+	_ "github.com/lagopus/vsw/agents/vrrp"
 	_ "github.com/lagopus/vsw/modules/bridge"
 	_ "github.com/lagopus/vsw/modules/ethdev"
 	_ "github.com/lagopus/vsw/modules/hostif"
@@ -57,6 +58,11 @@ func initSignalHandling() {
 func main() {
 	flag.Parse()
 
+	if showVersion {
+		fmt.Println(vswitch.Version())
+		return
+	}
+
 	if err := vswitch.Init(configPath); err != nil {
 		fmt.Println(err)
 		return
@@ -71,7 +77,9 @@ func main() {
 }
 
 var configPath string
+var showVersion bool
 
 func init() {
 	flag.StringVar(&configPath, "f", defaultConfigPath, "Config file")
+	flag.BoolVar(&showVersion, "v", false, "Show version info and quit")
 }

@@ -57,6 +57,9 @@ func Init(configPath string) error {
 	}
 	logger = l
 
+	// Print version string
+	logger.Printf("%s", Version())
+
 	// Initialize DPDK first
 	if err := initDpdk(); err != nil {
 		return err

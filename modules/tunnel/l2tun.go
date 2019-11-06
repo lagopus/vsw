@@ -136,6 +136,8 @@ func (l *l2TunnelIF) Enable() error {
 	l.lock.Lock()
 	defer l.lock.Unlock()
 
+	log.Logger.Info("[%s] Enable called", l.name)
+
 	if l.inboundRti == nil {
 		err := fmt.Errorf("inbound runtime instance is nil")
 		log.Logger.Err("[%s] %s", l.name, err)
@@ -170,6 +172,8 @@ func (l *l2TunnelIF) Disable() {
 	l.lock.Lock()
 	defer l.lock.Unlock()
 
+	log.Logger.Info("[%s] Disable called", l.name)
+
 	if l.inboundRti == nil || l.outboundRti == nil {
 		return
 	}
@@ -185,6 +189,8 @@ func (l *l2TunnelIF) Disable() {
 
 // Free Free for instance.
 func (l *l2TunnelIF) Free() {
+	log.Logger.Info("[%s] Free called", l.name)
+
 	if l.enabled {
 		l.Disable()
 	}
@@ -229,7 +235,7 @@ func (l *l2TunnelIF) deleteL2TunnelVIF(name string) {
 	defer l.lock.Unlock()
 
 	if _, ok := l.vifs[name]; ok {
-		l.vifs[name] = nil
+		delete(l.vifs, name)
 	}
 }
 
@@ -367,40 +373,48 @@ func (l *l2TunnelIF) resetCounter() {
 	C.tunnel_reset_counter(l.counter, l.inboundStats, l.outboundStats)
 }
 
-func (l *l2TunnelIF) doControl(cparam *C.struct_l2tun_control_param) error {
-	if err := l.doControlInbound(cparam); err != nil {
-		return err
-	}
-	if err := l.doControlOutbound(cparam); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (l *l2TunnelIF) doControlInbound(cparam *C.struct_l2tun_control_param) error {
-	l.lock.Lock()
-	defer l.lock.Unlock()
-
-	if cparam == nil {
+func (l *l2TunnelIF) doControl(param *C.struct_l2tun_control_param) error {
+	if param == nil {
 		return fmt.Errorf("invalid args")
 	}
 
+	inboundErr := l.doControlInbound(param)
+	if inboundErr != nil {
+		return inboundErr
+	}
+
+	outboundErr := l.doControlOutbound(param)
+	if outboundErr != nil {
+		return outboundErr
+	}
+
+	return nil
+}
+
+func (l *l2TunnelIF) doControlInbound(param *C.struct_l2tun_control_param) error {
+	cparam := toL2CParam(param)
+	if cparam == nil {
+		return fmt.Errorf("inbound toL2CParam failed")
+	}
+	defer freeL2CParam(cparam)
+
+	// premise: Control is synchronous call
 	if rc, err := l.inboundRti.Control(unsafe.Pointer(cparam)); !rc || err != nil {
-		return fmt.Errorf("inbound cmd(%d) Failed: %v", cparam.cmd, err)
+		return fmt.Errorf("inbound cmd(%d) failed: %v", cparam.cmd, err)
 	}
 	return nil
 }
 
-func (l *l2TunnelIF) doControlOutbound(cparam *C.struct_l2tun_control_param) error {
-	l.lock.Lock()
-	defer l.lock.Unlock()
-
+func (l *l2TunnelIF) doControlOutbound(param *C.struct_l2tun_control_param) error {
+	cparam := toL2CParam(param)
 	if cparam == nil {
-		return fmt.Errorf("invalid args")
+		return fmt.Errorf("outbound toL2CParam failed")
 	}
+	defer freeL2CParam(cparam)
 
+	// premise: Control is synchronous call
 	if rc, err := l.outboundRti.Control(unsafe.Pointer(cparam)); !rc || err != nil {
-		return fmt.Errorf("outbound cmd(%d) Failed: %v", cparam.cmd, err)
+		return fmt.Errorf("outbound cmd(%d) failed: %v", cparam.cmd, err)
 	}
 	return nil
 }
@@ -456,6 +470,8 @@ func (l *l2TunnelVIF) SetVRF(vrf *vswitch.VRF) {
 
 // Free Free for VIF instance.
 func (l *l2TunnelVIF) Free() {
+	log.Logger.Info("[%s] Free called", l.vif.Name())
+
 	if l.enabled {
 		l.Disable()
 	}
@@ -494,6 +510,8 @@ func (l *l2TunnelVIF) validate() error {
 func (l *l2TunnelVIF) Enable() error {
 	l.lock.Lock()
 	defer l.lock.Unlock()
+
+	log.Logger.Info("[%s] Enable called", l.vif.Name())
 
 	if !l.enabled {
 		if err := l.validate(); err != nil {
@@ -559,6 +577,8 @@ func (l *l2TunnelVIF) Enable() error {
 func (l *l2TunnelVIF) Disable() {
 	l.lock.Lock()
 	defer l.lock.Unlock()
+
+	log.Logger.Info("[%s] Disable called", l.vif.Name())
 
 	if l.enabled {
 		cparam := createL2SetDisableCmdParam(l.vif.Index(), l.vif.VID())

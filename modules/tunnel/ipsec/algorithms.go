@@ -21,8 +21,6 @@ package ipsec
 import "C"
 import (
 	"unsafe"
-
-	"github.com/lagopus/vsw/modules/tunnel/log"
 )
 
 const (
@@ -133,8 +131,8 @@ const (
 	AuthAlgoTypeNull AuthAlgoType = C.AUTH_ALGO_NULL
 	// AuthAlgoTypeSha1Hmac SHA1-HMAC.
 	AuthAlgoTypeSha1Hmac AuthAlgoType = C.AUTH_ALGO_SHA1_HMAC
-	// AuthAlgoTypeSha256Hmac SHA256-HMAC.
-	AuthAlgoTypeSha256Hmac AuthAlgoType = C.AUTH_ALGO_SHA256_HMAC
+	// AuthAlgoTypeSha256Hmac SHA256-128-HMAC.
+	AuthAlgoTypeSha256Hmac AuthAlgoType = C.AUTH_ALGO_SHA256_128_HMAC
 )
 
 // AuthAlgoValues -- auth algorithm's values
@@ -214,10 +212,6 @@ func init() {
 	setSupportedCipherAlgo()
 	setSupportedAuthAlgo()
 	setSupportedAeadAlgo()
-	log.Logger.Info("Supported %d cipher algos, %d auth algos, %d aead algos",
-		len(SupportedCipherAlgoByType),
-		len(SupportedAuthAlgoByType),
-		len(SupportedAeadAlgoByType))
 }
 
 // setSupportedCipherAlgo Set Supported CipherAlgos.

@@ -34,8 +34,6 @@
 #define IS_IPV4_BROADCAST(x) \
 	((x) == (uint32_t)0xFFFFFFFF)
 
-#define INTERFACE_IS_SELF(i, a) (rte_hash_lookup((i)->self, (const void *)&(a)) >= 0)
-
 enum {
 	INTERFACE_IP_SELF_UNICAST,
 	INTERFACE_IP_BROADCAST,
@@ -60,6 +58,14 @@ bool
 interface_ip_add(struct interface_table *interface_table, struct interface_addr_entry *ia);
 bool
 interface_ip_delete(struct interface_table *interface_table, struct interface_addr_entry *ia);
+bool
+interface_ip_is_self(struct interface_table *interface_table, uint32_t addr, vifindex_t ifindex);
+
+// nexthop reference
+bool
+interface_nexthop_reference_add(struct interface *interface, nexthop_t *nh);
+void
+interface_nexthop_reference_delete(struct interface *interface, nexthop_t *nh);
 
 // inteface infomation.
 bool

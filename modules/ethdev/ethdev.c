@@ -388,32 +388,31 @@ ethdev_rx_trunk(struct ethdev_rx_instance *e, struct rte_mbuf **mbufs, int rx_co
 				mbuf->ol_flags |= PKT_RX_VLAN | PKT_RX_VLAN_STRIPPED;
 			} else {
 				rte_pktmbuf_free(mbuf);
-				c->in_discards++;
+				c->in_errors++;
 				continue;
 			}
 		}
 
-		// XXX: We shall optimize packets forwarding. Queueing packets one-by-one
-		// is not optimal.
 		uint16_t vlan_id = mbuf->vlan_tci & 0xfff;
-		struct rte_ring *output = outputs[vlan_id];
-		if (!output) {
-			// Invalid VID
-			rte_pktmbuf_free(mbuf);
-			c->in_discards++;
+		vifindex_t vifidx = index[vlan_id];
+		if (vifidx == VIF_INVALID_INDEX) {
+			c->in_errors++;
+			rte_pktmbuf_free(mbufs[i]);
 			continue;
 		}
 
+		// XXX: We shall optimize packets forwarding. Queueing packets one-by-one
+		// is not optimal.
+		struct rte_ring *output = outputs[vlan_id];
 		struct vsw_counter *vc = counters[vlan_id];
 		vsw_ether_dst_t dt = vsw_check_ether_dst_and_self(mbuf, self_addr);
-		VSW_ETHER_UPDATE_IN_COUNTER2(c, vc, dt);
 
-		ethdev_set_metadata(mbuf, index[vlan_id]);
+		ethdev_set_metadata(mbuf, vifidx);
 		if (dt & ft[vlan_id])
 			output = fwd[vlan_id];
 
 		if (rte_ring_enqueue(output, mbuf) == 0) {
-			vc->in_octets += mbuf->pkt_len;
+			VSW_ETHER_UPDATE_IN_COUNTER(c, vc, dt, mbuf->pkt_len);
 		} else {
 			rte_pktmbuf_free(mbuf);
 			c->in_discards++;
@@ -434,11 +433,21 @@ ethdev_free_mbufs(struct rte_mbuf **mbufs, unsigned count, unsigned sent)
 static void
 ethdev_rx_access(struct ethdev_rx_instance *e, struct rte_mbuf **mbufs, int rx_count)
 {
+	uint16_t vid = e->common.vid;
+	vifindex_t index = e->common.index[vid];
+	struct vsw_counter *c = e->common.counter;
+
+	if (index == VIF_INVALID_INDEX) {
+		for (int i = 0; i < rx_count; i++) {
+			c->in_errors++;
+			rte_pktmbuf_free(mbufs[i]);
+		}
+		return;
+	}
+
 	struct rte_mbuf *in_mbufs[ETHDEV_MBUF_LEN]; // FIXME
 	struct rte_mbuf *fwd_mbufs[ETHDEV_MBUF_LEN]; // FIXME
 
-	uint16_t vid = e->common.vid;
-	vifindex_t index = e->common.index[vid];
 	struct rte_ring *output = e->common.base.outputs[vid];
 	struct rte_ring *fwd_output = e->fwd[vid];
 	vsw_ether_dst_t ft = e->fwd_type[vid];
@@ -448,7 +457,7 @@ ethdev_rx_access(struct ethdev_rx_instance *e, struct rte_mbuf **mbufs, int rx_c
 	unsigned count = 0;
 	unsigned fwd_count = 0;
 
-	struct vsw_counter *c = e->common.counter;
+	struct vsw_counter *vc = e->common.counters[vid];
 
 	for (int i = 0; i < rx_count; i++) {
 		struct rte_mbuf *mbuf = mbufs[i];
@@ -459,6 +468,7 @@ ethdev_rx_access(struct ethdev_rx_instance *e, struct rte_mbuf **mbufs, int rx_c
 		if (eh->ether_type == rte_cpu_to_be_16(ETHER_TYPE_VLAN)) {
 			rte_pktmbuf_free(mbuf);
 			c->in_discards++;
+			vc->in_discards++;
 			continue;
 		}
 
@@ -466,9 +476,7 @@ ethdev_rx_access(struct ethdev_rx_instance *e, struct rte_mbuf **mbufs, int rx_c
 
 		vsw_ether_dst_t dt = vsw_check_ether_dst_and_self(mbuf, self_addr);
 
-		// For ACCESS mode, the counter will anyway be the same
-		// for interface and subinterface.
-		VSW_ETHER_UPDATE_IN_COUNTER(c, dt);
+		VSW_ETHER_UPDATE_IN_COUNTER(c, vc, dt, mbuf->pkt_len);
 
 		if (dt & ft)
 			fwd_mbufs[fwd_count++] = mbuf;
@@ -488,11 +496,44 @@ ethdev_rx_access(struct ethdev_rx_instance *e, struct rte_mbuf **mbufs, int rx_c
 	if (fwd_output)
 		fwd_sent = rte_ring_enqueue_burst(fwd_output, (void * const*)fwd_mbufs, fwd_count, NULL);
 
-	unsigned discarded = rx_count - sent - fwd_sent;
-	c->in_discards += discarded;
+	if (unlikely(sent < count)) {
+		uint64_t discards = count - sent;
+		c->in_discards += discards;
+		vc->in_discards += discards;
 
-	ethdev_free_mbufs(in_mbufs, count, sent);
-	ethdev_free_mbufs(fwd_mbufs, fwd_count, fwd_sent);
+		uint64_t octets = 0;
+		while (unlikely(sent < count)) {
+			struct rte_mbuf *mbuf = in_mbufs[sent];
+			vsw_ether_dst_t dt = vsw_check_ether_dst(mbuf);
+
+			octets += mbuf->pkt_len;
+			VSW_ETHER_DEC_IN_COUNTER(c, vc, dt);
+
+			rte_pktmbuf_free(mbuf);
+			sent++;
+		}
+		c->in_octets -= octets;
+		vc->in_octets -= octets;
+	}
+	if (unlikely(fwd_sent < fwd_count)) {
+		uint64_t discards = fwd_count - fwd_sent;
+		c->in_discards += discards;
+		vc->in_discards += discards;
+
+		uint64_t octets = 0;
+		while (unlikely(fwd_sent < fwd_count)) {
+			struct rte_mbuf *mbuf = in_mbufs[fwd_sent];
+			vsw_ether_dst_t dt = vsw_check_ether_dst(mbuf);
+
+			octets += mbuf->pkt_len;
+			VSW_ETHER_DEC_IN_COUNTER(c, vc, dt);
+
+			rte_pktmbuf_free(mbuf);
+			fwd_sent++;
+		}
+		c->in_octets -= octets;
+		vc->in_octets -= octets;
+	}
 }
 
 static bool
@@ -641,39 +682,38 @@ ethdev_insert_vlan(struct rte_mbuf *m, struct rte_mempool *hdr_pool, struct rte_
 static void
 ethdev_tx_trunk(struct ethdev_tx_instance *e, struct rte_mbuf **mbufs, int tx_count)
 {
-	struct rte_ring **outputs = e->common.base.outputs;
+	vifindex_t *index = e->common.index;
 	uint16_t vid = e->common.vid;
 	int cnt = tx_count;
 	struct rte_mempool *hp = e->r->hdr_pool;
 	struct rte_mempool *cp = e->r->cln_pool;
 	struct vsw_counter *c = e->common.counter;
-	struct vsw_counter *nc = e->common.counters[vid];
 	struct vsw_counter **counters = e->common.counters;
 
 	for (int i = 0; i < cnt; i++) {
 		struct rte_mbuf *mbuf = mbufs[i];
-
-		vsw_ether_dst_t dt = vsw_check_ether_dst(mbuf);
-
-		VSW_ETHER_UPDATE_OUT_COUNTER(c, dt);
-
 		uint16_t vlan_id = mbuf->vlan_tci & 0xfff;
+		vifindex_t vifidx = index[vlan_id];
 
-		if (!outputs[vlan_id]) {
-			// Invalid VID
+		if (vifidx == VIF_INVALID_INDEX) {
 			DISCARD_MBUF(mbufs, i, cnt);
-			c->out_discards++;
+			c->out_errors++;
 			continue;
 		}
+
+		struct vsw_counter *vc = counters[vlan_id];
 
 		// Some vPMD doesn't support multi-segment mbuf.
 		if ((e->force_linearize) && (mbuf->next)) {
 			if (rte_pktmbuf_linearize(mbuf) != 0) {
 				DISCARD_MBUF(mbufs, i, cnt);
 				c->out_discards++;
+				vc->out_discards++;
 				continue;
 			}
 		}
+
+		vsw_ether_dst_t dt = vsw_check_ether_dst(mbuf);
 
 		if (vlan_id != vid) {
 			// Tag none-Native VID
@@ -681,30 +721,30 @@ ethdev_tx_trunk(struct ethdev_tx_instance *e, struct rte_mbuf **mbufs, int tx_co
 			if (tagged_mbuf != NULL) {
 				mbufs[i] = tagged_mbuf;
 
-				struct vsw_counter *vc = counters[vlan_id];
-				VSW_ETHER_UPDATE_OUT_COUNTER(vc, dt);
-				vc->out_octets += mbuf->pkt_len;
+				VSW_ETHER_UPDATE_OUT_COUNTER(c, vc, dt, mbuf->pkt_len);
 			} else {
 				DISCARD_MBUF(mbufs, i, cnt);
 				c->out_discards++;
+				vc->out_discards++;
 			}
 		} else {
-			VSW_ETHER_UPDATE_OUT_COUNTER(nc, dt);
-			nc->out_octets += mbuf->pkt_len;
+			// Native VLAN
+			VSW_ETHER_UPDATE_OUT_COUNTER(c, vc, dt, mbuf->pkt_len);
 		}
 	}
 
 	unsigned sent = rte_eth_tx_burst(e->common.port_id, 0, mbufs, cnt);
-	c->out_discards += cnt - sent;
 
 	// Count up discarded packets for each VLAN
 	while (unlikely(sent < cnt)) {
 		struct rte_mbuf *mbuf = mbufs[sent];
 		uint16_t vlan_id = mbuf->vlan_tci & 0xfff;
-		struct vsw_counter *vc = (vlan_id == vid) ? nc : counters[vlan_id];
+		struct vsw_counter *vc = counters[vlan_id];
+		vsw_ether_dst_t dt = vsw_check_ether_dst(mbuf);
 
+		c->out_discards++;
 		vc->out_discards++;
-		vc->out_octets -= mbuf->pkt_len;
+		VSW_ETHER_DEC_OUT_COUNTER_WITH_OCTETS(c, vc, dt, mbuf->pkt_len);
 
 		rte_pktmbuf_free(mbuf);
 		sent++;
@@ -715,33 +755,58 @@ static void
 ethdev_tx_access(struct ethdev_tx_instance *e, struct rte_mbuf **mbufs, int tx_count)
 {
 	uint16_t vid = e->common.vid;
-	int cnt = tx_count;
+	vifindex_t index = e->common.index[vid];
 	struct vsw_counter *c = e->common.counter;
+
+	if (index == VIF_INVALID_INDEX) {
+		for (int i = 0; i < tx_count; i++) {
+			c->out_errors++;
+			rte_pktmbuf_free(mbufs[i]);
+		}
+		return;
+	}
+
+	int cnt = tx_count;
+	struct vsw_counter *vc = e->common.counters[vid];
 
 	for (int i = 0; i < cnt; i++) {
 		struct rte_mbuf *mbuf = mbufs[i];
-
-		vsw_ether_dst_t dt = vsw_check_ether_dst(mbuf);
-		VSW_ETHER_UPDATE_OUT_COUNTER(c, dt);
-
-		if (unlikely(mbuf->vlan_tci != vid)) {
-			DISCARD_MBUF(mbufs, i, cnt);
-			c->out_discards++;
-			continue;
-		}
 
 		// Some vPMD doesn't support multi-segment mbuf.
 		if ((e->force_linearize) && (mbuf->next)) {
 			if (rte_pktmbuf_linearize(mbuf) != 0) {
 				DISCARD_MBUF(mbufs, i, cnt);
 				c->out_discards++;
+				vc->out_discards++;
+				continue;
 			}
 		}
+
+		vsw_ether_dst_t dt = vsw_check_ether_dst(mbuf);
+		VSW_ETHER_UPDATE_OUT_COUNTER(c, vc, dt, mbuf->pkt_len);
 	}
 
 	unsigned sent = rte_eth_tx_burst(e->common.port_id, 0, mbufs, cnt);
-	ethdev_free_mbufs(mbufs, cnt, sent);
-	c->out_discards += cnt - sent;
+
+	if (unlikely(sent < cnt)) {
+		uint64_t discards = cnt - sent;
+		c->out_discards += discards;
+		vc->out_discards += discards;
+
+		uint64_t octets = 0;
+		while (unlikely(sent < cnt)) {
+			struct rte_mbuf *mbuf = mbufs[sent];
+			vsw_ether_dst_t dt = vsw_check_ether_dst(mbuf);
+
+			octets += mbuf->pkt_len;
+			VSW_ETHER_DEC_OUT_COUNTER(c, vc, dt);
+
+			rte_pktmbuf_free(mbuf);
+			sent++;
+		}
+		c->out_octets -= octets;
+		vc->out_octets -= octets;
+	}
 }
 
 static bool

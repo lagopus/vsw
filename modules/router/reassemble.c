@@ -157,8 +157,12 @@ reassemble_packet_process(struct router_instance *ri, struct rte_mbuf *mbuf) {
 		rte_pktmbuf_free(mbuf);
 		return;
 	}
-	// Invalid parameter, assertion fail.
-	assert(ret >= 0);
+	// Lookup failed
+	if (ret < 0) {
+		ROUTER_ERROR("[REASSEMBLE] rte_hash_lookup_data() failed, err = %d.", ret);
+		rte_pktmbuf_free(mbuf);
+		return;
+	}
 
 	time_t now = time(NULL);
 	if (*expire < now) {
@@ -245,4 +249,5 @@ reassemble_init(struct router_instance *ri) {
 void
 reassemble_fini(struct router_instance *ri) {
 	rte_ip_frag_table_destroy(ri->frag_tbl);
+	rte_hash_free(ri->reassemble_hash);
 }

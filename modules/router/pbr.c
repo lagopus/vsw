@@ -32,8 +32,8 @@
 #include <rte_tcp.h>
 #include <rte_udp.h>
 
-#include "ipproto.h"
 #include "interface.h"
+#include "ipproto.h"
 #include "pbr.h"
 #include "router_common.h"
 #include "router_log.h"
@@ -137,8 +137,11 @@ range_rule_get(struct rte_hash *hash, range_t *key) {
 	if (unlikely(ret == -ENOENT))
 		return NULL; // no entry.
 
-	// Invalid parameter, assertion fail..
-	assert(ret >= 0);
+	// Lookup failed
+	if (ret < 0) {
+		ROUTER_ERROR("[PBR] rte_hash_lookup_data() failed, err = %d.", ret);
+		return false;
+	}
 
 	return val;
 }
@@ -231,17 +234,16 @@ insert(struct rt *rt, uint32_t key, uint32_t len) {
 	return rtv;
 }
 
-rt_value_t *
+bool
 insert_value(struct rt *rt, uint32_t key, uint32_t len, void *val) {
 	struct set *set = rt_alloc_node(rt, key, len);
 	if (!set) {
-		// TODO free set structure.
-		return NULL;
+		return false;
 	}
 	rt_value_t *value;
 	if (!(value = rte_zmalloc(NULL, sizeof(rt_value_t), 0))) {
 		// TODO: free set created by rt_alloc_node().
-		return NULL;
+		return false;
 	}
 	value->val = val;
 	value->type = PBR_RT_VALUE_TYPE_VALUE;
@@ -249,9 +251,9 @@ insert_value(struct rt *rt, uint32_t key, uint32_t len, void *val) {
 	if (!set_insert(set, value)) {
 		// TODO: free set created by rt_alloc_node().
 		rte_free(value);
-		return NULL;
+		return false;
 	}
-	return value;
+	return true;
 }
 
 bool
@@ -302,15 +304,19 @@ pbr_entry_add(struct router_tables *tbls, struct pbr_entry *pbr) {
 	nh->nexthops = pbr->nexthops;
 	for (int i = 0; i < pbr->nexthop_num; i++) {
 		nh->nexthops[i].interface = interface_entry_get(tbls->interface, nh->nexthops[i].ifindex);
+
+		// Add reference of a nexthop that refer to a interface
+		if (nh->nexthops[i].interface &&
+		    !interface_nexthop_reference_add(nh->nexthops[i].interface, &nh->nexthops[i])) {
+			rte_free(nh);
+			return false;
+		}
 	}
 
 	// input interface.
-	len = pbr->in_vif == VIF_INVALID_INDEX ? 0 : PBR_KEY_LEN;
+	len = (pbr->in_vif == VIF_INVALID_INDEX) ? 0 : PBR_KEY_LEN;
 
-	if (!(insert_value(rtv->val, pbr->in_vif, len, nh)))
-		return false;
-
-	return true;
+	return insert_value(rtv->val, pbr->in_vif, len, nh);
 }
 
 bool
@@ -505,4 +511,5 @@ pbr_fini(struct pbr_table *pt) {
 	rte_hash_free(pt->sp_hash);
 	rte_hash_free(pt->dp_hash);
 	free_trie(pt->top);
+	rte_free(pt);
 }

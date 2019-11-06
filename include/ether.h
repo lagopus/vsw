@@ -65,32 +65,21 @@ vsw_check_ether_dst_and_self(struct rte_mbuf *mbuf, struct ether_addr *self) {
 	if ((self) && (is_same_ether_addr(&hdr->d_addr, self)))
 		return VSW_ETHER_DST_UNICAST | VSW_ETHER_DST_SELF;
 
-	return VSW_ETHER_DST_UNKNOWN;
+	return VSW_ETHER_DST_UNICAST;
 }
 
 // The order of members SHALL match to the definition
 // of struct vsw_counter in counter.h.
 struct vsw_ether_counter {
+	uint64_t octets;
 	uint64_t unicast_pkts;
 	uint64_t broadcast_pkts;
 	uint64_t multicast_pkts;
 };
 
 static inline void
-vsw_ether_counter_inc(struct vsw_ether_counter *c, vsw_ether_dst_t t)
-{
-	if (t & VSW_ETHER_DST_UNICAST) {
-		c->unicast_pkts++;
-	} else if (t & VSW_ETHER_DST_BROADCAST) {
-		c->broadcast_pkts++;
-	} else if (t & VSW_ETHER_DST_MULTICAST) {
-		c->multicast_pkts++;
-	}
-}
-
-static inline void
-vsw_ether_counter_inc2(struct vsw_ether_counter *c1, struct vsw_ether_counter *c2,
-			  vsw_ether_dst_t t)
+vsw_ether_counter_inc(struct vsw_ether_counter *c1, struct vsw_ether_counter *c2,
+			  vsw_ether_dst_t t, uint64_t pkt_len)
 {
 	if (t & VSW_ETHER_DST_UNICAST) {
 		c1->unicast_pkts++;
@@ -102,22 +91,12 @@ vsw_ether_counter_inc2(struct vsw_ether_counter *c1, struct vsw_ether_counter *c
 		c1->multicast_pkts++;
 		c2->multicast_pkts++;
 	}
+	c1->octets += pkt_len;
+	c2->octets += pkt_len;
 }
 
 static inline void
-vsw_ether_counter_dec(struct vsw_ether_counter *c, vsw_ether_dst_t t)
-{
-	if (t & VSW_ETHER_DST_UNICAST) {
-		c->unicast_pkts--;
-	} else if (t & VSW_ETHER_DST_BROADCAST) {
-		c->broadcast_pkts--;
-	} else if (t & VSW_ETHER_DST_MULTICAST) {
-		c->multicast_pkts--;
-	}
-}
-
-static inline void
-vsw_ether_counter_dec2(struct vsw_ether_counter *c1, struct vsw_ether_counter *c2,
+vsw_ether_counter_dec(struct vsw_ether_counter *c1, struct vsw_ether_counter *c2,
 			  vsw_ether_dst_t t)
 {
 	if (t & VSW_ETHER_DST_UNICAST) {
@@ -132,33 +111,42 @@ vsw_ether_counter_dec2(struct vsw_ether_counter *c1, struct vsw_ether_counter *c
 	}
 }
 
-#define _VSW_IN_COUNTER_BASE(c) ((struct vsw_ether_counter*)&((c)->in_unicast_pkts))
-#define _VSW_OUT_COUNTER_BASE(c) ((struct vsw_ether_counter*)&((c)->out_unicast_pkts))
+static inline void
+vsw_ether_counter_dec_with_octets(struct vsw_ether_counter *c1, struct vsw_ether_counter *c2,
+			  vsw_ether_dst_t t, uint64_t pkt_len)
+{
+	if (t & VSW_ETHER_DST_UNICAST) {
+		c1->unicast_pkts--;
+		c2->unicast_pkts--;
+	} else if (t & VSW_ETHER_DST_BROADCAST) {
+		c1->broadcast_pkts--;
+		c2->broadcast_pkts--;
+	} else if (t & VSW_ETHER_DST_MULTICAST) {
+		c1->multicast_pkts--;
+		c2->multicast_pkts--;
+	}
+	c1->octets -= pkt_len;
+	c2->octets -= pkt_len;
+}
 
-#define VSW_ETHER_INC_IN_COUNTER(c1, d) \
-	vsw_ether_counter_inc(_VSW_IN_COUNTER_BASE(c1), (d))
-#define VSW_ETHER_INC_OUT_COUNTER(c1, d) \
-	vsw_ether_counter_inc(_VSW_OUT_COUNTER_BASE(c1), (d))
+#define _VSW_IN_COUNTER_BASE(c) ((struct vsw_ether_counter*)(c))
+#define _VSW_OUT_COUNTER_BASE(c) ((struct vsw_ether_counter*)&((c)->out_octets))
 
-#define VSW_ETHER_INC_IN_COUNTER2(c1, c2, d) \
-	vsw_ether_counter_inc2(_VSW_IN_COUNTER_BASE(c1), _VSW_IN_COUNTER_BASE(c2), (d))
-#define VSW_ETHER_INC_OUT_COUNTER2(c1, c2, d) \
-	vsw_ether_counter_inc2(_VSW_OUT_COUNTER_BASE(c1), _VSW_OUT_COUNTER_BASE(c2), (d))
+#define VSW_ETHER_INC_IN_COUNTER(c1, c2, d, l) \
+	vsw_ether_counter_inc(_VSW_IN_COUNTER_BASE(c1), _VSW_IN_COUNTER_BASE(c2), (d), (l))
+#define VSW_ETHER_INC_OUT_COUNTER(c1, c2, d, l) \
+	vsw_ether_counter_inc(_VSW_OUT_COUNTER_BASE(c1), _VSW_OUT_COUNTER_BASE(c2), (d), (l))
 
-#define VSW_ETHER_DEC_IN_COUNTER(c1, d) \
-	vsw_ether_counter_dec(_VSW_IN_COUNTER_BASE(c1), (d))
-#define VSW_ETHER_DEC_OUT_COUNTER(c1, d) \
-	vsw_ether_counter_dec(_VSW_OUT_COUNTER_BASE(c1), (d))
+#define VSW_ETHER_DEC_IN_COUNTER(c1, c2, d) \
+	vsw_ether_counter_dec(_VSW_IN_COUNTER_BASE(c1), _VSW_IN_COUNTER_BASE(c2), (d))
+#define VSW_ETHER_DEC_IN_COUNTER_WITH_OCTETS(c1, c2, d, l) \
+	vsw_ether_counter_dec_with_octets(_VSW_IN_COUNTER_BASE(c1), _VSW_IN_COUNTER_BASE(c2), (d), (l))
+#define VSW_ETHER_DEC_OUT_COUNTER(c1, c2, d) \
+	vsw_ether_counter_dec(_VSW_OUT_COUNTER_BASE(c1), _VSW_OUT_COUNTER_BASE(c2), (d))
+#define VSW_ETHER_DEC_OUT_COUNTER_WITH_OCTETS(c1, c2, d, l) \
+	vsw_ether_counter_dec_with_octets(_VSW_OUT_COUNTER_BASE(c1), _VSW_OUT_COUNTER_BASE(c2), (d), (l))
 
-#define VSW_ETHER_DEC_IN_COUNTER2(c1, c2, d) \
-	vsw_ether_counter_dec2(_VSW_IN_COUNTER_BASE(c1), _VSW_IN_COUNTER_BASE(c2), (d))
-#define VSW_ETHER_DEC_OUT_COUNTER2(c1, c2, d) \
-	vsw_ether_counter_dec2(_VSW_OUT_COUNTER_BASE(c1), _VSW_OUT_COUNTER_BASE(c2), (d))
-
-#define VSW_ETHER_UPDATE_IN_COUNTER(c1, d)  VSW_ETHER_INC_IN_COUNTER(c1, d)
-#define VSW_ETHER_UPDATE_OUT_COUNTER(c1, d) VSW_ETHER_INC_OUT_COUNTER(c1, d)
-
-#define VSW_ETHER_UPDATE_IN_COUNTER2(c1, c2, d) VSW_ETHER_INC_IN_COUNTER2(c1, c2, d)
-#define VSW_ETHER_UPDATE_OUT_COUNTER2(c1, c2, d) VSW_ETHER_INC_OUT_COUNTER2(c1, c2, d)
+#define VSW_ETHER_UPDATE_IN_COUNTER(c1, c2, d, l) VSW_ETHER_INC_IN_COUNTER(c1, c2, d, l)
+#define VSW_ETHER_UPDATE_OUT_COUNTER(c1, c2, d, l) VSW_ETHER_INC_OUT_COUNTER(c1, c2, d, l)
 
 #endif /* VSW_ETHER_H_ */

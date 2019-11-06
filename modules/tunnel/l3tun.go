@@ -115,6 +115,8 @@ func newL3TunnelIF(accessor ifParamAccessor) *l3TunnelIF {
 
 // Free Free for instance.
 func (l *l3TunnelIF) Free() {
+	log.Logger.Info("[%s] Free called", l.name)
+
 	if l.enabled {
 		l.Disable()
 	}
@@ -152,6 +154,8 @@ func (l *l3TunnelIF) Enable() error {
 	l.lock.Lock()
 	defer l.lock.Unlock()
 
+	log.Logger.Info("[%s] Enable called", l.name)
+
 	if l.inboundRti == nil {
 		err := fmt.Errorf("inbound runtime instance is nil")
 		log.Logger.Err("[%s] %s", l.name, err)
@@ -185,6 +189,8 @@ func (l *l3TunnelIF) Enable() error {
 func (l *l3TunnelIF) Disable() {
 	l.lock.Lock()
 	defer l.lock.Unlock()
+
+	log.Logger.Info("[%s] Disable called", l.name)
 
 	if l.inboundRti == nil || l.outboundRti == nil {
 		return
@@ -305,11 +311,13 @@ func (l *l3TunnelVIF) SetVRF(vrf *vswitch.VRF) {
 
 // Free Free for VIF instance.
 func (l *l3TunnelVIF) Free() {
+	log.Logger.Info("[%s] Free called", l.vif.Name())
+
 	if l.enabled {
 		l.Disable()
 	}
 
-	// TODO: delete from l3TunnelIF.vif
+	l.iface.vif = nil
 }
 
 func (l *l3TunnelVIF) validate() error {
@@ -342,6 +350,8 @@ func (l *l3TunnelVIF) validate() error {
 func (l *l3TunnelVIF) Enable() error {
 	l.lock.Lock()
 	defer l.lock.Unlock()
+
+	log.Logger.Info("[%s] Enable called", l.vif.Name())
 
 	if !l.enabled {
 		if err := l.validate(); err != nil {
@@ -376,6 +386,8 @@ func (l *l3TunnelVIF) Enable() error {
 func (l *l3TunnelVIF) Disable() {
 	l.lock.Lock()
 	defer l.lock.Unlock()
+
+	log.Logger.Info("[%s] Disable called", l.vif.Name())
 
 	if l.enabled {
 		cparam := createL3SetDisableCmdParam()
@@ -461,19 +473,49 @@ func (l *l3TunnelVIF) L3TOSUpdated(tos int8) {
 	}
 }
 
-func (l *l3TunnelVIF) doControl(cparam *C.struct_l3tun_control_param) error {
-	if cparam == nil {
+func (l *l3TunnelVIF) doControl(param *C.struct_l3tun_control_param) error {
+	if param == nil {
 		return fmt.Errorf("invalid args")
 	}
 
+	inboundErr := l.doControlInbound(param)
+	if inboundErr != nil {
+		return inboundErr
+	}
+
+	outboundErr := l.doControlOutbound(param)
+	if outboundErr != nil {
+		return outboundErr
+	}
+
+	return nil
+}
+
+func (l *l3TunnelVIF) doControlInbound(param *C.struct_l3tun_control_param) error {
+	cparam := toL3CParam(param)
+	if cparam == nil {
+		return fmt.Errorf("inbound toL3CParam failed")
+	}
+	defer freeL3CParam(cparam)
+
+	// premise: Control is synchronous call
 	if rc, err := l.iface.inboundRti.Control(unsafe.Pointer(cparam)); !rc || err != nil {
 		return fmt.Errorf("inbound cmd(%d) failed: %v", cparam.cmd, err)
 	}
+	return nil
+}
 
-	if rc, err := l.iface.outboundRti.Control(unsafe.Pointer(cparam)); !rc || err != nil {
-		return fmt.Errorf("outbound cmd(%d) failed: %v", cparam.cmd, err)
+func (l *l3TunnelVIF) doControlOutbound(param *C.struct_l3tun_control_param) error {
+	cparam := toL3CParam(param)
+	if cparam == nil {
+		return fmt.Errorf("outbound toL3CParam failed")
 	}
+	defer freeL3CParam(cparam)
 
+	// premise: Control is synchronous call
+	if rc, err := l.iface.outboundRti.Control(unsafe.Pointer(cparam)); !rc || err != nil {
+		return fmt.Errorf("inbound cmd(%d) failed: %v", cparam.cmd, err)
+	}
 	return nil
 }
 

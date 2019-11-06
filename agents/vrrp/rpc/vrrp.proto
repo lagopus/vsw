@@ -13,7 +13,8 @@ message Reply {
 
 message VifEntry {
 	string name = 1;
-	string addr = 2;
+	string phyaddr = 2;
+	string vaddr = 3;
 }
 
 message VifInfo {

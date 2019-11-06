@@ -31,34 +31,6 @@
 #define MAX_BRIDGE_RIFS 32
 
 //
-// Bridge Instances (== Bridge Domain)
-//
-struct bridge_mac_entry {
-	struct ether_addr mac;		// Destination MAC
-	struct rte_ring	  *ring;	// Output ring for the MAC
-};
-
-struct bridge_vif {
-	vifindex_t 	index;		// VIF Index
-	struct rte_ring	*ring;		// Output ring for the VIF
-};
-
-struct bridge_instance {
-	struct vsw_instance base;
-	uint32_t		domain_id;
-
-	// Filled by backend
-	int			mtu;
-	struct bridge_mac_entry rifs[MAX_BRIDGE_RIFS];
-	int 			rif_count;
-	struct bridge_vif	vifs[MAX_BRIDGE_VIFS];
-	int 			vif_count;
-	struct rte_hash		*mac_hash;	// MAC Hash returns DPDK Ring
-	int			max_mac_entries;
-	struct rte_ring		*mat;
-};
-
-//
 // Bridge Control
 //
 typedef enum {
@@ -85,6 +57,37 @@ struct bridge_control_param {
 	struct rte_ring	  	*ring;			// Output ring for the MAC or MAT
 	int			mtu;			// New MTU
 	int			max_mac_entries;	// Max MAC Entries
+};
+
+//
+// Bridge Instances (== Bridge Domain)
+//
+struct bridge_mac_entry {
+	struct ether_addr mac;		// Destination MAC
+	struct rte_ring	  *ring;	// Output ring for the MAC
+};
+
+struct bridge_vif {
+	vifindex_t 	index;		// VIF Index
+	struct rte_ring	*ring;		// Output ring for the VIF
+};
+
+struct bridge_instance {
+	struct vsw_instance base;
+	uint32_t		domain_id;
+
+	// Filled by backend
+	int			mtu;
+	struct bridge_mac_entry rifs[MAX_BRIDGE_RIFS];
+	int 			rif_count;
+	struct bridge_vif	vifs[MAX_BRIDGE_VIFS];
+	int 			vif_count;
+	struct rte_hash		*mac_hash;	// MAC Hash returns DPDK Ring
+	int			max_mac_entries;
+	struct rte_ring		*mat;
+
+	// For Control
+	struct bridge_control_param control;
 };
 
 //

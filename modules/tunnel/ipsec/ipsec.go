@@ -62,6 +62,7 @@ type TunnelIF struct {
 
 // TunnelVIF IPsec tunnel VIF.
 type TunnelVIF struct {
+	name      string
 	tif       *TunnelIF
 	vif       *VIF
 	vrf       *vswitch.VRF
@@ -176,7 +177,7 @@ func enable(i *TunnelIF, v *TunnelVIF) error {
 	}
 
 	if i.isEnabled && v.isEnabled {
-		log.Logger.Info("%v: enable.", i)
+		log.Logger.Info("%v/%v: enable.", i, v)
 
 		inputInbound := i.tvif.vif.Inbound()
 		inputOutbound := i.tvif.vif.Outbound()
@@ -208,7 +209,7 @@ func disable(i *TunnelIF, v *TunnelVIF) error {
 	}
 
 	if (!i.isEnabled && v.isEnabled) || (i.isEnabled && !v.isEnabled) {
-		log.Logger.Info("%v: disable.", i)
+		log.Logger.Info("%v/%v: disable.", i, v)
 
 		accessor.UnsetRingFn(i.tvif.vif.Index())
 	}
@@ -253,6 +254,8 @@ func (i *TunnelIF) disable() {
 func (i *TunnelIF) Free() {
 	i.lock.Lock()
 	defer i.lock.Unlock()
+
+	log.Logger.Info("%v: Free.", i)
 
 	i.disable()
 	if i.tvif != nil {
@@ -335,6 +338,7 @@ func (i *TunnelIF) NewVIF(vif *vswitch.VIF) (vswitch.VIFInstance, error) {
 	}
 
 	tvif := &TunnelVIF{
+		name:    vif.Name(),
 		tif:     i,
 		counter: (*C.struct_vsw_counter)(unsafe.Pointer(vif.Counter())),
 		vif: &VIF{
@@ -370,6 +374,8 @@ func (v *TunnelVIF) disable() {
 		return
 	}
 
+	log.Logger.Info("%v: Disable.", v)
+
 	// Disable even if an error occurs.
 	v.isEnabled = false
 	if err := disable(v.tif, v); err != nil {
@@ -382,6 +388,8 @@ func (v *TunnelVIF) disable() {
 func (v *TunnelVIF) Free() {
 	v.lock.Lock()
 	defer v.lock.Unlock()
+
+	log.Logger.Info("%v: Free.", v)
 
 	v.disable()
 	if v.tif != nil {
@@ -527,6 +535,11 @@ func (v *TunnelVIF) SecurityUpdated(security vswitch.Security) {
 // VRFUpdated Update VRF.
 func (v *TunnelVIF) VRFUpdated(vrf *vswitch.VRF) {
 	// do nothing.
+}
+
+//String Get name of TunnelVIF.
+func (v *TunnelVIF) String() string {
+	return v.name
 }
 
 //

@@ -305,8 +305,9 @@ rt_alloc_node(struct rt *rt, uint32_t key, uint32_t len) {
 		len -= p->len;
 	}
 
-	if (p->values == NULL && (!(p->values = set_new())))
-		return NULL;
+	if (p->values == NULL)
+		p->values = set_new();
+
 	return p->values;
 }
 

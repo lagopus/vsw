@@ -36,6 +36,7 @@ const (
 	TOKEN_IPV4ADDR_PREFIX = "A.B.C.D/E"
 	TOKEN_PORTRANGE       = "PORTRANGE"
 	TOKEN_PROTOCOL        = "PROTOCOL"
+	TOKEN_IPV4ADDRS       = "A.B.C.D..."
 )
 
 type radixTree struct {
@@ -165,6 +166,16 @@ func (nk nodeKey) parseInput(input []string) (int, bool, []interface{}) {
 			} else {
 				return count, false, nil
 			}
+		case TOKEN_IPV4ADDRS:
+			limit := len(input)
+			for i := n; i < limit; i++ {
+				if ip := net.ParseIP(input[i]); ip != nil {
+					args = append(args, ip)
+				} else {
+					return count, false, nil
+				}
+			}
+			count = count + (limit - n - 1)
 		case TOKEN_IPV4ADDR_PREFIX:
 			if addr, mask, err := net.ParseCIDR(input[n]); err == nil {
 				addr := vswitch.IPAddr{

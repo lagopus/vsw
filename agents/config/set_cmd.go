@@ -137,6 +137,19 @@ var ocdcSetSyntax = []*parserSyntax{
 		},
 	},
 	{
+		"interfaces interface STRING subinterfaces subinterface INTEGER ipv4 addresses address A.B.C.D vrrp vrrp-group INTEGER",
+		[]*parserSyntaxEntry{
+			{"config virtual-address A.B.C.D...", procSubIFVRRP, ifSubVRRPVirtualAddress},
+			{"config priority INTEGER", procSubIFVRRP, ifSubVRRPPriority},
+			{"config preempt BOOL", procSubIFVRRP, ifSubVRRPPreempt},
+			{"config preempt-delay INTEGER", procSubIFVRRP, ifSubVRRPPreemptDelay},
+			{"config accept-mode BOOL", procSubIFVRRP, ifSubVRRPAcceptMode},
+			{"config advertisement-interval INTEGER", procSubIFVRRP, ifSubVRRPAdvertisementInterval},
+			{"interface-tracking config track-interface STRING", procSubIFVRRP, ifSubVRRPTrackInterface},
+			{"interface-tracking config priority-decrement INTEGER", procSubIFVRRP, ifSubVRRPPriorityDecrement},
+		},
+	},
+	{
 		"interfaces interface STRING subinterfaces subinterface INTEGER tunnel config",
 		[]*parserSyntaxEntry{
 			{"address-type STRING", setSubIFTunnel, ifSubTunnelAddressType},
@@ -170,7 +183,8 @@ func (o ocdcTypeUnexpectedError) Error() string {
 type ocdcType int
 
 const (
-	niEnabled ocdcType = iota
+	niSelf ocdcType = iota
+	niEnabled
 	niAddressFamily
 	niTypes
 	niInterface
@@ -179,6 +193,7 @@ const (
 	niFdbMacLearning
 	niFdbMaxEntries
 
+	ifSelf
 	ifDevice
 	ifDriver
 	ifEnabled
@@ -188,6 +203,7 @@ const (
 	ifVLANMode
 	ifVLANAccess
 	ifVLANTrunk
+	ifSubSelf
 	ifSubEnabled
 	ifSubAddress
 	ifSubVLAN
@@ -210,12 +226,23 @@ const (
 	ifSubTunnelTOS
 	ifSubTunnelVRF
 
+	ifSubVRRPGroup
+	ifSubVRRPVirtualAddress
+	ifSubVRRPPriority
+	ifSubVRRPPreempt
+	ifSubVRRPPreemptDelay
+	ifSubVRRPAcceptMode
+	ifSubVRRPAdvertisementInterval
+	ifSubVRRPTrackInterface
+	ifSubVRRPPriorityDecrement
+
 	ifSubNAPTEnabled
 	ifSubNAPTMaximumEntries
 	ifSubNAPTAgingTime
 	ifSubNAPTPortRange
 	ifSubNAPTAddress
 
+	sadSPI
 	sadSAMode
 	sadLifeTimeInSec
 	sadLifeTimeInByte
@@ -229,6 +256,7 @@ const (
 	sadEncapSrcPort
 	sadEncapDstPort
 
+	spdName
 	spdSPI
 	spdDestinationAddress
 	spdDestinationPort
@@ -292,6 +320,7 @@ const (
 
 func (o ocdcType) String() string {
 	s := map[ocdcType]string{
+		niSelf:                   "niSelf",
 		niEnabled:                "niEnabled",
 		niAddressFamily:          "niAddressFamily",
 		niTypes:                  "niType",
@@ -300,6 +329,7 @@ func (o ocdcType) String() string {
 		niFdbMacAgingTime:        "niFdbMacAgingTime",
 		niFdbMacLearning:         "niFdbMacLearning",
 		niFdbMaxEntries:          "niFdbMaxEntries",
+		ifSelf:                   "ifSelf",
 		ifDevice:                 "ifDevice",
 		ifDriver:                 "ifDriver",
 		ifEnabled:                "ifEnabled",
@@ -309,6 +339,7 @@ func (o ocdcType) String() string {
 		ifVLANMode:               "ifVLANMode",
 		ifVLANAccess:             "ifVLANAccess",
 		ifVLANTrunk:              "ifVLANTrunk",
+		ifSubSelf:                "ifSubSelf",
 		ifSubEnabled:             "ifSubEnabled",
 		ifSubAddress:             "ifSubAddress",
 		ifSubVLAN:                "ifSubVLAN",
@@ -323,6 +354,7 @@ func (o ocdcType) String() string {
 		ifSubNAPTAgingTime:       "ifSubNAPTAgingTime",
 		ifSubNAPTPortRange:       "ifSubNAPTPortRange",
 		ifSubNAPTAddress:         "ifSubNAPTAddress",
+		sadSPI:                   "sadSPI",
 		sadSAMode:                "sadSAMode",
 		sadLifeTimeInSec:         "sadLifeTimeInSec",
 		sadLifeTimeInByte:        "sadLifeTimeInByte",
@@ -332,6 +364,7 @@ func (o ocdcType) String() string {
 		sadESPAuthKey:            "sadESPAuthKey",
 		sadESPEncrypt:            "sadESPEncrypt",
 		sadESPEncryptKey:         "sadESPEncryptKey",
+		spdName:                  "spdName",
 		spdSPI:                   "spdSPI",
 		spdDestinationAddress:    "spdDestinationAddress",
 		spdDestinationPort:       "spdDestinationPort",
@@ -607,6 +640,37 @@ func setSubIFTunnel(v interface{}, key ocdcType, args []interface{}) (interface{
 	return i, nil
 }
 
+func procSubIFVRRP(v interface{}, key ocdcType, args []interface{}) (interface{}, error) {
+	oc := (v).(*openconfig)
+	i := oc.getInterface(args[0].(string))
+	vg := i.getSubiface(args[1].(int)).getVrrpGroup(args[2].(net.IP), args[3].(int))
+
+	switch key {
+	case ifSubVRRPVirtualAddress:
+		for i := 4; i < len(args); i++ {
+			vg.AddVirtualAddr(args[i].(net.IP))
+		}
+	case ifSubVRRPPriority:
+		vg.Priority = uint8(args[4].(int))
+	case ifSubVRRPPreempt:
+		vg.Preempt = args[4].(bool)
+	case ifSubVRRPPreemptDelay:
+		vg.PreemptDelay = uint16(args[4].(int))
+	case ifSubVRRPAcceptMode:
+		vg.AcceptMode = args[4].(bool)
+	case ifSubVRRPAdvertisementInterval:
+		vg.AdvertisementInterval = uint16(args[4].(int))
+	case ifSubVRRPTrackInterface:
+		vg.TrackInterface = args[4].(string)
+	case ifSubVRRPPriorityDecrement:
+		vg.PriorityDecrement = uint8(args[4].(int))
+	default:
+		return nil, ocdcTypeUnexpectedError(key)
+	}
+
+	return i, nil
+}
+
 func procSubIFNAPT(v interface{}, key ocdcType, args []interface{}) (interface{}, error) {
 	oc := (v).(*openconfig)
 	i := oc.getInterface(args[0].(string))
@@ -678,16 +742,6 @@ func procPBRNextHop(v interface{}, key ocdcType, args []interface{}) (interface{
 		return nil, ocdcTypeUnexpectedError(key)
 	}
 	return ni, nil
-}
-
-func newOpenConfigParser(oc *openconfig, ocdcSyntax []*parserSyntax) *parser {
-	p := newParser(oc)
-	for _, s := range ocdcSyntax {
-		for _, e := range s.syntax {
-			p.register(s.prefix, e)
-		}
-	}
-	return p
 }
 
 /*
@@ -800,6 +854,11 @@ type iface struct {
 	tunnel  *l2tunnel
 }
 
+type ipaddr struct {
+	ip   vswitch.IPAddr
+	vrrp map[vswitch.VRID]*vswitch.VRRPGroup
+}
+
 // subiface represents a subinterface
 type subiface struct {
 	name    string
@@ -808,7 +867,7 @@ type subiface struct {
 	iface   *iface
 	ni      map[string]*ni
 	vid     vswitch.VID
-	ipaddr  map[string]vswitch.IPAddr
+	ipaddr  map[string]*ipaddr
 	tunnel  *l3tunnel
 	napt    *napt
 }
@@ -973,12 +1032,16 @@ func (i *iface) getSubiface(id int) *subiface {
 			iface:  i,
 			id:     uint32(id),
 			ni:     make(map[string]*ni),
-			ipaddr: make(map[string]vswitch.IPAddr),
+			ipaddr: make(map[string]*ipaddr),
 		}
 		i.subs[id] = s
 	}
 
 	return s
+}
+
+func (i *iface) deleteSubiface(id int) {
+	delete(i.subs, id)
 }
 
 func (i *iface) getTunnel() *l2tunnel {
@@ -1011,12 +1074,16 @@ func createIPAddr(ip net.IP, mask int) vswitch.IPAddr {
 }
 
 func (s *subiface) addAddress(ip net.IP, mask int) {
-	ipaddr := createIPAddr(ip, mask)
-	s.ipaddr[ipaddr.String()] = ipaddr
+	newip := createIPAddr(ip, mask)
+	ipkey := ip.String()
+	if s.ipaddr[ipkey] == nil {
+		s.ipaddr[ipkey] = &ipaddr{}
+	}
+	s.ipaddr[ipkey].ip = newip
 }
 
 func (s *subiface) deleteAddress(ip net.IP, mask int) {
-	delete(s.ipaddr, createIPAddr(ip, mask).String())
+	delete(s.ipaddr, ip.String())
 }
 
 func (s *subiface) setVID(v int) {
@@ -1040,6 +1107,50 @@ func (s *subiface) getNAPT() *napt {
 		s.napt = &napt{}
 	}
 	return s.napt
+}
+
+func (s *subiface) deleteVrrp(ip net.IP) {
+	delete(s.ipaddr, ip.String())
+}
+
+func (s *subiface) deleteVrrpGroup(ip net.IP, vrid int) {
+	ipkey := ip.String()
+	ipaddr := s.ipaddr[ipkey]
+	if ipaddr == nil || ipaddr.vrrp == nil {
+		return
+	}
+	if ipaddr.vrrp[vswitch.VRID(vrid)] != nil {
+		delete(s.ipaddr[ipkey].vrrp, vswitch.VRID(vrid))
+	}
+	if len(s.ipaddr[ipkey].vrrp) == 0 {
+		s.ipaddr[ipkey].vrrp = nil
+	}
+}
+
+func (s *subiface) deleteVrrpVirtualAddress(ip net.IP, vrid int, vip net.IP) {
+	ipaddr := s.ipaddr[ip.String()]
+	if ipaddr == nil || ipaddr.vrrp == nil {
+		return
+	}
+	if vg := ipaddr.vrrp[vswitch.VRID(vrid)]; vg != nil {
+		vg.DeleteVirtualAddr(ip)
+	}
+}
+
+func (s *subiface) getVrrpGroup(ip net.IP, vrid int) *vswitch.VRRPGroup {
+	ipkey := ip.String()
+	if s.ipaddr[ipkey] == nil {
+		s.ipaddr[ipkey] = &ipaddr{}
+	}
+	if s.ipaddr[ipkey].vrrp == nil {
+		s.ipaddr[ipkey].vrrp = make(map[vswitch.VRID]*vswitch.VRRPGroup)
+	}
+	vg := s.ipaddr[ipkey].vrrp[vswitch.VRID(vrid)]
+	if vg == nil {
+		vg = &vswitch.VRRPGroup{VirtualRouterId: vswitch.VRID(vrid)}
+		s.ipaddr[ipkey].vrrp[vswitch.VRID(vrid)] = vg
+	}
+	return vg
 }
 
 func (t *tunnel) setAddressType(a string) {
@@ -1207,6 +1318,10 @@ func (n *ni) getSA(index int) *vswitch.SA {
 	return sa
 }
 
+func (n *ni) deleteSA(index uint32) {
+	delete(n.sad, index)
+}
+
 func (n *ni) setSAMode(spi int, mode string) error {
 	m := vswitch.ModeUndefined
 	switch mode {
@@ -1309,6 +1424,10 @@ func (n *ni) getSP(name string) *vswitch.SP {
 	}
 
 	return sp
+}
+
+func (n *ni) deleteSP(name string) {
+	delete(n.spd, name)
 }
 
 func (n *ni) setSPI(name string, spi int) {
@@ -1450,8 +1569,8 @@ func (i *iface) String() string {
 		str += fmt.Sprintf("\n\tSUB(%d): vid=%d enabled=%v", n, s.vid, s.enabled)
 		if len(s.ipaddr) > 0 {
 			str += " ip="
-			for ip := range s.ipaddr {
-				str += ip + ","
+			for _, ipaddr := range s.ipaddr {
+				str += ipaddr.ip.IP.String() + ","
 			}
 		}
 		if s.tunnel != nil {
@@ -1500,39 +1619,4 @@ func (n *ni) String() string {
 		}
 	}
 	return str
-}
-
-type openconfig struct {
-	nis map[string]*ni
-	ifs map[string]*iface
-}
-
-func (o *openconfig) getNetworkInstance(name string) *ni {
-	n, ok := o.nis[name]
-	if !ok {
-		n = newNetworkInstance(o, name)
-		o.nis[name] = n
-	}
-	return n
-}
-
-func (o *openconfig) getInterface(name string) *iface {
-	i, ok := o.ifs[name]
-	if !ok {
-		i = newInterface(o, name)
-		o.ifs[name] = i
-	}
-	return i
-}
-
-func (o *openconfig) free() {
-	o.nis = make(map[string]*ni)
-	o.ifs = make(map[string]*iface)
-}
-
-func newOpenConfig() *openconfig {
-	return &openconfig{
-		nis: make(map[string]*ni),
-		ifs: make(map[string]*iface),
-	}
 }

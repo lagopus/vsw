@@ -30,6 +30,29 @@
 #define MAX_VID 4096
 
 //
+// For control
+//
+typedef enum {
+	ETHDEV_CMD_ADD_VID,
+	ETHDEV_CMD_DELETE_VID,
+	ETHDEV_CMD_SET_TRUNK_MODE,
+	ETHDEV_CMD_SET_ACCESS_MODE,
+	ETHDEV_CMD_SET_NATIVE_VID,
+	ETHDEV_CMD_SET_DST_SELF_FORWARD,
+	ETHDEV_CMD_SET_DST_BC_FORWARD,
+	ETHDEV_CMD_SET_DST_MC_FORWARD,
+	ETHDEV_CMD_UPDATE_MAC,
+} ethdev_cmd_t;
+
+struct ethdev_control_param {
+	ethdev_cmd_t cmd;
+	int vid;
+	vifindex_t index;
+	struct rte_ring *output;
+	struct vsw_counter *counter;
+};
+
+//
 // ETHDEV Instances
 //
 struct ethdev_tx_instance;
@@ -54,6 +77,8 @@ struct ethdev_tx_instance {
 	uint16_t nb_tx_desc;
 	bool force_linearize;			// If true, multi-segment mbuf is linearized.
 
+	struct ethdev_control_param param;	// Filled by Go, and referred by both Tx/Rx instance.
+
 	// Filled by Runtime
 	struct ethdev_runtime *r;
 };
@@ -66,29 +91,6 @@ struct ethdev_rx_instance {
 	struct ether_addr self_addr;		// MAC Address of the port
 	struct rte_ring *fwd[MAX_VID];		// Output rings for forwarding packets
 	vsw_ether_dst_t fwd_type[MAX_VID];	// Packet types to forward
-};
-
-//
-// For control
-//
-typedef enum {
-	ETHDEV_CMD_ADD_VID,
-	ETHDEV_CMD_DELETE_VID,
-	ETHDEV_CMD_SET_TRUNK_MODE,
-	ETHDEV_CMD_SET_ACCESS_MODE,
-	ETHDEV_CMD_SET_NATIVE_VID,
-	ETHDEV_CMD_SET_DST_SELF_FORWARD,
-	ETHDEV_CMD_SET_DST_BC_FORWARD,
-	ETHDEV_CMD_SET_DST_MC_FORWARD,
-	ETHDEV_CMD_UPDATE_MAC,
-} ethdev_cmd_t;
-
-struct ethdev_control_param {
-	ethdev_cmd_t cmd;
-	int vid;
-	vifindex_t index;
-	struct rte_ring *output;
-	struct vsw_counter *counter;
 };
 
 struct ethdev_runtime_param {

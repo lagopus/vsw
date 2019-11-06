@@ -30,25 +30,6 @@
 
 #define MAX_VID 4096
 
-// RIF Instance
-struct rif_instance {
-	struct vsw_instance base;
-	struct vsw_counter *counter;
-	struct vsw_counter *counters[MAX_VID];
-	struct rte_ring *o[MAX_VID];	// Internal buffers for output rings (linked to base.outputs)
-	bool trunk;
-	int mtu;
-	int vid;
-	vifindex_t index[MAX_VID];
-	struct ether_addr self_addr;
-
-	// Filled by Runtime
-	void (*proc)(struct rte_mempool*, struct rif_instance*, struct rte_mbuf**, int);
-
-	struct rte_ring *fwd[MAX_VID];
-	vsw_ether_dst_t fwd_type[MAX_VID];
-};
-
 // For Control
 typedef enum {
 	RIF_CMD_ADD_VID,
@@ -68,8 +49,30 @@ struct rif_control_param {
 	int mtu;
         vifindex_t index;
 	struct rte_ring *output;
-	struct ether_addr *mac;
+	struct ether_addr mac;
 	struct vsw_counter *counter;
+};
+
+// RIF Instance
+struct rif_instance {
+	struct vsw_instance base;
+	struct vsw_counter *counter;
+	struct vsw_counter *counters[MAX_VID];
+	struct rte_ring *o[MAX_VID];	// Internal buffers for output rings (linked to base.outputs)
+	bool trunk;
+	int mtu;
+	int vid;
+	vifindex_t index[MAX_VID];
+	struct ether_addr self_addr;
+
+	struct rif_control_param control;
+
+	// Filled by Runtime
+	void (*proc_rx)(struct rte_mempool*, struct rif_instance*, struct rte_mbuf**, int);
+	void (*proc_tx)(struct rte_mempool*, struct rif_instance*, struct rte_mbuf**, int);
+
+	struct rte_ring *fwd[MAX_VID];
+	vsw_ether_dst_t fwd_type[MAX_VID];
 };
 
 // A length of input ring

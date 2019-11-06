@@ -19,7 +19,6 @@
  *      @brief  Routing table use dpdk hash.
  */
 
-#include <assert.h>
 #include <inttypes.h>
 #include <rte_errno.h>
 #include <rte_malloc.h>
@@ -104,12 +103,6 @@ routelist_pop(struct route_table *rt) {
  */
 static bool
 routelist_create(struct route_table *rt) {
-	// Check total num
-	if (rt->total >= IPV4_MAX_ROUTES) {
-		ROUTER_INFO("[ROUTE] route entry is full.");
-		return false;
-	}
-
 	// Create pool.ROUTE_ENTRY_POOL_SIZE.
 	rt->entries = rte_zmalloc(NULL, sizeof(route_t) * ROUTE_ENTRY_POOL_SIZE, 0);
 	// allocation failed, return a error.
@@ -175,6 +168,8 @@ print_route_list(struct route_table *rt) {
 	for (uint32_t i = 0, cnt = 0;
 	     i < IPV4_MAX_ROUTES && cnt < rt->route_num; i++) {
 		route_t *r = &rt->entries[i];
+		if (!r->fib)
+			continue;
 		print_route_entry(r);
 		cnt++;
 	}
@@ -190,6 +185,13 @@ fib_delete(route_t *r, uint32_t metric) {
 	while (p) {
 		if (p->metric == metric) {
 			*f = p->next;
+
+			// Delete reference of a nexthop from an interface info
+			for (int i = 0; i < p->nexthop_num; i++) {
+				if (p->nexthop[i].interface)
+					interface_nexthop_reference_delete(p->nexthop[i].interface, &p->nexthop[i]);
+			}
+
 			free(p->nexthop);
 			rte_free(p);
 			break;
@@ -202,34 +204,15 @@ fib_delete(route_t *r, uint32_t metric) {
 /**
  * Add metric to route entry.
  */
-static bool
+static void
 fib_add(route_t *r, fib_t *new) {
-	// XXX: Do sanity check in frontend.
-	// Same metric entry is not notified,
-	// do not check here.
+	fib_t **f = &r->fib;
 
-	if (!r->fib) {
-		r->fib = new;
-		return true;
-	}
-	if (r->fib->metric > new->metric) {
-		new->next = r->fib;
-		r->fib = new;
-		return true;
-	}
+	while ((*f != NULL) && ((*f)->metric < new->metric))
+		f = &((*f)->next);
 
-	fib_t *f = r->fib;
-	while (f->next) {
-		if (f->next->metric < new->metric) {
-			f = f->next;
-			continue;
-		} else {
-			new->next = f->next;
-			break;
-		}
-	}
-	f->next = new;
-	return true;
+	new->next = *f;
+	*f = new;
 }
 
 /**
@@ -251,6 +234,13 @@ fib_create(struct interface_table *it, struct route_entry *entry) {
 	f->nexthop = entry->nexthops;
 	for (int i = 0; i < f->nexthop_num; i++) {
 		f->nexthop[i].interface = interface_entry_get(it, entry->nexthops[i].ifindex);
+
+		// Add reference of a nexthop that refer to a interface
+		if (f->nexthop[i].interface &&
+		    !interface_nexthop_reference_add(f->nexthop[i].interface, &f->nexthop[i])) {
+			rte_free(f);
+			return NULL;
+		}
 	}
 
 	return f;
@@ -302,7 +292,10 @@ route_entry_delete(struct router_tables *t, struct route_entry *entry) {
 	int ret = rte_lpm_is_rule_present(rt->lpm, entry->dst,
 					  (uint8_t)entry->prefixlen, &nhid);
 	// fatal error.
-	assert(ret >= 0);
+	if (ret < 0) {
+		ROUTER_ERROR("[ROUTE] rte_lpm_is_rule_present() failed, err = %d.", ret);
+		return false;
+	}
 
 	// No entry.
 	if (ret == 0) {
@@ -313,6 +306,11 @@ route_entry_delete(struct router_tables *t, struct route_entry *entry) {
 	// Route entry exists
 	route_t *r = &rt->entries[nhid];
 
+	if (VSW_LOG_DEBUG_ENABLED(router_log_id)) {
+		ROUTER_DEBUG("[ROUTE] Delete");
+		print_route_entry(&rt->entries[nhid]);
+	}
+
 	// Delete rule specified by agent.
 	fib_delete(r, entry->metric);
 
@@ -320,15 +318,8 @@ route_entry_delete(struct router_tables *t, struct route_entry *entry) {
 	if (!r->fib) {
 		rte_lpm_delete(rt->lpm,
 			       entry->dst, entry->prefixlen);
+		routelist_push(rt, nhid);
 		rt->route_num--;
-		ROUTER_DEBUG("[ROUTE] route delete %s/%d",
-			     ip2str(entry->dst), entry->prefixlen);
-	}
-
-	// Output route list after delete.
-	if (VSW_LOG_DEBUG_ENABLED(router_log_id)) {
-		ROUTER_DEBUG("[ROUTE] Delete");
-		print_route_entry(&rt->entries[nhid]);
 	}
 
 	if (VSW_LOG_DEBUG_ENABLED(router_log_id))
@@ -343,26 +334,6 @@ route_entry_delete(struct router_tables *t, struct route_entry *entry) {
  */
 bool
 route_entry_add(struct router_tables *t, struct route_entry *entry) {
-	struct route_table *rt = t->route;
-
-	// Default route.
-	if (entry->dst == 0) {
-		fib_t *f = fib_create(t->interface, entry);
-		if ((!f) || !fib_add(&rt->default_route, f)) {
-			ROUTER_ERROR("[ROUTE] Failed to add default route");
-			return false;
-		}
-		return true;
-	}
-
-	uint32_t nhid;
-	uint32_t dst = entry->dst;
-	uint32_t prefixlen = entry->prefixlen;
-	// Check if the rule is present in the lpm table.
-	int ret = rte_lpm_is_rule_present(rt->lpm, dst, prefixlen, &nhid);
-	// fatal error.
-	assert(ret >= 0);
-
 	// Newly added or updated, create a new fib entry and nexthops.
 	// XXX: An entry with the same metric does not come.
 	//      If same metric entry will be come,
@@ -373,9 +344,33 @@ route_entry_add(struct router_tables *t, struct route_entry *entry) {
 		return false;
 	}
 
-	// Add route entry to lpm.
-	if (ret == 0 && (nhid = route_add_new_entry(rt, entry)) == -1) {
+	struct route_table *rt = t->route;
+
+	// Default route.
+	if (entry->dst == 0) {
+		fib_add(&rt->default_route, f);
+		return true;
+	}
+
+	uint32_t nhid;
+	uint32_t dst = entry->dst;
+	uint32_t prefixlen = entry->prefixlen;
+	// Check if the rule is present in the lpm table.
+	int ret = rte_lpm_is_rule_present(rt->lpm, dst, prefixlen, &nhid);
+	// fatal error.
+	if (ret < 0) {
+		ROUTER_ERROR("[ROUTE] rte_lpm_is_rule_present() failed, err = %d.", ret);
+		rte_free(f);
 		return false;
+	}
+
+	// Add route entry to lpm.
+	if (ret == 0) {
+		nhid = route_add_new_entry(rt, entry);
+		if (nhid == -1) {
+			rte_free(f);
+			return false;
+		}
 	}
 
 	// Add nexthop to list of route entry.
@@ -387,6 +382,7 @@ route_entry_add(struct router_tables *t, struct route_entry *entry) {
 	if (VSW_LOG_DEBUG_ENABLED(router_log_id)) {
 		ROUTER_DEBUG("[ROUTE] Update");
 		print_route_entry(r);
+		print_route_list(rt);
 	}
 
 	return true;
@@ -400,14 +396,20 @@ route_entry_get(struct router_tables *tbls, const uint32_t dst) {
 	struct route_table *rt = tbls->route;
 	uint32_t nexthop_index;
 	int ret = rte_lpm_lookup(rt->lpm, dst, &nexthop_index);
+	// Lookup miss, no entry.
 	if (ret == -ENOENT) {
 		// return default route.
 		if (rt->default_route.fib)
 			return rt->default_route.fib->nexthop;
 		return NULL;
 	}
-	// Invalid parameter, assertion fail..
-	assert(ret == 0);
+
+	// Lookup failed
+	// Lookup failed
+	if (ret < 0) {
+		ROUTER_ERROR("[ROUTE] rte_lpm_lookup() failed, err = %d.", ret);
+		return false;
+	}
 
 	// Set nexthop information.
 	route_t *r = &rt->entries[nexthop_index];
@@ -480,5 +482,12 @@ void
 route_fini(struct route_table *rt) {
 	if (!rt)
 		return;
+
+	struct fib *fib = rt->default_route.fib;
+	while (fib) {
+		fib_delete(&rt->default_route, fib->metric);
+		fib = fib->next;
+	}
 	rte_lpm_free(rt->lpm);
+	rte_free(rt);
 }

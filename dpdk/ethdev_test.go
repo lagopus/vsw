@@ -27,7 +27,7 @@ func TestEthDevEnumerate(t *testing.T) {
 	t.Logf("Testing EthDevGetNameByPort()")
 	names := make([]string, count)
 	for i := 0; i < count; i++ {
-		names[i], err = EthDevGetNameByPort(uint(i))
+		names[i], err = EthDevGetNameByPort(uint16(i))
 		if err != nil {
 			t.Errorf("Error getting name for port %d: %v", i, err)
 			continue
@@ -63,7 +63,7 @@ func TestEthDevEnumerate(t *testing.T) {
 func TestEthDevSocketID(t *testing.T) {
 	count := int(EthDevCount())
 	for i := 0; i < count; i++ {
-		dev, err := EthDevOpen(uint(i))
+		dev, err := EthDevOpen(uint16(i))
 		if err == nil {
 			t.Logf("Port %v (%v): Socket %v", i, dev.PortID(), dev.SocketID())
 		} else {

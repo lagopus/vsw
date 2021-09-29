@@ -237,9 +237,29 @@ set_meta_inner_dst_ether_addr_type(struct rte_mbuf *m) {
 }
 
 static inline void
-set_meta_local(struct rte_mbuf *m) {
+set_meta_keep_ttl(struct rte_mbuf *m) {
   struct vsw_packet_metadata *metadata = VSW_MBUF_METADATA(m);
-  metadata->common.local = true;
+  metadata->common.keep_ttl = true;
+}
+
+static inline void
+set_meta_encap(struct rte_mbuf *m) {
+  struct vsw_packet_metadata *metadata = VSW_MBUF_METADATA(m);
+  metadata->common.encap = true;
+}
+
+static inline lagopus_result_t
+set_meta_vif(struct rte_mbuf *m, vifindex_t in_vif_index) {
+  if (m == NULL) {
+    TUNNEL_ERROR("invalid args");
+    return LAGOPUS_RESULT_INVALID_ARGS;
+  }
+
+  struct vsw_packet_metadata *metadata = VSW_MBUF_METADATA(m);
+  metadata->common.in_vif = in_vif_index;
+  metadata->common.out_vif = VIF_INVALID_INDEX;
+
+  return LAGOPUS_RESULT_OK;
 }
 
 static inline void

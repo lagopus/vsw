@@ -308,7 +308,7 @@ func (mgr *Mgr) UpdateSP(direction ipsec.DirectionType,
 
 // DeleteSP Delete SP.
 func (mgr *Mgr) DeleteSP(direction ipsec.DirectionType,
-	selector *SPSelector) {
+	selector *SPSelector) error {
 	mgr.lock.Lock()
 	defer mgr.lock.Unlock()
 
@@ -317,16 +317,20 @@ func (mgr *Mgr) DeleteSP(direction ipsec.DirectionType,
 		var err error
 		if vrf, err = mgr.vrf(selector); err != nil {
 			// ignore.
-			return
+			return nil
 		}
 
 		if spd := mgr.spd(vrf, selector); spd != nil {
 			key := mgr.createPKey(selector, direction)
 			if value, ok := spd.findSP(direction, key); ok {
 				mgr.deleteSPNoLock(vrf, spd, key, value)
+				return nil
+			} else {
+				return fmt.Errorf("Not found : %v", selector)
 			}
 		}
 	}
+	return nil
 }
 
 // SetSPI Set SPI.

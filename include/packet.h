@@ -55,8 +55,9 @@ struct vsw_packet_metadata {
 
 		vsw_md_flag_t flags;	// Or'd VSW_MD_*
 
-		bool local;			// True if the packet is originated locally. False otherwise.
-		bool to_tap;			// If True, send this packet to the TAP.
+		bool keep_ttl;		// Set to true to preserve the current TTL, i.e. do not decrement TTL.
+		bool encap;		// Set to true for the packet encapsulated by tunnel module.
+		bool to_tap;		// If True, send this packet to the TAP.
 	} common;
 	uint8_t udata[PACKET_METADATA_SIZE - sizeof(struct vsw_common_metadata)];
 };

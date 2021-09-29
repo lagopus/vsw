@@ -51,7 +51,7 @@ print_interface_entry(char *str, struct interface *interface) {
 
 	ROUTER_DEBUG("[INTERFACE] %s: ifindex: %" PRIu32 ", mac: %s, mtu: %d, vid: %d\n",
 		     str, ie->ifindex, mac2str(ie->mac), ie->mtu, ie->vid);
-	for (int i = 0; i < IPADDR_MAX_NUM && interface->addr[i].addr != 0; i++) {
+	for (int i = 0; i < ROUTER_MAX_VIF_IPADDRS && interface->addr[i].addr != 0; i++) {
 		ROUTER_DEBUG("\t\t\t\t: addr[%d] %s\n", i, ip2str(interface->addr[i].addr));
 	}
 }
@@ -93,7 +93,7 @@ interface_init(const char *name) {
 		     name, hash_name);
 	struct rte_hash_parameters hash_params = {
 	    .name = hash_name,
-	    .entries = MAX_ROUTER_VIFS, // MAX number of interfaces.
+	    .entries = ROUTER_MAX_VIFS, // MAX number of interfaces.
 	    .key_len = sizeof(uint32_t),
 	    .hash_func = rte_jhash,
 	    .hash_func_init_val = 0,
@@ -111,7 +111,7 @@ interface_init(const char *name) {
 		     name, hash_name);
 	struct rte_hash_parameters self_hash_params = {
 	    .name = hash_name,
-	    .entries = IPADDR_MAX_NUM, //MAX number of ip address.
+	    .entries = ROUTER_MAX_VIF_IPADDRS, //MAX number of ip address.
 	    .key_len = sizeof(uint64_t),
 	    .hash_func = self_hash_func,
 	    .hash_func_init_val = 0,
@@ -180,7 +180,7 @@ interface_ip_add(struct interface_table *interface_table, struct interface_addr_
 	}
 
 	// full of ip address
-	if (interface->count == IPADDR_MAX_NUM)
+	if (interface->count == ROUTER_MAX_VIF_IPADDRS)
 		return false;
 
 	// Interface entry exists.
@@ -240,7 +240,9 @@ interface_ip_delete(struct interface_table *interface_table, struct interface_ad
 			// Delete a address from hashmap for self.
 			uint64_t key = create_ip_key(addr, ifindex);
 			if (rte_hash_del_key(interface_table->self, &key) < 0) {
-				ROUTER_INFO("[INTERFACE] Not found entry.");
+				ROUTER_INFO("[INTERFACE] delete %02x.%02x.%02x.%02x from VIF %d failed. no such address.",
+					    (addr >> 24) & 0xff, (addr >> 16) & 0xff, (addr >> 8) &0xff, addr & 0xff,
+					    ifindex);
 			}
 			break;
 		}
@@ -302,8 +304,8 @@ interface_nexthop_reference_delete(struct interface *interface, nexthop_t *nh) {
  * Add interface(vif) entry.
  */
 bool
-interface_entry_add(struct router_context *ctx, struct interface_entry *ie) {
-	struct interface_table *interface_table = ctx->tables.interface;
+interface_entry_add(struct router_instance *ri, struct interface_entry *ie) {
+	struct interface_table *interface_table = ri->tables.interface;
 	struct interface *interface;
 	uint32_t ifindex = ie->ifindex;
 
@@ -318,7 +320,7 @@ interface_entry_add(struct router_context *ctx, struct interface_entry *ie) {
 	}
 
 	// create new entry
-	ie->rr = get_router_ring(ctx, ie->ring);
+	ie->rr = get_router_ring(ri, ie->ring);
 	if (!ie->rr) {
 		ROUTER_ERROR("[INTERFACE] Can't get router ring for VIF %d", ifindex);
 		return false;
@@ -330,15 +332,29 @@ interface_entry_add(struct router_context *ctx, struct interface_entry *ie) {
 		return false;
 	}
 
+	// Create neighbor cache if the interface is normal VIF, i.e. neither tunnel nor VRF.
+	if (is_iff_type_vif(ie)) {
+		struct neighbor_table *nt = neighbor_init(ie->ifindex);
+		if (nt == NULL) {
+			ROUTER_ERROR("[INTERFACE] neighbor cache creation failed.");
+			rte_free(interface);
+			return false;
+		}
+		interface->neighbor = nt;
+
+		// Tell Go frontend about neighbor cache.
+		ie->cache = nt->cache;
+		ie->cache_size = nt->cache_size;
+	}
+
 	// Add new key to hash table of the self interface.
 	if (rte_hash_add_key_data(interface_table->hashmap, &ifindex, interface) < 0) {
 		ROUTER_ERROR("[INTERFACE] interface entry add failed.");
+		neighbor_fini(interface->neighbor);
 		rte_free(interface);
 		return false;
 	}
 
-	// If the interface entry already exists,
-	// to update the entry.
 	interface->base = *ie;
 
 	if (VSW_LOG_DEBUG_ENABLED(router_log_id))
@@ -350,8 +366,8 @@ interface_entry_add(struct router_context *ctx, struct interface_entry *ie) {
  * Delete interface(vif) entry.
  */
 bool
-interface_entry_delete(struct router_context *ctx, struct interface_entry *ie) {
-	struct interface_table *interface_table = ctx->tables.interface;
+interface_entry_delete(struct router_instance *ri, struct interface_entry *ie) {
+	struct interface_table *interface_table = ri->tables.interface;
 	struct interface *interface;
 
 	int ret = rte_hash_lookup_data(interface_table->hashmap, &(ie->ifindex), (void **)&interface);
@@ -385,9 +401,10 @@ interface_entry_delete(struct router_context *ctx, struct interface_entry *ie) {
 		return false;
 	}
 
-	put_router_ring(ctx, interface->base.rr);
+	put_router_ring(ri, interface->base.rr);
 
 	// Free entry data.
+	neighbor_fini(interface->neighbor);
 	rte_free(interface);
 
 	ROUTER_DEBUG("[INTERFACE] deleted entry [ifindex = %" PRIu32 "]\n", ie->ifindex);
@@ -405,13 +422,10 @@ interface_entry_get(struct interface_table *interface_table, uint32_t ifindex) {
 				       (const void *)&key, (void **)&interface);
 	// No entry
 	if (unlikely(ret == -ENOENT)) {
-		ROUTER_INFO("[INTERFACE] Not found entry.");
+		ROUTER_INFO("[INTERFACE] can't find VIF %d", ifindex);
 		return NULL;
-	}
-	// Lookup failed
-	if (ret < 0) {
-		ROUTER_ERROR("[INTERFACE] rte_hash_lookup_data() failed, err = %d.", ret);
-		return false;
+	} else {
+		assert(ret >= 0);
 	}
 
 	if (VSW_LOG_DEBUG_ENABLED(router_log_id)) {
@@ -434,11 +448,8 @@ interface_mtu_update(struct interface_table *interface_table, struct interface_e
 	if (unlikely(ret == -ENOENT)) {
 		ROUTER_INFO("[INTERFACE] Not found entry in %s\n", __func__);
 		return false;
-	}
-	// Lookup failed
-	if (ret < 0) {
-		ROUTER_ERROR("[INTERFACE] rte_hash_lookup_data() failed, err = %d.", ret);
-		return false;
+	} else {
+		assert(ret >= 0);
 	}
 
 	// If the interface entry already exists, update MTU>

@@ -105,6 +105,9 @@ func newIPAddrs(container interface{}) *IPAddrs {
 
 // ListIPAddrs returns a slice IPAddr currently set.
 func (i *IPAddrs) ListIPAddrs() []IPAddr {
+	i.mutex.Lock()
+	defer i.mutex.Unlock()
+
 	addrs := make([]IPAddr, len(i.ipaddrs))
 	copy(addrs, i.ipaddrs)
 	return addrs

@@ -31,36 +31,48 @@
 #include <rte_ether.h>
 #include <rte_ip.h>
 #include <rte_lcore.h>
+#include <rte_mbuf.h>
 
 #include "router_common.h"
 
-#define IPV4_MAX_NEXTHOPS 100000
-
-/**
- * Nexthop information.
- */
-typedef struct neighbor {
-	uint32_t ip_addr;	   /**< IP address. */
-	struct ether_addr mac_addr; /**< MAC address. */
-	int state;
-	vifindex_t ifindex;
-} neighbor_t;
-
 struct neighbor_table {
 	struct rte_hash *hashmap; /**< hashtabble for neighbor information.*/
-	uint32_t neighbor_num;
+	struct neighbor *cache;
+	int cache_size;
 };
 
 /* Neighbor APIs. */
 struct neighbor_table *
-neighbor_init(const char *name);
+neighbor_init(vifindex_t vif);
+
 void
 neighbor_fini(struct neighbor_table *nt);
 
 bool
-neighbor_entry_delete(struct neighbor_table *nt, struct neighbor_entry *ne);
-bool
+neighbor_entry_delete(struct neighbor_table *nt, uint32_t target);
+
+struct neighbor *
 neighbor_entry_update(struct neighbor_table *nt, struct neighbor_entry *ne);
-neighbor_t *
-neighbor_entry_get(struct neighbor_table *nt, uint32_t dst);
+
+struct neighbor *
+neighbor_entry_get(struct neighbor_table *nt, uint32_t target);
+
+static inline void
+neighbor_entry_push_pending(struct neighbor *n, struct rte_mbuf *mbuf) {
+	if (n->pending)
+		rte_pktmbuf_free(n->pending);
+	n->pending = mbuf;
+}
+
+static inline struct rte_mbuf *
+neighbor_entry_pop_pending(struct neighbor *n) {
+	struct rte_mbuf *mbuf = n->pending;
+	n->pending = NULL;
+	return mbuf;
+}
+
+static inline bool
+neighbor_entry_has_pending(struct neighbor *n) {
+	return n->pending != NULL;
+}
 #endif /* VSW_MODULE_ROUTER_NEIGHBOR_H_ */

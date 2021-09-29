@@ -140,21 +140,6 @@ struct l2tun_control_param {
 struct l2tun_runtime_param {
 };
 
-static inline lagopus_result_t
-l2tun_set_meta_vif(struct rte_mbuf *m,
-                   vifindex_t in_vif_index) {
-  if (m == NULL) {
-    TUNNEL_ERROR("invalid args");
-    return LAGOPUS_RESULT_INVALID_ARGS;
-  }
-
-  struct vsw_packet_metadata *metadata = VSW_MBUF_METADATA(m);
-  metadata->common.in_vif = in_vif_index;
-  metadata->common.out_vif = VIF_INVALID_INDEX;
-
-  return LAGOPUS_RESULT_OK;
-}
-
 static inline void
 l2tun_vlan_free(struct l2tun_vlan *vlan) {
   free(vlan->stats);

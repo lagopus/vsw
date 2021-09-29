@@ -58,6 +58,17 @@ const notificationBuffer = 100
 //	Target: *VRF
 //	Value: Route
 //
+// 7. PBR Entry added:
+//	Type: Notifier.Add
+//	Target: *VRF
+//	Value: *PBREntry
+//
+// 8. PBR Entry deleted:
+//	Type: Notifier.Delete
+//	Target: *VRF
+//	Value: *PBREntry
+//
+//
 // VIF Related
 //
 // 1. VIF is deleted:
@@ -90,35 +101,10 @@ const notificationBuffer = 100
 //	Target: *VIF
 //	Value: bool
 //
-// 7. Neighbour entry added:
-//	Type: Notifier.Add
-//	Target: *VIF
-//	Value: Neighbour
-//
-// 8. Neighbour entry updated:
-//	Type: Notifier.Update
-//	Target: *VIF
-//	Value: Neighbour
-//
-// 9. Neighbour entry deleted:
-//	Type: Notifier.Delete
-//	Target: *VIF
-//	Value: Neighbour
-//
-// 10. MAC Address has changed:
+// 7. MAC Address has changed:
 //	Type: Notifier.Update
 //	Target: *VIF
 //	Value: net.HardwareAddr
-//
-// 11. PBR Entry added:
-//	Type: Notifier.Add
-//	Target: *VRF
-//	Value: PBREntry
-//
-// 12. PBR Entry deleted:
-//	Type: Notifier.Delete
-//	Target: *VRF
-//	Value: PBREntry
 //
 func GetNotifier() *notifier.Notifier {
 	return noti

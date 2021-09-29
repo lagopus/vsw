@@ -69,6 +69,26 @@ type ocdSetting struct {
 var log = vswitch.Logger
 
 //
+// configure each parameter of l2 tunnel
+//
+func (c *ConfigAgent) setL2TunnelConfig(t *vswitch.L2Tunnel, i *iface) error {
+	if err := t.SetTOS(uint8(i.tunnel.tos)); err != nil {
+		return fmt.Errorf("L2 Tunnel config err: %v", err)
+	}
+
+	if err := t.SetVNI(i.tunnel.vni); err != nil {
+		return fmt.Errorf("L2 Tunnel config err: %v", err)
+	}
+
+	t.SetAddressType(i.tunnel.af)
+	t.SetHopLimit(i.tunnel.hl)
+	t.SetLocalAddress(i.tunnel.local)
+	t.SetRemoteAddresses(i.tunnel.remotes)
+
+	return nil
+}
+
+//
 // configuration methods for instances
 //
 func (c *ConfigAgent) getInterfaceInstance(i *iface) (*vswitch.Interface, error) {
@@ -117,19 +137,10 @@ func (c *ConfigAgent) getInterfaceInstance(i *iface) (*vswitch.Interface, error)
 					return nil, fmt.Errorf("L2 Tunnel config err: %v", err)
 				}
 
-				if err := t.SetTOS(uint8(i.tunnel.tos)); err != nil {
-					return nil, fmt.Errorf("L2 Tunnel config err: %v", err)
+				if err := c.setL2TunnelConfig(t, i); err != nil {
+					return nil, err
 				}
-
-				if err := t.SetVNI(i.tunnel.vni); err != nil {
-					return nil, fmt.Errorf("L2 Tunnel config err: %v", err)
-				}
-
-				t.SetAddressType(i.tunnel.af)
-				t.SetHopLimit(i.tunnel.hl)
 				t.SetVRF(vrf)
-				t.SetLocalAddress(i.tunnel.local)
-				t.SetRemoteAddresses(i.tunnel.remotes)
 
 				private = t
 			}
@@ -326,6 +337,13 @@ func (c *ConfigAgent) processSetInterfaceCmd(i *iface) error {
 		if err := iface.SetInterfaceMode(i.ifmode); err != nil {
 			i.ifmode = iface.InterfaceMode()
 			log.Err("Setting InterfaceMode for %s failed (rolling back to %v): %v", i.name, i.ifmode, err)
+		}
+	}
+
+	// Update L2 Tunnel
+	if t := iface.Tunnel(); t != nil {
+		if err := c.setL2TunnelConfig(t, i); err != nil {
+			return err
 		}
 	}
 
@@ -572,16 +590,13 @@ func (c *ConfigAgent) processSetVRFCmd(ni *ni) error {
 	return nil
 }
 
-func (c *ConfigAgent) configPBR(vrf *vswitch.VRF, name string, p *pe) error {
-	if name == "" {
-		return fmt.Errorf("Rule name is empty.")
-	}
-
+func (c *ConfigAgent) processSetPBR(vrf *vswitch.VRF, name string, p *pe) bool {
 	var vif *vswitch.VIF
 	if p.inInterface != "" {
 		vif = vswitch.GetVIFByName(p.inInterface)
 		if vif == nil {
-			return fmt.Errorf("No such input VIF found for PBR entry: %s", p.inInterface)
+			// The VIF is not ready
+			return false
 		}
 	}
 
@@ -600,51 +615,41 @@ func (c *ConfigAgent) configPBR(vrf *vswitch.VRF, name string, p *pe) error {
 		DstPort: dp,
 		Proto:   p.protocol,
 	}
-	pbr := &vswitch.PBREntry{
-		FiveTuple: ft,
-		Priority:  p.priority,
-		InputVIF:  vif,
-		NextHops:  make(map[string]vswitch.PBRNextHop),
-	}
+	pbr := vswitch.NewPBREntry(ft, p.priority, vif)
+
+	// Set if we fallback to default routing
+	pbr.Pass = p.Pass()
 
 	// set nexthop
 	for key, val := range p.nhs {
-		nh := pbr.NextHops[key]
+		nh := new(vswitch.Nexthop)
 
 		// nexthop: output interface
 		if val.outInterface != "" {
 			out := vswitch.GetVIFByName(val.outInterface)
 			if out == nil {
-				return fmt.Errorf("output VRF not enabled.%s", val.outInterface)
+				// The VRF is not ready
+				return false
 			}
 			nh.Dev = out
-		}
-		// nexthop: ni
-		if val.nhNI != "" {
+		} else if val.nhNI != "" {
+			// nexthop: ni
 			vrf := vswitch.GetVRFByName(val.nhNI)
 			if vrf == nil {
-				return fmt.Errorf("VRF not enabled.%s", val.nhNI)
+				// The VRF is not ready
+				return false
 			}
 			nh.Dev = vrf
 		}
 		nh.Gw = val.addr.IP
 		nh.Weight = int(val.weight)
-		nh.Action = val.action
 
-		if v, exists := pbr.NextHops[key]; exists {
-			if !v.Equal(nh) {
-				// Overwrite if updated
-				pbr.NextHops[name] = nh
-			}
-		} else {
-			// New registration if not registered.
-			pbr.NextHops[name] = nh
-		}
+		pbr.AddNexthop(key, nh)
 	}
 
 	vrf.AddPBREntry(name, pbr)
 
-	return nil
+	return true
 }
 
 //
@@ -845,6 +850,30 @@ func (c *ConfigAgent) clearDeleteConfs() {
 	c.oc.difs = make(map[string]*deletedIface)
 }
 
+func (c *ConfigAgent) processDeletePBR(dni *deletedNI) error {
+	vrf, ok := c.vrf[dni.name]
+	if !ok {
+		return errors.New("No such VRF")
+	}
+
+	for pname, dpe := range dni.pbr {
+		vrf.DeletePBREntry(pname)
+		if !dpe.self {
+			// In dataplane, nexthop is managed by radix trie,
+			// so it is difficult to change here.
+			// Therefore, it is more efficient to delete the pbr entry and add it again.
+			pe := c.oc.getNetworkInstance(dni.name).getPBREntry(pname)
+			// All instances shall be ready. processSetPBR shall not fail.
+			// If it fails, it is a fatal bug as a system.
+			if !c.processSetPBR(vrf, pname, pe) {
+				return errors.New("processSetPBR failed")
+			}
+		}
+	}
+
+	return nil
+}
+
 //
 // control related
 //
@@ -906,6 +935,15 @@ func (c *ConfigAgent) config() {
 		}
 	}
 
+	for dni := range c.deletedNI {
+		if dni.niType != NI_L3VRF {
+			continue
+		}
+		if err := c.processDeletePBR(dni); err != nil {
+			log.Err("PBR deletion failed.vrf=%v, err=%v", dni.name, err)
+		}
+	}
+
 	for di := range c.deletedIF {
 		if err := c.processDeleteInterfaceCmd(di); err != nil {
 			log.Err("Interface %s deletion failed: %v", di.name, err)
@@ -940,16 +978,16 @@ func (c *ConfigAgent) config() {
 	}
 
 	for ni := range c.updatedNI {
+		if ni.niType != NI_L3VRF {
+			continue
+		}
 		for pname, pe := range ni.pbr {
 			vrf, err := c.getVRF(ni)
 			if err != nil {
 				continue
 			}
-			if err := c.configPBR(vrf, pname, pe); err != nil {
-				log.Err("configPBR(%s) failed: %v", pname, err)
-				continue
-			}
-			delete(ni.pbr, pname)
+			// If it fails, reconfigure when other instances are ready.
+			c.processSetPBR(vrf, pname, pe)
 		}
 	}
 }

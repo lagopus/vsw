@@ -20,6 +20,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+typedef const char *(*stringer)(void *p);
+
 struct set;
 extern bool set_insert(struct set *set, void *value);
 extern void *set_value_at(struct set *set, unsigned pos);
@@ -27,13 +29,14 @@ extern void *set_get_first(struct set *set);
 
 struct rt;
 extern struct rt *rt_new();
-extern void rt_free(struct rt *rt);
+extern void rt_free(struct rt*);
 extern struct set *rt_alloc_node(struct rt *rt, uint32_t key, uint32_t len);
 extern bool rt_insert_key(struct rt *rt, uint32_t key, uint32_t len, void *value);
 extern bool rt_delete_key(struct rt *rt, uint32_t key, uint32_t len, void *value);
 extern int rt_search_key(struct rt *rt, uint32_t key, uint32_t len);
 extern bool rt_iterate_results(struct rt *rt, void **value);
 extern void rt_dump(struct rt *rt);
+extern void rt_dump2(struct rt *rt, stringer s);
 
 extern bool rt_insert_range(struct rt *rt, uint32_t min, uint32_t max, void *value);
 extern bool rt_delete_range(struct rt *rt, uint32_t min, uint32_t max, void *value);

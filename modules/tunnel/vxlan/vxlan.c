@@ -217,9 +217,10 @@ vxlan_decap(struct l2tun_iface *iface,
     return ret;
   }
 
-  set_meta_local(m);
+  /* set keep_ttl metadata. */
+  set_meta_keep_ttl(m);
 
-  ret = l2tun_set_meta_vif(m, iface->vlans[iface->access_vid]->index);
+  ret = set_meta_vif(m, iface->vlans[iface->access_vid]->index);
   if (unlikely((ret != LAGOPUS_RESULT_OK))) {
     TUNNEL_PERROR(ret);
     return ret;
@@ -508,7 +509,9 @@ vxlan_encap(struct l2tun_iface *iface,
   /* reset metadata(VNI). */
   m->vlan_tci = 0;
 
-  set_meta_local(m);
+  /* set encap, keep_ttl metadata. */
+  set_meta_encap(m);
+  set_meta_keep_ttl(m);
 
   /* Inner Ether. */
   if (unlikely(m->pkt_len < sizeof(struct ether_hdr))) {

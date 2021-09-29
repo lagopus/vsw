@@ -69,9 +69,9 @@ interface_nexthop_reference_delete(struct interface *interface, nexthop_t *nh);
 
 // inteface infomation.
 bool
-interface_entry_add(struct router_context *ctx, struct interface_entry *ie);
+interface_entry_add(struct router_instance *ri, struct interface_entry *ie);
 bool
-interface_entry_delete(struct router_context *ctx, struct interface_entry *ie);
+interface_entry_delete(struct router_instance *ri, struct interface_entry *ie);
 struct interface *
 interface_entry_get(struct interface_table *interface_table, uint32_t ifindex);
 

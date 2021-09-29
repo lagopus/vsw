@@ -522,7 +522,7 @@ ethdev_rx_access(struct ethdev_rx_instance *e, struct rte_mbuf **mbufs, int rx_c
 
 		uint64_t octets = 0;
 		while (unlikely(fwd_sent < fwd_count)) {
-			struct rte_mbuf *mbuf = in_mbufs[fwd_sent];
+			struct rte_mbuf *mbuf = fwd_mbufs[fwd_sent];
 			vsw_ether_dst_t dt = vsw_check_ether_dst(mbuf);
 
 			octets += mbuf->pkt_len;

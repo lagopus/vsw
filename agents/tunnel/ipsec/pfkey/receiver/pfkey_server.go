@@ -17,13 +17,16 @@
 package receiver
 
 import (
+	"bytes"
 	"io"
 	"math/rand"
+	"net"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
+	"github.com/lagopus/vsw/agents/tunnel/ipsec/connections"
 	"github.com/lagopus/vsw/agents/tunnel/ipsec/pfkey"
 	"github.com/lagopus/vsw/agents/tunnel/ipsec/sad"
 	"github.com/lagopus/vsw/agents/tunnel/ipsec/spd"
@@ -41,6 +44,193 @@ type sadbAddMsg struct {
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
+}
+
+func sendError(w io.Writer, sadbMsg *pfkey.SadbMsg, errno uint8) {
+	sadbMsg.SadbMsgErrno = errno
+	smsg := pfkey.SadbMsgTransport{
+		SadbMsg: sadbMsg,
+	}
+	_ = smsg.Serialize(w)
+}
+
+func (s *sadbAddMsg) addSA(selector *sad.SASelector) error {
+	sav, ok := s.toSadbSaSAV()
+	if !ok {
+		return syscall.EINVAL
+	}
+	log.Logger.Info("SadbAddMsg: add sa spi %d", s.Sa.SadbSaSpi)
+	selector.SPI = sad.SPI(s.Sa.SadbSaSpi)
+	if err := addSA(selector, sav); err != nil {
+		return syscall.EEXIST
+	}
+	return nil
+}
+
+func (s *sadbAddMsg) validCipherAlgo(algo ipsec.CipherAlgo,
+	sav *sad.SAValue) bool {
+
+	if algoInfo, ok := ipsec.SupportedCipherAlgo[algo]; ok {
+		var key []byte
+		var keyLen uint16
+		if s.EncKey != nil && s.EncKey.Key != nil {
+			keyLen = s.EncKey.SadbKey.SadbKeyBits / 8
+			if keyLen <= uint16(len(*s.EncKey.Key)) {
+				key = (*s.EncKey.Key)[:keyLen]
+			}
+		}
+		if value, ok := algoInfo.Algos[keyLen]; ok {
+			sav.CipherAlgoType = value.Type
+
+			if key != nil {
+				sav.CipherKey = append(sav.CipherKey, key...)
+			}
+			return true
+		}
+	}
+
+	log.Logger.Err("no encAlgo(Cipher): %v, KeyBits: %v",
+		s.Sa.SadbSaEncrypt, s.EncKey.SadbKey.SadbKeyBits)
+	return false
+}
+
+func (s *sadbAddMsg) validAuthAlgo(algo ipsec.AuthAlgo,
+	sav *sad.SAValue) bool {
+
+	if algoInfo, ok := ipsec.SupportedAuthAlgo[algo]; ok {
+		var key []byte
+		var keyLen uint16
+		if s.AuthKey != nil && s.AuthKey.Key != nil {
+			keyLen = s.AuthKey.SadbKey.SadbKeyBits / 8
+			if keyLen <= uint16(len(*s.AuthKey.Key)) {
+				key = (*s.AuthKey.Key)[:keyLen]
+			}
+		}
+		if value, ok := algoInfo.Algos[keyLen]; ok {
+			sav.AuthAlgoType = value.Type
+
+			if key != nil {
+				sav.AuthKey = append(sav.AuthKey, key...)
+			}
+			return true
+		}
+	}
+
+	log.Logger.Err("no authAlgo: %v, KeyBits: %v",
+		s.Sa.SadbSaAuth, s.AuthKey.SadbKey.SadbKeyBits)
+	return false
+}
+
+func (s *sadbAddMsg) validAeadAlgo(algo ipsec.AeadAlgo,
+	sav *sad.SAValue) bool {
+
+	if algoInfo, ok := ipsec.SupportedAeadAlgo[algo]; ok {
+		var key []byte
+		var keyLen uint16
+		if s.EncKey != nil && s.EncKey.Key != nil {
+			keyLen = s.EncKey.SadbKey.SadbKeyBits / 8
+			if keyLen <= uint16(len(*s.EncKey.Key)) {
+				key = (*s.EncKey.Key)[:keyLen]
+			}
+		}
+		if value, ok := algoInfo.Algos[keyLen]; ok {
+			sav.AeadAlgoType = value.Type
+
+			if key != nil {
+				sav.AeadKey = append(sav.AeadKey, key...)
+			}
+			return true
+		}
+	}
+
+	log.Logger.Err("no encAlgo(AEAD): %v, KeyBits: %v",
+		s.Sa.SadbSaEncrypt, s.EncKey.SadbKey.SadbKeyBits)
+	return false
+}
+
+func (s *sadbAddMsg) toSadbSaSAV() (*sad.SAValue, bool) {
+	if s.Sa == nil {
+		log.Logger.Err("invalid sa: %v", s.Sa)
+		return nil, false
+	}
+	sav := sad.SAValue{
+		CSAValue: ipsec.CSAValue{
+			Flags: ipsec.IP4Tunnel,
+		},
+	}
+
+	if algo, ok := encTbl[s.Sa.SadbSaEncrypt]; ok {
+		// Cipher/Auth algo.
+		//// Cipher algo.
+		if ok := s.validCipherAlgo(algo, &sav); !ok {
+			log.Logger.Err("no encAlgo(Cipher): %v", s.Sa.SadbSaEncrypt)
+			return nil, ok
+		}
+
+		//// Auth algo.
+		if algo, ok := authTbl[s.Sa.SadbSaAuth]; ok {
+			if ok := s.validAuthAlgo(algo, &sav); !ok {
+				log.Logger.Err("no authAlgo: %v", s.Sa.SadbSaAuth)
+				return nil, ok
+			}
+		} else {
+			log.Logger.Err("no authAlgo: %v", s.Sa.SadbSaAuth)
+			return nil, ok
+		}
+	} else if algo, ok := aeadTbl[s.Sa.SadbSaEncrypt]; ok {
+		// AEAD algo.
+		if ok := s.validAeadAlgo(algo, &sav); !ok {
+			log.Logger.Err("no encAlgo(AEAD): %v", s.Sa.SadbSaEncrypt)
+			return nil, ok
+		}
+	} else {
+		log.Logger.Err("no encAlgo: %v", s.Sa.SadbSaEncrypt)
+		return nil, ok
+	}
+
+	sav.State = sad.SAState(s.Sa.SadbSaState)
+	sav.LocalEPIP = s.SrcAddress.ToIPNet().IP
+	sav.RemoteEPIP = s.DstAddress.ToIPNet().IP
+	// XXX: NOT support lifetime allocations
+	now := time.Now()
+	if s.HardLifetime != nil {
+		log.Logger.Info("SadbAddMsg: spi %d, hard addtime %d", s.Sa.SadbSaSpi,
+			s.HardLifetime.SadbLifetimeAddtime)
+		if s.HardLifetime.SadbLifetimeAddtime != 0 {
+			sav.LifeTimeHard = now.Add(time.Duration(
+				s.HardLifetime.SadbLifetimeAddtime) * time.Second)
+		} else {
+			sav.LifeTimeHard = time.Time{}
+		}
+		sav.LifeTimeByteHard = s.HardLifetime.SadbLifetimeBytes
+
+	}
+	if s.SoftLifetime != nil {
+		log.Logger.Info("SadbAddMsg: spi %d, soft addtime %d", s.Sa.SadbSaSpi,
+			s.SoftLifetime.SadbLifetimeAddtime)
+		if s.SoftLifetime.SadbLifetimeAddtime != 0 {
+			sav.LifeTimeSoft = now.Add(time.Duration(
+				s.SoftLifetime.SadbLifetimeAddtime) * time.Second)
+		} else {
+			sav.LifeTimeSoft = time.Time{}
+		}
+
+		sav.LifeTimeByteSoft = s.SoftLifetime.SadbLifetimeBytes
+	}
+	sav.LifeTimeCurrent = now
+	sav.Protocol = ipsec.SecurityProtocolTypeESP //Only ESP supported.
+	if s.NatTType != nil {
+		if s.NatTType.SadbXNatTTypeType != uint8(ipsec.UDPEncapESPinUDP) ||
+			s.NatTSrcPort == nil || s.NatTDstPort == nil {
+			log.Logger.Err("natt invalid params: type %v, sport %v, dport %v", s.NatTType.SadbXNatTTypeType, s.NatTSrcPort, s.NatTDstPort)
+			return nil, false
+		}
+		sav.EncapType = ipsec.UDPEncapESPinUDP //Only UDP Encap supported.
+		sav.EncapProtocol = ipsec.EncapProtoUDP
+		sav.EncapSrcPort = s.NatTSrcPort.SadbXNatTPortPort
+		sav.EncapDstPort = s.NatTDstPort.SadbXNatTPortPort
+	}
+	return &sav, true
 }
 
 func (s *sadbAddMsg) Parse(r io.Reader) error {
@@ -65,11 +255,8 @@ func (s *sadbAddMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 		VRFIndex: i,
 	}
 	if err := s.addSA(selector); err != nil {
-		sadbMsg.SadbMsgErrno = uint8(err.(syscall.Errno))
-		smsg := pfkey.SadbMsgTransport{
-			SadbMsg: sadbMsg,
-		}
-		_ = smsg.Serialize(w)
+		sendError(w, sadbMsg, uint8(err.(syscall.Errno)))
+		log.Logger.Err("SadbAddMsg Handle err: %v", err.(syscall.Errno))
 		return nil
 	}
 	serializer := []pfkey.Serializer{
@@ -122,6 +309,50 @@ type sadbUpdateMsg struct {
 	sadbAddMsg
 }
 
+func (s *sadbUpdateMsg) updateSA(selector *sad.SASelector) error {
+	sav, ok := s.toSadbSaSAV()
+	if !ok {
+		return syscall.EINVAL
+	}
+	sav2, err := findSAByIP(selector, sav.LocalEPIP, sav.RemoteEPIP)
+	if err != nil {
+		return syscall.ENOENT
+	}
+	log.Logger.Info("SadbUpdateMsg: update sa spi %d", s.Sa.SadbSaSpi)
+	sav2.CipherAlgoType = sav.CipherAlgoType
+	sav2.CipherKey = sav.CipherKey
+	sav2.AuthAlgoType = sav.AuthAlgoType
+	sav2.AuthKey = sav.AuthKey
+	sav2.AeadAlgoType = sav.AeadAlgoType
+	sav2.AeadKey = sav.AeadKey
+	sav2.Protocol = sav.Protocol
+	sav2.Flags = sav.Flags
+	sav2.State = sav.State
+	if s.CurrentLifetime != nil {
+		sav2.LifeTimeCurrent = sav.LifeTimeCurrent
+		sav2.LifeTimeByteCurrent = sav.LifeTimeByteCurrent
+	}
+	if s.HardLifetime != nil {
+		sav2.LifeTimeHard = sav.LifeTimeHard
+		sav2.LifeTimeByteHard = sav.LifeTimeByteHard
+	}
+	if s.SoftLifetime != nil {
+		sav2.LifeTimeSoft = sav.LifeTimeSoft
+		sav2.LifeTimeByteSoft = sav.LifeTimeByteSoft
+	}
+	if s.SoftLifetime != nil {
+		sav2.LifeTimeSoft = sav.LifeTimeSoft
+		sav2.LifeTimeByteSoft = sav.LifeTimeByteSoft
+	}
+	if s.NatTType != nil {
+		sav2.EncapType = sav.EncapType
+		sav2.EncapProtocol = sav.EncapProtocol
+		sav2.EncapSrcPort = sav.EncapSrcPort
+		sav2.EncapDstPort = sav.EncapDstPort
+	}
+	return nil
+}
+
 func (s *sadbUpdateMsg) Parse(r io.Reader) error {
 	smsg := sadbAddMsg{}
 	err := smsg.Parse(r)
@@ -139,11 +370,7 @@ func (s *sadbUpdateMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 	}
 	err := s.updateSA(selector)
 	if err != nil {
-		sadbMsg.SadbMsgErrno = uint8(err.(syscall.Errno))
-		smsg := pfkey.SadbMsgTransport{
-			SadbMsg: sadbMsg,
-		}
-		_ = smsg.Serialize(w)
+		sendError(w, sadbMsg, uint8(err.(syscall.Errno)))
 		log.Logger.Err("SadbUpdateMsg Handle err: %v", err.(syscall.Errno))
 		return nil
 	}
@@ -187,6 +414,66 @@ func (s *sadbUpdateMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 
 type sadbGetSPIMsg struct {
 	pfkey.SadbBaseMsg
+}
+
+func (s *sadbGetMsg) toSadbGetMsgReply(sav *sad.SAValue, spi uint32) (*sadbGetMsgReply, bool) {
+	sa := pfkey.SadbSa{
+		SadbSaSpi:   spi,
+		SadbSaState: uint8(sav.State),
+	}
+
+	var aKey *pfkey.KeyPair
+	var eKey *pfkey.KeyPair
+	if enc, ok := encRTbl[sav.CipherAlgoType]; ok {
+		if auth, ok := authRTbl[sav.AuthAlgoType]; ok {
+			sa.SadbSaEncrypt = enc
+			sa.SadbSaAuth = auth
+			aKey = pfkey.ToKeyPair(&sav.AuthKey)
+			eKey = pfkey.ToKeyPair(&sav.CipherKey)
+		} else {
+			return nil, false
+		}
+	} else if enc, ok := aeadRTbl[sav.AeadAlgoType]; ok {
+		sa.SadbSaEncrypt = enc
+		eKey = pfkey.ToKeyPair(&sav.AeadKey)
+	} else {
+		return nil, false
+	}
+
+	sAddr := pfkey.AddrPair{
+		Addr:     pfkey.SadbAddress{}, // XXX: to set proto, prefixlen?
+		SockAddr: pfkey.ToSockaddr(&net.IPNet{IP: sav.LocalEPIP}),
+	}
+	dAddr := pfkey.AddrPair{
+		Addr:     pfkey.SadbAddress{}, // XXX: to set proto, prefixlen?
+		SockAddr: pfkey.ToSockaddr(&net.IPNet{IP: sav.RemoteEPIP}),
+	}
+	cTime := pfkey.SadbLifetime{
+		SadbLifetimeBytes:   sav.LifeTimeByteCurrent,
+		SadbLifetimeAddtime: uint64(sav.LifeTimeCurrent.Unix()),
+		SadbLifetimeUsetime: 0, //XXX
+	}
+	hTime := pfkey.SadbLifetime{
+		SadbLifetimeBytes:   sav.LifeTimeByteHard,
+		SadbLifetimeAddtime: uint64(sav.LifeTimeHard.Sub(sav.LifeTimeCurrent).Seconds()),
+		SadbLifetimeUsetime: 0, //XXX
+	}
+	sTime := pfkey.SadbLifetime{
+		SadbLifetimeBytes:   sav.LifeTimeByteSoft,
+		SadbLifetimeAddtime: uint64(sav.LifeTimeSoft.Sub(sav.LifeTimeCurrent).Seconds()),
+		SadbLifetimeUsetime: 0, //XXX
+	}
+
+	return &sadbGetMsgReply{
+		sa:              &sa,
+		currentLifetime: &cTime,
+		hardLifetime:    &hTime,
+		softLifetime:    &sTime,
+		srcAddress:      &sAddr,
+		dstAddress:      &dAddr,
+		authKey:         aKey,
+		encKey:          eKey,
+	}, true
 }
 
 func (s *sadbGetSPIMsg) Parse(r io.Reader) error {
@@ -239,11 +526,7 @@ func (s *sadbGetSPIMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 	}
 
 	if err != nil {
-		sadbMsg.SadbMsgErrno = uint8(syscall.EEXIST)
-		smsg := pfkey.SadbMsgTransport{
-			SadbMsg: sadbMsg,
-		}
-		_ = smsg.Serialize(w)
+		sendError(w, sadbMsg, uint8(syscall.EEXIST))
 		return nil
 	}
 
@@ -307,21 +590,13 @@ func (s *sadbGetMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 	}
 	sav, err := findSA(selector)
 	if err != nil {
-		sadbMsg.SadbMsgErrno = uint8(syscall.ESRCH)
-		smsg := pfkey.SadbMsgTransport{
-			SadbMsg: sadbMsg,
-		}
-		_ = smsg.Serialize(w)
-		log.Logger.Err("SadbGetMsg Handle err: %v spi %d", syscall.ESRCH, s.Sa.SadbSaSpi)
+		sendError(w, sadbMsg, uint8(syscall.ENOENT))
+		log.Logger.Err("SadbGetMsg Handle err: %v spi %d", syscall.ENOENT, s.Sa.SadbSaSpi)
 		return nil
 	}
 	reply, ok := s.toSadbGetMsgReply(sav, s.Sa.SadbSaSpi)
 	if !ok {
-		sadbMsg.SadbMsgErrno = uint8(syscall.EINVAL)
-		smsg := pfkey.SadbMsgTransport{
-			SadbMsg: sadbMsg,
-		}
-		_ = smsg.Serialize(w)
+		sendError(w, sadbMsg, uint8(syscall.EINVAL))
 		log.Logger.Err("SadbGetMsg Handle err: %v spi %d", syscall.EINVAL, s.Sa.SadbSaSpi)
 		return nil
 	}
@@ -454,10 +729,62 @@ type sadbXSPDAddMsg struct {
 	pfkey.SadbBaseMsg
 }
 
+func (s *sadbXSPDAddMsg) buildSPSelector(i vswitch.VRFIndex) *spd.SPSelector {
+	sps := spd.SPSelector{
+		CSPSelector: ipsec.CSPSelector{
+			VRFIndex:      i,
+			LocalIP:       *s.SrcAddress.ToIPNet(),
+			RemoteIP:      *s.DstAddress.ToIPNet(),
+			UpperProtocol: ipsec.UpperProtocolType(s.SrcAddress.Addr.SadbAddressProto),
+		},
+	}
+	if s.SrcAddress.SockAddr.Port() != 0 {
+		sps.LocalPortRangeStart = uint16(s.SrcAddress.SockAddr.Port())
+		sps.LocalPortRangeEnd = uint16(s.SrcAddress.SockAddr.Port())
+	} else {
+		sps.LocalPortRangeStart = 0
+		sps.LocalPortRangeEnd = 65535
+	}
+	if s.DstAddress.SockAddr.Port() != 0 {
+		sps.RemotePortRangeStart = uint16(s.DstAddress.SockAddr.Port())
+		sps.RemotePortRangeEnd = uint16(s.DstAddress.SockAddr.Port())
+	} else {
+		sps.RemotePortRangeStart = 0
+		sps.RemotePortRangeEnd = 65535
+	}
+	return &sps
+}
+
+func (s *sadbXSPDAddMsg) toSadbSPSSPV(i vswitch.VRFIndex) (*spd.SPSelector, *spd.SPValue, error) {
+	// parameter check, but this block will move to ipsec/spd?
+	if s.Policy.IpsecRequest.SadbXIpsecrequestProto != uint16(vswitch.IPP_ESP) ||
+		s.Policy.IpsecRequest.SadbXIpsecrequestMode != uint8(ipsec.ModeTypeTunnel) {
+		return nil, nil, syscall.EINVAL
+	}
+	sps := s.buildSPSelector(i)
+	spv := spd.SPValue{
+		CSPValue: ipsec.CSPValue{
+			Policy:   ipsec.PolicyType(s.Policy.Policy.SadbXPolicyType),
+			Priority: int32(s.Policy.Policy.SadbXpolicyPriority),
+		},
+		Protocol:  ipsec.SecurityProtocolType(ipsec.SecurityProtocolTypeESP), // only support ESP.
+		Mode:      ipsec.ModeType(ipsec.ModeTypeTunnel),                      // only support tunnel.
+		Level:     ipsec.LevelType(s.Policy.IpsecRequest.SadbXIpsecrequestLevel),
+		RequestID: s.Policy.IpsecRequest.SadbXIpsecrequestReqid,
+	}
+	if s.Policy.TunnelSrcAddr != nil {
+		spv.LocalEPIP = *s.Policy.TunnelSrcAddr.ToIPNet(0)
+	}
+	if s.Policy.TunnelDstAddr != nil {
+		spv.RemoteEPIP = *s.Policy.TunnelDstAddr.ToIPNet(0)
+	}
+	return sps, &spv, nil
+}
+
 func (s *sadbXSPDAddMsg) Parse(r io.Reader) error {
 	err := s.ParseSadbMsg(r)
 	if err != nil {
-		log.Logger.Err("parse err")
+		log.Logger.Err("parse err %v", err)
 		return err
 	}
 	/* checking necessary options */
@@ -482,26 +809,32 @@ func (s *sadbXSPDAddMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 		spi, err = findSPIbyIP(selector, s.Policy.TunnelSrcAddr.ToIPNet(0).IP,
 			s.Policy.TunnelDstAddr.ToIPNet(0).IP)
 		if err != nil {
-			sadbMsg.SadbMsgErrno = uint8(syscall.ESRCH)
-			smsg := pfkey.SadbMsgTransport{
-				SadbMsg: sadbMsg,
-			}
-			_ = smsg.Serialize(w)
-			log.Logger.Err("SadbXSPDAddMsg Handle err: %v", syscall.ESRCH)
+			sendError(w, sadbMsg, uint8(syscall.ENOENT))
+			log.Logger.Err("SadbXSPDAddMsg Handle err: %v", syscall.ENOENT)
 			return nil
 		}
 		selector.SPI = sad.SPI(spi)
-		if ipsec.DirectionType(s.Policy.Policy.SadbXPolicyDir) == ipsec.DirectionTypeIn {
+
+		switch ipsec.DirectionType(s.Policy.Policy.SadbXPolicyDir) {
+		case ipsec.DirectionTypeIn:
 			log.Logger.Info("enable spi:%d inbound", spi)
 			enableSA(selector, ipsec.DirectionTypeIn)
-		} else if ipsec.DirectionType(s.Policy.Policy.SadbXPolicyDir) == ipsec.DirectionTypeOut {
+		case ipsec.DirectionTypeOut:
 			log.Logger.Info("enable spi:%d outbound", spi)
 			enableSA(selector, ipsec.DirectionTypeOut)
-		} else {
+		case ipsec.DirectionTypeFwd:
+			// ignore.
+		default:
 			log.Logger.Err("no direction spi:%d", spi)
+			return nil
 		}
 	}
-	sps, spv := s.toSadbSPSSPV(i)
+	sps, spv, err := s.toSadbSPSSPV(i)
+	if err != nil {
+		sendError(w, sadbMsg, uint8(syscall.EINVAL))
+		log.Logger.Err("SadbXSPDAddMsg Handle err: %v", syscall.EINVAL)
+		return nil
+	}
 	if spi != 0 {
 		spv.State = spd.Completed
 	}
@@ -509,11 +842,7 @@ func (s *sadbXSPDAddMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 	spdi, err := addSP(ipsec.DirectionType(s.Policy.Policy.SadbXPolicyDir), sps, spv)
 	log.Logger.Info("SadbXSPDAddMsg: add spdi %d, spi %d", spdi, spi)
 	if err != nil {
-		sadbMsg.SadbMsgErrno = uint8(syscall.EEXIST)
-		smsg := pfkey.SadbMsgTransport{
-			SadbMsg: sadbMsg,
-		}
-		_ = smsg.Serialize(w)
+		sendError(w, sadbMsg, uint8(syscall.EEXIST))
 		log.Logger.Err("SadbXSPDAddMsg Handle err: %v", syscall.EEXIST)
 		return nil
 	}
@@ -559,11 +888,7 @@ func (s *sadbXSPDUpdateMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 		spi, err = findSPIbyIP(selector, s.Policy.TunnelSrcAddr.ToIPNet(0).IP,
 			s.Policy.TunnelDstAddr.ToIPNet(0).IP)
 		if err != nil {
-			sadbMsg.SadbMsgErrno = uint8(syscall.EINVAL)
-			smsg := pfkey.SadbMsgTransport{
-				SadbMsg: sadbMsg,
-			}
-			_ = smsg.Serialize(w)
+			sendError(w, sadbMsg, uint8(syscall.EINVAL))
 			log.Logger.Err("SadbXSPDUpdateMsg Handle err: %v", syscall.EINVAL)
 			return nil
 		}
@@ -578,14 +903,15 @@ func (s *sadbXSPDUpdateMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 	}
 	log.Logger.Info("get spi:%d", spi)
 	log.Logger.Info("receive policy_id :%d", s.Policy.Policy.SadbXPolicyID)
-	sps, spvNew := s.toSadbSPSSPV(i)
+	sps, spvNew, err := s.toSadbSPSSPV(i)
+	if err != nil {
+		sendError(w, sadbMsg, uint8(syscall.EINVAL))
+		log.Logger.Err("SadbXSPDUpdateMsg Handle err: %v", syscall.EINVAL)
+		return nil
+	}
 	spvOld, ok := findSP(ipsec.DirectionType(s.Policy.Policy.SadbXPolicyDir), sps)
 	if !ok {
-		sadbMsg.SadbMsgErrno = uint8(syscall.EINVAL)
-		smsg := pfkey.SadbMsgTransport{
-			SadbMsg: sadbMsg,
-		}
-		_ = smsg.Serialize(w)
+		sendError(w, sadbMsg, uint8(syscall.EINVAL))
 		log.Logger.Err("SadbXSPDUpdateMsg Handle err: %v", syscall.EINVAL)
 		return nil
 	}
@@ -604,11 +930,7 @@ func (s *sadbXSPDUpdateMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 		spvOld.State = spd.Completed
 		err = updateSP(ipsec.DirectionType(s.Policy.Policy.SadbXPolicyDir), sps, spvOld)
 		if err != nil {
-			sadbMsg.SadbMsgErrno = uint8(syscall.EINVAL)
-			smsg := pfkey.SadbMsgTransport{
-				SadbMsg: sadbMsg,
-			}
-			_ = smsg.Serialize(w)
+			sendError(w, sadbMsg, uint8(syscall.EINVAL))
 			log.Logger.Err("SadbXSPDUpdateMsg Handle err: %v", syscall.EINVAL)
 			return nil
 		}
@@ -677,12 +999,8 @@ func (s *sadbXSPDGetMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 		s.Policy.Policy.SadbXPolicyID, s.Policy.Policy.SadbXpolicyPriority)
 	spv, ok := findSPByEntryID(selector, s.Policy.Policy.SadbXPolicyID)
 	if !ok {
-		sadbMsg.SadbMsgErrno = uint8(syscall.ESRCH)
-		smsg := pfkey.SadbMsgTransport{
-			SadbMsg: sadbMsg,
-		}
-		_ = smsg.Serialize(w)
-		log.Logger.Err("SadbXSPDGetMsg Handle err: %v", syscall.ESRCH)
+		sendError(w, sadbMsg, uint8(syscall.ENOENT))
+		log.Logger.Err("SadbXSPDGetMsg Handle err: %v", syscall.ENOENT)
 		return nil
 	}
 	reply := toSadbXSPDGetMsgReply(&spv.SPSelector, spv)
@@ -712,7 +1030,12 @@ func (s *sadbXSPDGetMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 }
 
 type sadbXSPDDeleteMsg struct {
-	pfkey.SadbBaseMsg
+	sadbXSPDAddMsg
+}
+
+func (s *sadbXSPDDeleteMsg) toSadbSPS(i vswitch.VRFIndex) *spd.SPSelector {
+	sps := s.buildSPSelector(i)
+	return sps
 }
 
 func (s *sadbXSPDDeleteMsg) Parse(r io.Reader) error {
@@ -733,7 +1056,12 @@ func (s *sadbXSPDDeleteMsg) Parse(r io.Reader) error {
 func (s *sadbXSPDDeleteMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 	i := vrfs.load(s)
 	sps := s.toSadbSPS(i)
-	deleteSP(ipsec.DirectionType(s.Policy.Policy.SadbXPolicyDir), sps)
+	err := deleteSP(ipsec.DirectionType(s.Policy.Policy.SadbXPolicyDir), sps)
+	if err != nil {
+		sendError(w, sadbMsg, uint8(syscall.ENOENT))
+		log.Logger.Err("SadbXSPDeleteMsg Handle err: %v", syscall.ENOENT)
+		return nil
+	}
 	smsg := pfkey.SadbMsgTransport{
 		sadbMsg,
 		[]pfkey.Serializer{
@@ -751,8 +1079,7 @@ func (s *sadbXSPDDeleteMsg) Handle(w io.Writer, sadbMsg *pfkey.SadbMsg) error {
 			},
 		},
 	}
-	err := smsg.Serialize(w)
-	return err
+	return smsg.Serialize(w)
 }
 
 type sadbDumpMsg struct {
@@ -841,11 +1168,262 @@ type sadbExpireMsg struct {
 	dstAddress      *pfkey.AddrPair
 }
 
+func (s *sadbExpireMsg) expireMsg(sav *sad.SAValue, spi uint32, isSoft bool) {
+	s.sa = &pfkey.SadbSa{
+		SadbSaSpi:   spi,
+		SadbSaState: uint8(sav.State),
+	}
+	var ok bool
+	if s.sa.SadbSaEncrypt, ok = encRTbl[sav.CipherAlgoType]; ok {
+		s.sa.SadbSaAuth, _ = authRTbl[sav.AuthAlgoType]
+	} else {
+		s.sa.SadbSaEncrypt, _ = aeadRTbl[sav.AeadAlgoType]
+	}
+
+	s.srcAddress = &pfkey.AddrPair{
+		Addr:     pfkey.SadbAddress{}, // XXX: to set proto, prefixlen?
+		SockAddr: pfkey.ToSockaddr(&net.IPNet{IP: sav.LocalEPIP}),
+	}
+	s.dstAddress = &pfkey.AddrPair{
+		Addr:     pfkey.SadbAddress{}, // XXX: to set proto, prefixlen?
+		SockAddr: pfkey.ToSockaddr(&net.IPNet{IP: sav.RemoteEPIP}),
+	}
+	s.currentLifetime = &pfkey.SadbLifetime{
+		SadbLifetimeBytes:   sav.LifeTimeByteCurrent,
+		SadbLifetimeAddtime: uint64(sav.LifeTimeCurrent.Unix()),
+		SadbLifetimeUsetime: 0, //XXX
+	}
+	if isSoft {
+		s.softLifetime = &pfkey.SadbLifetime{
+			SadbLifetimeBytes:   sav.LifeTimeByteSoft,
+			SadbLifetimeAddtime: uint64(sav.LifeTimeSoft.Sub(sav.LifeTimeCurrent).Seconds()),
+			SadbLifetimeUsetime: 0, //XXX
+		}
+	} else {
+		s.hardLifetime = &pfkey.SadbLifetime{
+			SadbLifetimeBytes:   sav.LifeTimeByteHard,
+			SadbLifetimeAddtime: uint64(sav.LifeTimeHard.Sub(sav.LifeTimeCurrent).Seconds()),
+			SadbLifetimeUsetime: 0, //XXX
+		}
+	}
+}
+
 type sadbAcquireMsg struct {
 	sa         *pfkey.SadbSa
 	srcAddress *pfkey.AddrPair
 	dstAddress *pfkey.AddrPair
 	Policy     *pfkey.Policy
+}
+
+func (s *sadbAcquireMsg) acquireMsg(src *net.IPNet, dst *net.IPNet) {
+	s.srcAddress = &pfkey.AddrPair{
+		Addr:     pfkey.SadbAddress{}, // XXX: to set proto, prefixlen?
+		SockAddr: pfkey.ToSockaddr(src),
+	}
+	s.dstAddress = &pfkey.AddrPair{
+		Addr:     pfkey.SadbAddress{}, // XXX: to set proto, prefixlen?
+		SockAddr: pfkey.ToSockaddr(dst),
+	}
+}
+
+func toIPProto(spt ipsec.SecurityProtocolType) vswitch.IPProto {
+	switch spt {
+	case ipsec.SecurityProtocolTypeAH:
+		return vswitch.IPP_AH
+	case ipsec.SecurityProtocolTypeESP:
+		return vswitch.IPP_ESP
+	default:
+		return vswitch.IPP_ESP // only support ESP.
+	}
+
+}
+
+func toSadbXSPDGetMsgReply(sps *spd.SPSelector, spv *spd.SPValue) *sadbXSPDGetMsgReply {
+
+	policy := pfkey.Policy{
+		Policy: pfkey.SadbXPolicy{
+			SadbXPolicyType:     uint16(spv.Policy),
+			SadbXPolicyDir:      uint8(sps.Direction),
+			SadbXPolicyID:       spv.EntryID,
+			SadbXpolicyPriority: uint32(spv.Priority),
+		},
+		IpsecRequest: pfkey.SadbXIpsecrequest{
+			SadbXIpsecrequestProto: uint16(toIPProto(spv.Protocol)),
+			SadbXIpsecrequestMode:  uint8(spv.Mode),
+			SadbXIpsecrequestLevel: uint8(spv.Level),
+			SadbXIpsecrequestReqid: spv.RequestID,
+		},
+		TunnelSrcAddr: pfkey.ToSockaddr(&spv.LocalEPIP),
+		TunnelDstAddr: pfkey.ToSockaddr(&spv.RemoteEPIP),
+	}
+	p, _ := sps.LocalIP.Mask.Size()
+	sAddr := pfkey.AddrPair{
+		Addr: pfkey.SadbAddress{
+			SadbAddressPrefixlen: uint8(p),
+		},
+		SockAddr: pfkey.ToSockaddr(&sps.LocalIP),
+	}
+	p, _ = sps.RemoteIP.Mask.Size()
+	dAddr := pfkey.AddrPair{
+		Addr: pfkey.SadbAddress{
+			SadbAddressPrefixlen: uint8(p),
+		},
+		SockAddr: pfkey.ToSockaddr(&sps.RemoteIP),
+	}
+	cTime := pfkey.SadbLifetime{
+		SadbLifetimeBytes:   spv.SPStats.LifeTimeByteCurrent,
+		SadbLifetimeAddtime: 0,
+		SadbLifetimeUsetime: uint64(spv.SPStats.LifeTimeCurrent.Unix()),
+	}
+	return &sadbXSPDGetMsgReply{
+		sadbXSPDAddMsg{
+			pfkey.SadbBaseMsg{
+				Policy:          &policy,
+				CurrentLifetime: &cTime,
+				SrcAddress:      &sAddr,
+				DstAddress:      &dAddr,
+			},
+		},
+	}
+}
+
+func getSupportedAuth() *[]pfkey.SadbAlg {
+	s := []pfkey.SadbAlg{}
+	// Auth algo.
+	for auth, algo := range authTbl {
+		algoInfo := ipsec.SupportedAuthAlgo[algo]
+		minKeyLen := algoInfo.MinKeyLen
+		maxKeyLen := algoInfo.MaxKeyLen
+		a := pfkey.SadbAlg{
+			SadbAlgID:      auth,
+			SadbAlgMinbits: minKeyLen,
+			SadbAlgMaxbits: maxKeyLen,
+		}
+		s = append(s, a)
+	}
+
+	return &s
+}
+
+func getSupportedEnc() *[]pfkey.SadbAlg {
+	s := []pfkey.SadbAlg{}
+	// Cipher algo.
+	for enc, algo := range encTbl {
+		algoInfo := ipsec.SupportedCipherAlgo[algo]
+		minKeyLen := algoInfo.MinKeyLen
+		maxKeyLen := algoInfo.MaxKeyLen
+		// Prerequisites: same length of IV.
+		ivLen := uint8(algoInfo.Algos[minKeyLen].IvLen)
+		a := pfkey.SadbAlg{
+			SadbAlgID:      enc,
+			SadbAlgIvlen:   ivLen,
+			SadbAlgMinbits: minKeyLen * 8,
+			SadbAlgMaxbits: maxKeyLen * 8,
+		}
+		s = append(s, a)
+	}
+	// AEAD algo.
+	for aead, algo := range aeadTbl {
+		algoInfo := ipsec.SupportedAeadAlgo[algo]
+		minKeyLen := algoInfo.MinKeyLen
+		maxKeyLen := algoInfo.MaxKeyLen
+		// Prerequisites: same length of IV.
+		ivLen := uint8(algoInfo.Algos[minKeyLen].IvLen)
+		a := pfkey.SadbAlg{
+			SadbAlgID:      aead,
+			SadbAlgIvlen:   ivLen,
+			SadbAlgMinbits: minKeyLen * 8,
+			SadbAlgMaxbits: maxKeyLen * 8,
+		}
+		s = append(s, a)
+	}
+
+	return &s
+}
+
+func sadbExpire(vrfIndex vswitch.VRFIndex, dir ipsec.DirectionType, spi sad.SPI, sav *sad.SAValue, kind sad.SadbExpireType) bool {
+	// TODO: set VRF Index.
+	sadbMsg := pfkey.NewSadbMsg(pfkey.SADB_EXPIRE, pfkey.SADB_SATYPE_ESP, 0, 0)
+	s := &sadbExpireMsg{}
+
+	if kind == sad.SoftLifetimeExpired {
+		s.expireMsg(sav, uint32(spi), true)
+		log.Logger.Info("send soft expire message: spi %d", uint32(spi))
+	} else {
+		s.expireMsg(sav, uint32(spi), false)
+		log.Logger.Info("send hard expire message: spi %d", uint32(spi))
+	}
+	smsg := pfkey.SadbMsgTransport{
+		sadbMsg,
+		[]pfkey.Serializer{
+			&pfkey.SadbExtTransport{
+				&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_SA},
+				s.sa,
+			},
+			&pfkey.SadbExtTransport{
+				&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_ADDRESS_SRC},
+				s.srcAddress,
+			},
+			&pfkey.SadbExtTransport{
+				&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_ADDRESS_DST},
+				s.dstAddress,
+			},
+			&pfkey.SadbExtTransport{
+				&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_LIFETIME_CURRENT},
+				s.currentLifetime,
+			},
+		},
+	}
+	var st *pfkey.SadbExtTransport
+	if kind == sad.SoftLifetimeExpired {
+		st = &pfkey.SadbExtTransport{&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_LIFETIME_SOFT}, s.softLifetime}
+	} else {
+		st = &pfkey.SadbExtTransport{&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_LIFETIME_HARD}, s.hardLifetime}
+	}
+	smsg.Serializer = append(smsg.Serializer, st)
+	buf := bytes.Buffer{}
+	err := smsg.Serialize(&buf)
+	if err != nil {
+		log.Logger.Err("SadbExpire: error: %v", err)
+		return false
+	}
+	con := &connections.Connections{}
+	con.Write(buf.Bytes())
+	return true
+}
+
+func sadbAcquire(vrfIndex vswitch.VRFIndex, spEntryID uint32, src *net.IPNet, dst *net.IPNet) bool {
+	// TODO: set VRF Index.
+	// XXX: use spEntryID
+	sadbMsg := pfkey.NewSadbMsg(pfkey.SADB_ACQUIRE, pfkey.SADB_SATYPE_ESP, 0, 0)
+	s := &sadbAcquireMsg{}
+	s.acquireMsg(src, dst)
+	smsg := pfkey.SadbMsgTransport{
+		sadbMsg,
+		[]pfkey.Serializer{
+			&pfkey.SadbExtTransport{
+				&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_ADDRESS_SRC},
+				s.srcAddress,
+			},
+			&pfkey.SadbExtTransport{
+				&pfkey.SadbExt{SadbExtType: pfkey.SADB_EXT_ADDRESS_DST},
+				s.dstAddress,
+			},
+			&pfkey.SadbExtTransport{
+				&pfkey.SadbExt{SadbExtType: pfkey.SADB_X_EXT_POLICY},
+				&pfkey.Policy{}, // XXX: workaround for no charon down.
+			},
+		},
+	}
+	buf := bytes.Buffer{}
+	err := smsg.Serialize(&buf)
+	if err != nil {
+		log.Logger.Err("SadbAcquire: error: %v", err)
+		return false
+	}
+	con := &connections.Connections{}
+	con.Write(buf.Bytes())
+	return true
 }
 
 type vrfMap struct {

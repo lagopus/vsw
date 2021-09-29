@@ -21,49 +21,64 @@ import (
 
 type PBRAction int
 
-const (
-	PBRActionNone PBRAction = iota
-	PBRActionDrop
-	PBRActionPass
-	PBRActionForward
-)
-
-type PBRNextHop struct {
-	Nexthop
-	Action PBRAction
-}
-
 type PBREntry struct {
 	FiveTuple      // ref: fivetuple.go
 	Priority  uint // rule priority
 	InputVIF  *VIF // input interface
-	NextHops  map[string]PBRNextHop
+	Pass      bool // If true, pass to the default routing
+	NextHops  map[string]*Nexthop
+	mutex     sync.RWMutex
 }
 
 type pbrObserver interface {
-	pbrEntryAdded(entry PBREntry)
-	pbrEntryDeleted(entry PBREntry)
+	pbrEntryAdded(entry *PBREntry)
+	pbrEntryDeleted(entry *PBREntry)
 }
 
 type PBR struct {
 	observer pbrObserver
-	entries  map[string]PBREntry
+	entries  map[string]*PBREntry
 	mutex    sync.RWMutex
 }
 
-func (nh *PBRNextHop) Equal(x PBRNextHop) bool {
-	return nh.Weight == x.Weight &&
-		nh.Dev.VIFIndex() == x.Dev.VIFIndex() &&
-		nh.Action == x.Action &&
-		nh.Gw.Equal(x.Gw)
+func NewPBREntry(ft FiveTuple, priority uint, inputVIF *VIF) *PBREntry {
+	return &PBREntry{
+		FiveTuple: ft,
+		Priority:  priority,
+		InputVIF:  inputVIF,
+		NextHops:  make(map[string]*Nexthop),
+	}
+
+}
+
+func (pe *PBREntry) AddNexthop(name string, nh *Nexthop) {
+	pe.mutex.Lock()
+	defer pe.mutex.Unlock()
+
+	// nexthop map is made when PBREntry is created
+	// Always overwrite NextHop entries
+	pe.NextHops[name] = nh
+}
+
+func (pe *PBREntry) DeleteNexthop(name string) {
+	pe.mutex.Lock()
+	defer pe.mutex.Unlock()
+
+	delete(pe.NextHops, name)
 }
 
 func (pe *PBREntry) equal(x *PBREntry) bool {
+	pe.mutex.Lock()
+	defer pe.mutex.Unlock()
+
 	if !pe.SrcIP.Equal(x.SrcIP) || !pe.DstIP.Equal(x.DstIP) ||
 		!pe.SrcPort.Equal(&x.SrcPort) ||
 		!pe.DstPort.Equal(&x.DstPort) ||
 		pe.Proto != x.Proto || pe.Priority != x.Priority ||
-		pe.InputVIF.Index() != x.InputVIF.Index() {
+		pe.InputVIF != x.InputVIF {
+		return false
+	}
+	if len(pe.NextHops) != len(x.NextHops) {
 		return false
 	}
 	for k, v := range pe.NextHops {
@@ -77,7 +92,7 @@ func (pe *PBREntry) equal(x *PBREntry) bool {
 func newPBR(observer pbrObserver) *PBR {
 	return &PBR{
 		observer: observer,
-		entries:  make(map[string]PBREntry),
+		entries:  make(map[string]*PBREntry),
 	}
 }
 
@@ -97,12 +112,13 @@ func (p *PBR) AddPBREntry(name string, entry *PBREntry) {
 		if v.equal(entry) {
 			return
 		}
-		p.DeletePBREntry(name)
+		p.observer.pbrEntryDeleted(v)
+		delete(p.entries, name)
 	}
 
 	// When key is not regiseterd.
-	p.entries[name] = *entry
-	p.observer.pbrEntryAdded(*entry)
+	p.entries[name] = entry
+	p.observer.pbrEntryAdded(entry)
 }
 
 // DeletePBREntry deletes PBREntry from PBR.

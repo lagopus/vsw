@@ -54,14 +54,14 @@ func (m *Metadata) SetOutVIF(vif VIFIndex) {
 	(*C.struct_vsw_packet_metadata)(m).common.out_vif = C.vifindex_t(vif)
 }
 
-// Get Local Flag.
-func (m *Metadata) Local() bool {
-	return bool((*C.struct_vsw_packet_metadata)(m).common.local)
+// Get KeepTTL Flag.
+func (m *Metadata) KeepTTL() bool {
+	return bool((*C.struct_vsw_packet_metadata)(m).common.keep_ttl)
 }
 
-// Set Local Flag.
-func (m *Metadata) SetLocal(l bool) {
-	(*C.struct_vsw_packet_metadata)(m).common.local = C.bool(l)
+// Get Encap Flag.
+func (m *Metadata) Encap() bool {
+	return bool((*C.struct_vsw_packet_metadata)(m).common.encap)
 }
 
 // Reset clears the metadata

@@ -85,9 +85,9 @@ gre_control_iface(__UNUSED void *priv, struct vsw_instance *base, void *p) {
     return false;
   }
 
-  TUNNEL_DEBUG("[%s]: cmd=%d address_type=%d local=%d remote=%d "
+  TUNNEL_DEBUG("[%s]: cmd=%d index=%d address_type=%d local=%d remote=%d "
                "hop_limit=%d tos=%d inbound_output=%p outbound_output=%p",
-               iface->base.name, param->cmd, param->address_type,
+               iface->base.name, param->cmd, param->index, param->address_type,
                param->local_addr.ip.ip4, param->remote_addr.ip.ip4,
                param->hop_limit, param->tos,
                param->inbound_output, param->outbound_output);
@@ -125,6 +125,7 @@ gre_control_iface(__UNUSED void *priv, struct vsw_instance *base, void *p) {
       iface->tos = param->tos;
       break;
     case L3TUN_CMD_SET_ENABLE:
+      iface->index = param->index;
       iface->address_type = param->address_type;
       iface->local_addr.ip.ip4 = rte_cpu_to_be_32(param->local_addr.ip.ip4);
       iface->remote_addr.ip.ip4 = rte_cpu_to_be_32(param->remote_addr.ip.ip4);
@@ -246,8 +247,15 @@ gre_decap(struct l3tun_iface *iface, struct rte_mbuf *mbuf) {
     return ret;
   }
 
-  // set local metadata
-  set_meta_local(mbuf);
+  // set keep_ttl metadata
+  set_meta_keep_ttl(mbuf);
+
+  // update in_vif
+  ret = set_meta_vif(mbuf, iface->index);
+  if (unlikely(ret != LAGOPUS_RESULT_OK)) {
+    TUNNEL_ERROR("[%s] update in_vif failed: %d", iface->base.name, ret);
+    return ret;
+  }
 
   return LAGOPUS_RESULT_OK;
 }
@@ -417,8 +425,9 @@ gre_encap(struct l3tun_iface *iface, struct rte_mbuf *mbuf) {
     return ret;
   }
 
-  // set local metadata
-  set_meta_local(mbuf);
+  // set encap, keep_ttl metadata
+  set_meta_encap(mbuf);
+  set_meta_keep_ttl(mbuf);
 
   return LAGOPUS_RESULT_OK;
 }

@@ -182,9 +182,6 @@ func (s *bridgeService) free() {
 	s.refcnt--
 	if s.refcnt == 0 {
 		s.stop()
-		for _, b := range s.bridges {
-			b.instance.Unregister()
-		}
 		s.runtime.Terminate()
 		s.rp.Free()
 		bs = nil
@@ -278,10 +275,6 @@ func (s *bridgeService) start() {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	if s.running {
-		return
-	}
-
 	s.running = true
 	go func() {
 		ticker := time.NewTicker(3 * time.Second)
@@ -300,7 +293,6 @@ func (s *bridgeService) start() {
 
 			case <-s.terminate:
 				ticker.Stop()
-				s.stop()
 				return
 
 			case b := <-s.dumpMACTable:
@@ -323,9 +315,8 @@ func (s *bridgeService) stop() {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	if !s.running {
-		s.terminate <- struct{}{}
-	}
+	s.terminate <- struct{}{}
+	s.running = false
 }
 
 var bridgeCount uint32 = 0
@@ -383,10 +374,6 @@ func newBridgeInstance(base *vswitch.BaseInstance, priv interface{}) (vswitch.In
 		macTableCh: make(chan []vswitch.BridgeMACEntry),
 	}
 
-	if err := s.registerBridge(b); err != nil {
-		return nil, err
-	}
-
 	b.param = (*C.struct_bridge_instance)(C.calloc(1, C.sizeof_struct_bridge_instance))
 	b.param.base.name = C.CString(base.Name())
 	b.param.base.input = (*C.struct_rte_ring)(unsafe.Pointer(base.Input()))
@@ -406,15 +393,21 @@ func newBridgeInstance(base *vswitch.BaseInstance, priv interface{}) (vswitch.In
 
 	b.instance = bi
 
+	if err := s.registerBridge(b); err != nil {
+		return nil, err
+	}
+
 	return b, nil
 }
 
 func (b *BridgeInstance) Free() {
+	b.service.unregisterBridge(b)
+
 	if b.instance != nil {
 		b.instance.Unregister()
 	}
 
-	b.service.unregisterBridge(b)
+	b.service.free()
 
 	C.free(unsafe.Pointer(b.param.base.name))
 	C.free(unsafe.Pointer(b.param.base.outputs))

@@ -28,6 +28,7 @@ import (
 	"fmt"
 
 	"github.com/lagopus/vsw/agents/debugsh"
+	"github.com/lagopus/vsw/vswitch"
 )
 
 type routerServiceStat struct {
@@ -35,11 +36,7 @@ type routerServiceStat struct {
 	RefCnt  uint `json:"reference_count"`
 }
 
-func routerDebugStat(rs *routerService, args ...string) (interface{}, error) {
-	return &routerServiceStat{rs.running, rs.refcnt}, nil
-}
-
-func routerDebugList(rs *routerService, args ...string) (interface{}, error) {
+func routerList(rs *routerService) []string {
 	rs.mutex.Lock()
 	defer rs.mutex.Unlock()
 
@@ -48,12 +45,20 @@ func routerDebugList(rs *routerService, args ...string) (interface{}, error) {
 		routers = append(routers, r.base.Name())
 	}
 
-	return routers, nil
+	return routers
+}
+
+func routerDebugStat(rs *routerService, args ...string) (interface{}, error) {
+	return &routerServiceStat{rs.running, rs.refcnt}, nil
+}
+
+func routerDebugList(rs *routerService, args ...string) (interface{}, error) {
+	return routerList(rs), nil
 }
 
 type routerInfo struct {
 	Name         string            `json:"name"`
-	VRFIndex     uint64            `json:"vrf-index"`
+	VRFIndex     vswitch.VRFIndex  `json:"vrf-index"`
 	ControlCount uint              `json:"control_count"`
 	ControlError uint              `json:"control_error"`
 	RouterRing   []*routerRingInfo `json:"output_ring"`
@@ -67,36 +72,86 @@ type routerRingInfo struct {
 	Dropped uint64 `json:"dropped"`
 }
 
+type routerNeighborCacheInfo struct {
+	Address   string `json:"address"`
+	HWAddress string `json:"hw-address"`
+	Interface string `json:"interface"`
+	Valid     bool   `json:"valid"`
+	Used      bool   `json:"used"`
+}
+
 func routerShowStat(rs *routerService, args ...string) (interface{}, error) {
 	if len(args) == 0 {
-		routers, _ := routerDebugList(rs)
-		return nil, fmt.Errorf("Usage: show <router> (router(s): %v)", routers)
+		return nil, fmt.Errorf("Usage: show 'router_name' (%v)", routerList(rs))
 	}
 
-	for _, r := range rs.routers {
-		if r.base.Name() != args[0] {
-			continue
+	ri := rs.getRouterInstance(args[0])
+	if ri == nil {
+		return nil, errors.New("No such router: " + args[0])
+	}
+
+	// Returns basic router status info
+	rinfo := &routerInfo{ri.base.Name(), ri.vrfidx, ri.ctrls, ri.ctrlsErr, nil}
+
+	for i := 0; i < int(ri.param.rr_count); i++ {
+		rr := ri.param.rrp[i]
+		rri := &routerRingInfo{
+			Name:    C.GoString(&rr.ring.name[0]),
+			RefCnt:  uint(rr.rc),
+			Count:   uint(rr.count),
+			Sent:    uint64(rr.sent),
+			Dropped: uint64(rr.dropped),
 		}
+		rinfo.RouterRing = append(rinfo.RouterRing, rri)
+	}
 
-		ri := &routerInfo{r.base.Name(), r.vrfidx, r.ctrls, r.ctrlsErr, nil}
-		ctx := r.param.ctx
+	return rinfo, nil
+}
 
-		for i := 0; i < int(ctx.rr_count); i++ {
-			rr := ctx.rrp[i]
-			rri := &routerRingInfo{
-				Name:    C.GoString(&rr.ring.name[0]),
-				RefCnt:  uint(rr.rc),
-				Count:   uint(rr.count),
-				Sent:    uint64(rr.sent),
-				Dropped: uint64(rr.dropped),
+func routerShowNeighbor(rs *routerService, args ...string) (interface{}, error) {
+	if len(args) == 0 {
+		return nil, fmt.Errorf("Usage: neigh 'router_name' (%v)", routerList(rs))
+	}
+
+	ri := rs.getRouterInstance(args[0])
+	if ri == nil {
+		return nil, errors.New("No such router: " + args[0])
+	}
+
+	// Returns neighbor cache
+	var ncinfo []*routerNeighborCacheInfo
+	ri.mutex.Lock()
+	for vif, nc := range ri.neighborCaches {
+		iface := vif.Name()
+		for _, entry := range nc {
+			if !entry.valid && !entry.used {
+				continue
 			}
-			ri.RouterRing = append(ri.RouterRing, rri)
+
+			addr := fmt.Sprintf("%d.%d.%d.%d",
+				(entry.addr>>24)&0xff, (entry.addr>>16)&0xff,
+				(entry.addr>>8)&0xff, entry.addr&0xff)
+
+			hwaddr := fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x",
+				entry.mac_addr.addr_bytes[0], entry.mac_addr.addr_bytes[1],
+				entry.mac_addr.addr_bytes[2], entry.mac_addr.addr_bytes[3],
+				entry.mac_addr.addr_bytes[4], entry.mac_addr.addr_bytes[5])
+
+			info := &routerNeighborCacheInfo{
+				Address:   addr,
+				HWAddress: hwaddr,
+				Interface: iface,
+				Used:      bool(entry.used),
+				Valid:     bool(entry.valid),
+			}
+
+			ncinfo = append(ncinfo, info)
 		}
-
-		return ri, nil
 	}
+	ri.mutex.Unlock()
 
-	return nil, errors.New("No such router: " + args[0])
+	return ncinfo, nil
+
 }
 
 type debugCmdFn func(rs *routerService, args ...string) (interface{}, error)
@@ -109,9 +164,10 @@ type routerDebugCmd struct {
 var routerDebugHelp []string
 
 var routerCmds = map[string]routerDebugCmd{
-	"stat": {"show status of router service", routerDebugStat},
-	"list": {"list router instances", routerDebugList},
-	"show": {"show status of the specified router", routerShowStat},
+	"stat":  {"show status of router service", routerDebugStat},
+	"list":  {"list router instances", routerDebugList},
+	"show":  {"show status of the specified router", routerShowStat},
+	"neigh": {"show neighbor cache of the specified router", routerShowNeighbor},
 }
 
 func (rs *routerService) ModuleShow(args ...string) (interface{}, error) {

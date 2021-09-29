@@ -23,14 +23,19 @@
  * A set data type
  */
 
+struct set_value {
+	void *value;
+	int rc;
+};
+
 struct set {
-	void **val;
+	struct set_value *sv;
 	int len;
 	int cap;
 };
 
 #define SET_COUNT(s) ((s)->len)
-#define SET_VALUE_AT(s, n) ((s)->val[(n)])
+#define SET_VALUE_AT(s, n) ((s)->sv[(n)].value)
 
 struct set *
 set_new() {
@@ -40,8 +45,10 @@ set_new() {
 void
 set_free(struct set *set) {
 	if (set != NULL) {
-		if (set->val != NULL)
-			free(set->val);
+		if (set->sv != NULL) {
+			free(set->sv);
+			set->sv = NULL;
+		}
 		free(set);
 	}
 }
@@ -49,10 +56,10 @@ set_free(struct set *set) {
 static bool
 set_expand(struct set *set, size_t size) {
 	int cap = set->cap + size;
-	void *p = realloc(set->val, sizeof(void *) * cap);
+	void *p = realloc(set->sv, sizeof(struct set_value) * cap);
 	if (p == NULL)
 		return false;
-	set->val = p;
+	set->sv  = p;
 	set->cap = cap;
 
 	return true;
@@ -62,41 +69,49 @@ bool
 set_insert(struct set *set, void *value) {
 	/*
 	 * Check if we already have duplicated entry.
-	 * If so, we simply return true.
+	 * If so, we increment ref count and return true.
 	 */
 	for (int i = 0; i < set->len; i++)
-		if (set->val[i] == value)
+		if (set->sv[i].value == value) {
+			set->sv[i].rc++;
 			return true;
+		}
 
 	/*
 	 * Check if we have enough space.
 	 */
 	if (set->len == set->cap) {
 		// XXX: Need better strategy to expand the set.
-		if (!set_expand(set, 8))
+		if (!set_expand(set, 1))
 			return false;
 	}
 
-	set->val[set->len++] = value;
+	set->sv[set->len].value = value;
+	set->sv[set->len].rc    = 1;
+	set->len++;
 	return true;
 }
 
 void *
 set_value_at(struct set *set, unsigned pos) {
-	return (set->len > pos) ? set->val[pos] : NULL;
+	return (set->len > pos) ? set->sv[pos].value : NULL;
 }
 
 void *
 set_get_first(struct set *set) {
-	return (set->len > 0) ? set->val[0] : NULL;
+	return (set->len > 0) ? set->sv[0].value : NULL;
 }
 
 static bool
 set_delete(struct set *set, void *value) {
 	for (int i = 0; i < set->len; i++) {
-		if (set->val[i] == value) {
-			set->len--;
-			set->val[i] = set->val[set->len];
+		if (set->sv[i].value == value) {
+			set->sv[i].rc--;
+
+			if (set->sv[i].rc == 0) {
+				set->len--;
+				set->sv[i] = set->sv[set->len];
+			}
 			return true;
 		}
 	}
@@ -104,13 +119,13 @@ set_delete(struct set *set, void *value) {
 }
 
 static void
-set_dump(struct set *set, const char *(*stringer)(void *p)) {
+set_dump(struct set *set, stringer stringer) {
 	if (set != NULL) {
 		putchar('[');
 		for (int i = 0; i < set->len; i++) {
 			if (i > 0)
 				printf(", ");
-			printf("%s", stringer(set->val[i]));
+			printf("%s (rc:%d)", stringer(set->sv[i].value), set->sv[i].rc);
 		}
 		putchar(']');
 	}
@@ -130,7 +145,7 @@ struct node {
 };
 
 struct rt {
-	struct node root;
+	struct node *root;
 	int ptr;
 	int len;
 	int n;
@@ -147,17 +162,22 @@ new_node(struct node *p) {
 	return node;
 }
 
-struct rt *
-rt_new() {
-	return (struct rt *)calloc(1, sizeof(struct rt));
-}
-
 static void
 delete_node(struct node *node) {
 	if (node != NULL) {
 		set_free(node->values);
+		node->values = NULL;
 		free(node);
 	}
+}
+
+static void
+free_node(struct node *node) {
+	if (!node)
+		return;
+	free_node(node->nodes[0]);
+	free_node(node->nodes[1]);
+	delete_node(node);
 }
 
 static void
@@ -236,31 +256,24 @@ match_key(struct node *p, uint32_t key) {
 #endif
 }
 
+struct rt *
+rt_new() {
+	return (struct rt *)calloc(1, sizeof(struct rt));
+}
+
 void
 rt_free(struct rt *rt) {
 	if (!rt)
 		return;
-
-	struct node *p = &rt->root;
-	while (p) {
-		if (p->nodes[0]) {
-			p = p->nodes[0];
-			continue;
-		}
-		if (p->nodes[1]) {
-			p = p->nodes[1];
-			continue;
-		}
-		struct node *t = p;
-		p = p->parent;
-		delete_node(t);
-	}
+	free_node(rt->root);
 	free(rt);
 }
 
 struct set *
 rt_alloc_node(struct rt *rt, uint32_t key, uint32_t len) {
-	struct node *p = &rt->root;
+	if (rt->root == NULL)
+		rt->root = (struct node *)calloc(1, sizeof(struct node));
+	struct node *p = rt->root;
 
 	while (len > 0) {
 		int b = key >> 31;
@@ -275,11 +288,6 @@ rt_alloc_node(struct rt *rt, uint32_t key, uint32_t len) {
 		p = p->nodes[b];
 
 		int matched_len = match_key(p, key);
-
-		if (matched_len == len) {
-			// we have to insert value in this node.
-			break;
-		}
 
 		if (matched_len > len) {
 			// we have to split the node.
@@ -298,6 +306,11 @@ rt_alloc_node(struct rt *rt, uint32_t key, uint32_t len) {
 			//
 			// and continue traversal
 			p = split_node(p, matched_len, b);
+		}
+
+		if (matched_len == len) {
+			// we have to insert value in this node.
+			break;
 		}
 
 		// we have to traverse the node
@@ -331,7 +344,10 @@ append_result(struct rt *rt, struct node *p) {
 
 int
 rt_search_key(struct rt *rt, uint32_t key, uint32_t len) {
-	struct node *p = &rt->root;
+	if (rt->root == NULL)
+		return 0;
+
+	struct node *p = rt->root;
 	int count;
 
 	rt->ptr = rt->len = rt->n = 0;
@@ -389,7 +405,10 @@ rt_iterate_results(struct rt *rt, void **value) {
 
 bool
 rt_delete_key(struct rt *rt, uint32_t key, uint32_t len, void *value) {
-	struct node *p = &rt->root;
+	if (rt->root == NULL)
+		return false;
+
+	struct node *p = rt->root;
 
 	while (len > 0) {
 		int b = key >> 31;
@@ -417,16 +436,22 @@ rt_delete_key(struct rt *rt, uint32_t key, uint32_t len, void *value) {
 
 	// check if we should delete this node.
 	if (SET_COUNT(p->values) == 0) {
+		struct node *parent;
+
 		if (p->nodes[0] == NULL && p->nodes[1] == NULL) {
 			// no children. this node can be deleted safely.
 			if (p->parent != NULL)
 				p->parent->nodes[p->key >> 31] = NULL;
+			parent = p->parent;
 			delete_node(p);
+			if (p == rt->root)
+				rt->root = NULL;
 		} else {
 			p = check_and_merge_if_needed(p);
+			parent = p->parent;
 		}
 
-		check_and_merge_if_needed(p->parent);
+		check_and_merge_if_needed(parent);
 	}
 
 	return true;
@@ -456,27 +481,33 @@ chp2str(void *p) {
 }
 
 static void
-dump(struct node *node, int n) {
+dump(struct node *node, int n, stringer s) {
 	if (node != NULL) {
 		for (int i = 0; i < n; i++)
 			putchar(' ');
 		print_key(node);
 		printf(": ");
-		set_dump(node->values, chp2str);
+		set_dump(node->values, s);
 		putchar('\n');
 
 		if (node->nodes[0])
-			dump(node->nodes[0], n + 1);
+			dump(node->nodes[0], n + 1, s);
 
 		if (node->nodes[1])
-			dump(node->nodes[1], n + 1);
+			dump(node->nodes[1], n + 1, s);
 	}
 }
 
 void
 rt_dump(struct rt *rt) {
-	dump(&rt->root, 0);
+	dump(rt->root, 0, chp2str);
 }
+
+void
+rt_dump2(struct rt *rt, stringer s) {
+	dump(rt->root, 0, s);
+}
+
 
 struct key {
 	uint32_t key;

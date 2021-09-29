@@ -17,6 +17,7 @@
 package pfkey
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"io"
@@ -114,6 +115,7 @@ type SadbBaseMsg struct {
 }
 
 func (s *SadbBaseMsg) getMsgMap() msgMap {
+	*s = SadbBaseMsg{} // clear pointers
 	return msgMap{
 		SADB_EXT_SA:               &s.Sa,
 		SADB_EXT_LIFETIME_CURRENT: &s.CurrentLifetime,
@@ -155,34 +157,68 @@ func (m MsgMux) ParseHandle(t uint8, p ParseHandler) {
 	m[t] = p
 }
 
+func (s *SadbMsg) sendError(w io.Writer, errno uint8) {
+	s.SadbMsgErrno = errno
+	smsg := SadbMsgTransport{
+		SadbMsg: s,
+	}
+	_ = smsg.Serialize(w)
+}
+
 // HandlePfkey handles pfkey messages with MsgMux.
 func HandlePfkey(r io.Reader, w io.Writer, msgMux MsgMux) (*SadbMsg, error) {
 	if msgMux == nil {
 		return nil, syscall.EINVAL
 	}
-	b := make([]byte, PfkeyBufferLen)
-	l, err := io.ReadAtLeast(r, b, SadbMsgLen)
-	if err != nil {
+	// assume to keep message boundary, on each pfkey messages.
+	br := bufio.NewReader(r)
+	// read SadbMsg head
+	sb := make([]byte, SadbMsgLen)
+	n, err := br.Read(sb) // one read, one pfkey message.
+	if n != len(sb) || err != nil {
+		// error log only.
+		log.Logger.Err("err %#v", err)
+		if err == nil {
+			return nil, fmt.Errorf("message length err: %d", n)
+		}
 		return nil, err
 	}
-	log.Logger.Info("smsg: len: %d %#v", l, b[:SadbMsgLen])
 	s := SadbMsg{}
-	err = s.Deserialize(bytes.NewBuffer(b[:SadbMsgLen]))
+	err = s.Deserialize(bytes.NewBuffer(sb))
 	if err != nil {
+		// error log only.
 		log.Logger.Err("err %#v", err)
 		return nil, err
 	}
-	// TODO: sadb msg checking.
-	buf := bytes.NewBuffer(b[SadbMsgLen:toByteLen(s.SadbMsgLen)])
-	log.Logger.Info("received sadb msg: %s len: %d seq: %d pid: %d",
-		SadbMsgTypes[s.SadbMsgType], toByteLen(s.SadbMsgLen), s.SadbMsgSeq, s.SadbMsgPid)
-	log.Logger.Info("sadb msg base:")
-	log.Logger.Info("%#v", b[SadbMsgLen:toByteLen(s.SadbMsgLen)])
+	if s.SadbMsgVersion != PF_KEY_V2 {
+		s.sendError(w, uint8(syscall.EINVAL))
+		log.Logger.Err("invalid pfkey version: %d != %d", PF_KEY_V2, s.SadbMsgVersion)
+		return nil, syscall.EINVAL
+	}
+	log.Logger.Info("base header: len: %d %#v", toByteLen(s.SadbMsgLen), sb)
+
+	// read SadbMsg body
+	eb := make([]byte, toByteLen(s.SadbMsgLen)-SadbMsgLen)
+	n, err = br.Read(eb)
+	if n != len(eb) || err != nil {
+		log.Logger.Err("invalid packet length: %d", n)
+		s.sendError(w, uint8(syscall.EINVAL))
+		return nil, fmt.Errorf("message length err: %d", n)
+	}
+
+	log.Logger.Info("extensions:")
+	log.Logger.Info("%#v", eb)
+
 	smsg, ok := msgMux[s.SadbMsgType]
 	if !ok {
 		log.Logger.Err("don't support type %d", s.SadbMsgType)
 		return nil, fmt.Errorf("don't support type %d", s.SadbMsgType)
 	}
+
+	log.Logger.Info("received sadb msg: %s len: %d seq: %d pid: %d",
+		SadbMsgTypes[s.SadbMsgType], toByteLen(s.SadbMsgLen), s.SadbMsgSeq, s.SadbMsgPid)
+
+	buf := bytes.NewBuffer(eb)
 	err = smsg.Parse(buf)
 	if err != nil {
 		log.Logger.Err("parse err: %v", err)

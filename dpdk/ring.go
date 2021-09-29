@@ -75,6 +75,14 @@ func (r *Ring) Dequeue(objp *unsafe.Pointer) int {
 	return int(C.rte_ring_dequeue((*C.struct_rte_ring)(r), objp))
 }
 
+func (r *Ring) SPEnqueue(obj unsafe.Pointer) int {
+	return int(C.rte_ring_sp_enqueue((*C.struct_rte_ring)(r), obj))
+}
+
+func (r *Ring) SCDequeue(objp *unsafe.Pointer) int {
+	return int(C.rte_ring_sc_dequeue((*C.struct_rte_ring)(r), objp))
+}
+
 func (r *Ring) EnqueueMbuf(mbuf *Mbuf) int {
 	return r.Enqueue(unsafe.Pointer(mbuf))
 }

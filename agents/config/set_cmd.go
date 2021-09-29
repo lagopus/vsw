@@ -304,6 +304,8 @@ const (
 
 	ifEthernet
 
+	pbrSelf
+	pbrNexthop
 	pbrPriority
 	pbrSrcIP
 	pbrDstIP
@@ -408,6 +410,8 @@ func (o ocdcType) String() string {
 		ifSubTunnel:         "ifSubTunnel",
 		ifEthernet:          "ifEthernet",
 
+		pbrSelf:           "pbrSelf",
+		pbrNexthop:        "pbrNexthop",
 		pbrPriority:       "pbrPriority",
 		pbrSrcIP:          "pbrSrcIP",
 		pbrDstIP:          "pbrDstIP",
@@ -725,6 +729,12 @@ func procPBRNextHop(v interface{}, key ocdcType, args []interface{}) (interface{
 	oc := (v).(*openconfig)
 	ni := oc.getNetworkInstance(args[0].(string))
 	p := ni.getPBREntry(args[1].(string))
+
+	if key == pbrPass {
+		p.pass = args[2].(string)
+		return ni, nil
+	}
+
 	nh := p.getNexthopEntry(args[2].(string))
 
 	switch key {
@@ -736,8 +746,6 @@ func procPBRNextHop(v interface{}, key ocdcType, args []interface{}) (interface{
 		nh.weight = uint32(args[3].(int))
 	case pbrNexthopIF:
 		nh.outInterface = fmt.Sprintf("%s-%d", args[3].(string), args[4].(int))
-	case pbrPass:
-		nh.action = vswitch.PBRActionPass
 	default:
 		return nil, ocdcTypeUnexpectedError(key)
 	}
@@ -910,11 +918,10 @@ type vlan struct {
 
 // nexthop entry
 type nh struct {
-	nhNI         string            // nexthop: ni name
-	addr         vswitch.IPAddr    // nexthop: nexthop address
-	weight       uint32            // nexthop: nexthop weight
-	outInterface string            // nexthop: output interface
-	action       vswitch.PBRAction // nexthop: action type
+	nhNI         string         // nexthop: ni name
+	addr         vswitch.IPAddr // nexthop: nexthop address
+	weight       uint32         // nexthop: nexthop weight
+	outInterface string         // nexthop: output interface
 }
 
 // pbr entry
@@ -926,6 +933,7 @@ type pe struct {
 	dstPort     *vswitch.PortRange // rule: dst port range
 	inInterface string             // rule: input interface
 	protocol    vswitch.IPProto    // rule: protorcol
+	pass        string             // rule: pass
 	nhs         map[string]*nh
 }
 
@@ -1189,6 +1197,17 @@ func (t *tunnel) setTOS(tos int) {
 
 func (t *tunnel) setVRF(vrf string) {
 	t.vrf = vrf
+}
+
+func (t *tunnel) deleteRemoteAddress(ip net.IP) {
+	for i, addr := range t.remotes {
+		if addr.Equal(ip) {
+			t.remotes[i] = t.remotes[len(t.remotes)-1]
+			t.remotes[len(t.remotes)-1] = nil
+			t.remotes = t.remotes[:len(t.remotes)-1]
+			return
+		}
+	}
 }
 
 func (t *l2tunnel) setVNI(vni int) {
@@ -1538,6 +1557,10 @@ func (n *ni) getPBREntry(name string) *pe {
 	return pbr
 }
 
+func (n *ni) deletePBREntry(name string) {
+	delete(n.pbr, name)
+}
+
 func (p *pe) getNexthopEntry(name string) *nh {
 	if p.nhs == nil {
 		p.nhs = make(map[string]*nh)
@@ -1550,6 +1573,19 @@ func (p *pe) getNexthopEntry(name string) *nh {
 	}
 
 	return nexthop
+}
+
+func (p *pe) deleteNexthopEntry(nh string) {
+	if nh == p.pass {
+		p.pass = ""
+	} else {
+		delete(p.nhs, nh)
+	}
+}
+
+// Pass returns if the action is to use the default routing
+func (p *pe) Pass() bool {
+	return p.pass != ""
 }
 
 func (i *iface) String() string {

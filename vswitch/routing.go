@@ -67,6 +67,10 @@ func (n *Nexthop) MarshalJSON() ([]byte, error) {
 	return json.Marshal(m)
 }
 
+func (n *Nexthop) Equal(t *Nexthop) bool {
+	return n.Weight == t.Weight && n.Dev == t.Dev && n.Gw.Equal(t.Gw)
+}
+
 // Route represents a routing entry.
 type Route struct {
 	Dst      *net.IPNet   // Destination

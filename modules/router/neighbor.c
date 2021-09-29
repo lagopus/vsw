@@ -19,165 +19,66 @@
  *      @brief  Neighbor table use dpdk hash.
  */
 
+#include <assert.h>
 #include <inttypes.h>
-#include <rte_errno.h>
-#include <rte_malloc.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include <rte_errno.h>
+#include <rte_malloc.h>
+#include <rte_hash_crc.h>
+
 #include "neighbor.h"
 #include "router_log.h"
-
-static void
-print_neighbor_entry(char *str, neighbor_t *neigh) {
-	if (!neigh)
-		return;
-
-	ROUTER_DEBUG("[NEIGH] %s: ip: %s, mac: %s, state: %d, ifindex: %d\n",
-		     str, ip2str(neigh->ip_addr),
-		     mac2str(neigh->mac_addr), neigh->state, neigh->ifindex);
-}
-
-static void
-print_neighbor_list(struct neighbor_table *nt) {
-	neighbor_t *neigh;
-	uint32_t *idx;
-	uint32_t next = 0;
-
-	while (rte_hash_iterate(nt->hashmap, (const void **)&idx,
-				(void **)&neigh, &next) >= 0) {
-		print_neighbor_entry("List", neigh);
-	}
-}
-
-/**
- * Clean neighbor table.
- */
-static void
-neighbor_table_clean(struct neighbor_table *nt) {
-	uint32_t *ip;
-	neighbor_t *entry;
-	uint32_t next = 0;
-	uint32_t removed = 0; // For debug.
-
-	while (rte_hash_iterate(nt->hashmap, (const void **)&ip,
-				(void **)&entry, &next) >= 0) {
-		rte_hash_del_key(nt->hashmap, ip);
-		rte_free(entry);
-		removed++;
-	}
-
-	// For debug.
-	if (removed > 0) {
-		ROUTER_DEBUG("[NEIGH] Free %d entries.\n", removed);
-	} else {
-		ROUTER_INFO("[NEIGH] Couldn't free entry, all entry valid.\n");
-		// Flush neighbor table
-		rte_hash_reset(nt->hashmap);
-	}
-}
-
-/**
- * Create neighbor.
- */
-static neighbor_t *
-neighbor_create(struct neighbor_entry *ne) {
-	neighbor_t *neigh = rte_zmalloc(NULL, sizeof(neighbor_t), 0);
-	if (!neigh) {
-		ROUTER_ERROR("[NEIGH] rte_zmalloc() failed.");
-		return NULL;
-	}
-
-	// Set neighbor
-	neigh->ip_addr = ne->ip;
-	ether_addr_copy(&(ne->mac), &(neigh->mac_addr));
-	neigh->state = ne->state;
-	neigh->ifindex = ne->ifindex;
-
-	return neigh;
-}
-
-/**
- * Add neighbor to hash table.
- */
-static bool
-neighbor_add(struct neighbor_table *nt, neighbor_t *neigh) {
-	if (nt->neighbor_num > IPV4_MAX_NEXTHOPS)
-		neighbor_table_clean(nt);
-
-	int ret = rte_hash_add_key_data(nt->hashmap, &neigh->ip_addr, neigh);
-	// No space in the hash for this key.
-	if (ret == -ENOSPC) {
-		ROUTER_INFO("[NEIGH] Failed to add neighbor entry, hashtable is full.\n");
-		// Free unused entries.
-		neighbor_table_clean(nt);
-		// To add again.
-		neighbor_add(nt, neigh);
-	}
-	// Parameters are invalid.
-	else if (ret == -EINVAL) {
-		ROUTER_ERROR("[NEIGH] Failed to add neighbor entry, invalid arguments.");
-		return false;
-	}
-
-	nt->neighbor_num++;
-	return true;
-}
 
 /**
  * Get neighbor from neighbor hash table.
  */
-neighbor_t *
-neighbor_entry_get(struct neighbor_table *nt, uint32_t ip) {
-	neighbor_t *neigh;
-	int ret = rte_hash_lookup_data(nt->hashmap,
-				       (const void *)&(ip),
-				       (void **)&neigh);
-	// No entry
+struct neighbor *
+neighbor_entry_get(struct neighbor_table *nt, uint32_t target) {
+	int32_t ret = rte_hash_lookup(nt->hashmap, &target);
+
 	if (unlikely(ret == -ENOENT)) {
-		// no neighbor entry
-		ROUTER_DEBUG("[NEIGH] no neighbor entry. ip = %s\n", ip2str(ip));
-		return NULL;
-	}
-	// Lookup failed
-	if (ret < 0) {
-		ROUTER_ERROR("[NEIGH] rte_hash_lookup_data() failed, err = %d.", ret);
-		return false;
+		ret = rte_hash_add_key(nt->hashmap, &target);
+		if (ret == -ENOSPC) {
+			// TODO: Do GC. Quit for now.
+			ROUTER_DEBUG("[NEIGH] no space for %02x.%02x.%02x.%02x",
+				     (target >> 24) & 0xff, (target >> 16) & 0xff,
+				     (target >>  8) & 0xff, target & 0xff);
+			return NULL;
+		}
+		nt->cache[ret].addr = target;
 	}
 
-	return neigh;
+	assert(ret >= 0);
+
+	nt->cache[ret].used = true;
+
+	return &nt->cache[ret];
 }
 
 /**
  * Delete entry from hash table.
  */
 bool
-neighbor_entry_delete(struct neighbor_table *nt, struct neighbor_entry *entry) {
-	neighbor_t *neigh;
-	/* free entry data. */
-	int ret = rte_hash_lookup_data(nt->hashmap, &(entry->ip), (void **)&neigh);
-	// No entry
-	if (unlikely(ret == -ENOENT)) {
-		// TODO: If ret is -EINVAL, should panic.
-		ROUTER_INFO("[NEIGH] neighbor entry free failed.(key:%s, ret:%d).",
-			    ip2str(entry->ip), ret);
-		return NULL;
-	}
-	// Lookup failed
+neighbor_entry_delete(struct neighbor_table *nt, uint32_t target) {
+	int32_t ret = rte_hash_del_key(nt->hashmap, &target);
+
 	if (ret < 0) {
-		ROUTER_ERROR("[NEIGH] rte_hash_lookup_data() failed, err = %d.", ret);
+		ROUTER_ERROR("[NEIGH] can't delete %02x.%02x.%02x.%02x",
+			     (target >> 24) & 0xff, (target >> 16) & 0xff,
+			     (target >>  8) & 0xff, target & 0xff);
 		return false;
 	}
 
-	if (neigh) {
-		if (rte_hash_del_key(nt->hashmap, &(entry->ip)) < 0) {
-			ROUTER_ERROR("[NEIGH] not found neighbor.");
-			return false;
-		}
-		rte_free(neigh);
-	}
+	// ARP resolution may have failed. Free pending mbuf.
+	struct rte_mbuf *mbuf = nt->cache[ret].pending;
+	if (mbuf)
+		rte_pktmbuf_free(mbuf);
+
+	memset(&nt->cache[ret], 0, sizeof(struct neighbor));
 
 	return true;
 }
@@ -185,59 +86,60 @@ neighbor_entry_delete(struct neighbor_table *nt, struct neighbor_entry *entry) {
 /**
  * Add entry to hash table.
  */
-bool
+struct neighbor *
 neighbor_entry_update(struct neighbor_table *nt, struct neighbor_entry *entry) {
-	// Check if entry is exist in arp table.
-	neighbor_t *neigh;
-	int ret = rte_hash_lookup_data(nt->hashmap, &(entry->ip), (void **)&neigh);
-	// No entry
-	if (unlikely(ret == -ENOENT)) {
-		neighbor_t *ne = neighbor_create(entry);
-		if (!ne)
-			return false;
-		neighbor_add(nt, ne);
-		print_neighbor_list(nt);
-		return true;
-	}
-	// Lookup failed
-	if (ret < 0) {
-		ROUTER_ERROR("[NEIGH] rte_hash_lookup_data() failed, err = %d.", ret);
-		return false;
-	}
+	struct neighbor *ne = neighbor_entry_get(nt, entry->ip);
 
-	// Entry exists.
-	ether_addr_copy(&(entry->mac), &(neigh->mac_addr));
-	neigh->state = entry->state;
-	print_neighbor_list(nt);
-	return true;
+	if (ne == NULL)
+		return NULL;
+
+	ne->mac_addr = entry->mac;
+	ne->valid    = true;
+	ne->used     = false;
+
+	return ne;
+}
+
+static uint32_t
+neighbor_hash(const void *key, uint32_t key_len, uint32_t init_val) {
+	return rte_hash_crc_4byte(*(uint32_t *)key, init_val);
 }
 
 /**
  * Initialize neighbor table.
  */
 struct neighbor_table *
-neighbor_init(const char *name) {
+neighbor_init(vifindex_t vif) {
 	struct neighbor_table *nt;
 	if (!(nt = rte_zmalloc(NULL, sizeof(struct neighbor_table), 0))) {
-		ROUTER_ERROR("router: %s: neighbor table rte_zmalloc() failed.", name);
+		ROUTER_ERROR("[NEIGH] table alloc failed for VIF %d", vif);
+		return NULL;
+	}
+
+	nt->cache_size = ROUTER_MAX_NEIGHBOR_ENTRIES;
+	if (!(nt->cache = rte_zmalloc(NULL, sizeof(struct neighbor) * nt->cache_size, 0))) {
+		ROUTER_ERROR("[NEIGH] cache alloc failed for VIF %d", vif);
+		rte_free(nt);
 		return NULL;
 	}
 
 	// Create hashmap
 	char hash_name[RTE_HASH_NAMESIZE];
-	snprintf(hash_name, sizeof(hash_name), "neighbor_%s", name);
-	ROUTER_DEBUG("[NEIGH] (%s) neighbor table name: %s\n", name, hash_name);
+	snprintf(hash_name, sizeof(hash_name), "neigh_vif_%d", vif);
+
 	struct rte_hash_parameters hash_params = {
 	    .name = hash_name,
-	    .entries = IPV4_MAX_NEXTHOPS, // TODO: MAX number of neigbor entries.
+	    .entries = nt->cache_size,
 	    .key_len = sizeof(uint32_t),
-	    .hash_func = rte_jhash,
+	    .hash_func = neighbor_hash,
 	    .hash_func_init_val = 0,
 	    .socket_id = rte_socket_id(),
 	};
-	nt->hashmap = rte_hash_create(&hash_params);
-	if (!nt->hashmap) {
-		ROUTER_ERROR("[NEIGH] Error allocating hash table");
+
+	if (!(nt->hashmap = rte_hash_create(&hash_params))) {
+		ROUTER_ERROR("[NEIGH] hash table alloc failed for VIF %d: %s",
+			     vif, rte_strerror(rte_errno));
+		rte_free(nt->cache);
 		rte_free(nt);
 		return NULL;
 	}
@@ -253,7 +155,7 @@ neighbor_fini(struct neighbor_table *nt) {
 	if (!nt)
 		return;
 	uint32_t *ip;
-	neighbor_t *entry;
+	struct neighbor *entry;
 	uint32_t next = 0;
 	// Free all entries.
 	while (rte_hash_iterate(nt->hashmap, (const void **)&ip,
@@ -263,5 +165,6 @@ neighbor_fini(struct neighbor_table *nt) {
 	// Destroy hashmap for neighbor table.
 	if (nt->hashmap)
 		rte_hash_free(nt->hashmap);
+	rte_free(nt->cache);
 	rte_free(nt);
 }

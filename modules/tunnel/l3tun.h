@@ -38,6 +38,7 @@ typedef enum {
 
 struct l3tun_iface {
   struct vsw_instance base;
+  vifindex_t index;
   uint16_t address_type;
   struct ip_addr local_addr;
   struct ip_addr remote_addr;
@@ -65,6 +66,7 @@ typedef struct l3tun_iface_list l3tun_iface_list_t;
 
 struct l3tun_control_param {
   l3tun_cmd_t cmd;
+  vifindex_t index;
   uint16_t address_type;
   struct ip_addr local_addr;
   struct ip_addr remote_addr;

@@ -396,13 +396,13 @@ l2gre_decap(struct l2tun_iface *iface, struct rte_mbuf *mbuf,
   // set inner packet bytes(for stats)
   set_meta_inner_pkt_bytes(mbuf);
 
-  // set local metadata
-  set_meta_local(mbuf);
+  // set keep_ttl metadata
+  set_meta_keep_ttl(mbuf);
 
   // update in_vif
   vlan = iface->vlans[*output_vid];
   if (vlan != NULL) {
-    ret = l2tun_set_meta_vif(mbuf, vlan->index);
+    ret = set_meta_vif(mbuf, vlan->index);
     if (unlikely(ret != LAGOPUS_RESULT_OK)) {
       TUNNEL_ERROR("[%s] update in_vif failed: %d", iface->base.name, ret);
       return ret;
@@ -659,8 +659,9 @@ l2gre_encap(struct l2tun_iface *iface, struct rte_mbuf **m,
     return ret;
   }
 
-  // set local metadata
-  set_meta_local(mbuf);
+  // set encap, keep_ttl metadata
+  set_meta_encap(mbuf);
+  set_meta_keep_ttl(mbuf);
 
   // for debug
   //rte_pktmbuf_dump(stdout, mbuf, sizeof(struct rte_mbuf));

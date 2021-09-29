@@ -196,6 +196,10 @@ func (v *VRF) baseInstance() *BaseInstance {
 	return v.router.base
 }
 
+func (v *VRF) Router() RouterInstance {
+	return v.router.instance
+}
+
 func (v *VRF) IsEnabled() bool {
 	return v.enabled
 }

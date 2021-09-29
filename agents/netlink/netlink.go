@@ -39,6 +39,7 @@ var netlinkInstance *NetlinkAgent
 type NetlinkAgent struct {
 	vswch  chan notifier.Notification
 	ruch   chan netlink.RouteUpdate
+	neich  chan netlink.NeighUpdate
 	nldone chan struct{}
 	vrfs   map[string]*netlink.Vrf
 	taps   map[string]*netlink.Tuntap
@@ -385,6 +386,40 @@ func (n *NetlinkAgent) handleRouteUpdate(ru netlink.RouteUpdate) {
 	}
 }
 
+func (n *NetlinkAgent) handleNeighUpdate(nei netlink.NeighUpdate) {
+	dev, ok := n.links[nei.LinkIndex]
+	if !ok {
+		return
+	}
+
+	vif, ok := dev.(*vswitch.VIF)
+	if !ok {
+		return
+	}
+
+	vrf := vif.VRF()
+	if vrf == nil {
+		return
+	}
+
+	rt := vrf.Router()
+	ip := vswitch.ToIPv4Addr(nei.IP)
+	eth := vswitch.NewEtherAddr(nei.HardwareAddr)
+
+	switch nei.Type {
+	case syscall.RTM_NEWNEIGH:
+		if err := rt.UpdateNeighborEntry(vif.Index(), ip, eth); err != nil {
+			log.Printf("Netlink Agent: Can't add a neighbor entry for %v: %v (%v)", vif, nei, err)
+		}
+	case syscall.RTM_DELNEIGH:
+		if err := rt.DeleteNeighborEntry(vif.Index(), ip); err != nil {
+			log.Printf("Netlink Agent: Can't delete a neighbor entry for %v: %v (%v)", vif, nei, err)
+		}
+	default:
+		log.Printf("Unknown NeighUpdate type: %v", nei.Type)
+	}
+}
+
 func (n *NetlinkAgent) listen() {
 	for {
 		select {
@@ -449,6 +484,13 @@ func (n *NetlinkAgent) listen() {
 			log.Printf("Netlink Agent: RU: %v", ru)
 			n.handleRouteUpdate(ru)
 
+		case nei, ok := <-n.neich:
+			if !ok {
+				return
+			}
+			log.Printf("Netlink Agent: NEI: %v", nei)
+			n.handleNeighUpdate(nei)
+
 		}
 	}
 }
@@ -456,6 +498,7 @@ func (n *NetlinkAgent) listen() {
 func (n *NetlinkAgent) Enable() error {
 	// Initialize Netlink Agent
 	n.ruch = make(chan netlink.RouteUpdate)
+	n.neich = make(chan netlink.NeighUpdate)
 	n.nldone = make(chan struct{})
 	n.vrfs = make(map[string]*netlink.Vrf)
 	n.taps = make(map[string]*netlink.Tuntap)
@@ -467,6 +510,10 @@ func (n *NetlinkAgent) Enable() error {
 
 	if err := netlink.RouteSubscribe(n.ruch, n.nldone); err != nil {
 		return fmt.Errorf("Netlink Agent: Can't receive route update: %v", err)
+	}
+
+	if err := netlink.NeighSubscribe(n.neich, n.nldone); err != nil {
+		return fmt.Errorf("Netlink Agent: Can't receive neigh update: %v", err)
 	}
 
 	go func() {
@@ -484,6 +531,7 @@ func (n *NetlinkAgent) Disable() {
 	// Clean ups
 	close(n.nldone)
 	close(n.ruch)
+	close(n.neich)
 	n.vrfs = nil
 	n.taps = nil
 	n.links = nil

@@ -24,6 +24,8 @@ import (
 )
 
 type RouterInstance interface {
+	UpdateNeighborEntry(VIFIndex, IPv4Addr, EtherAddr) error
+	DeleteNeighborEntry(VIFIndex, IPv4Addr) error
 	AddVIF(*VIF) error
 	DeleteVIF(*VIF) error
 	AddOutputDevice(OutputDevice) error

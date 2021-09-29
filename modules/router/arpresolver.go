@@ -44,14 +44,14 @@ const arpRingSize = 256
 
 type arpRequest struct {
 	resolver *arpResolver
-	target   IPv4Addr
+	target   vswitch.IPv4Addr
 	vif      vswitch.VIFIndex
 }
 
 type arpStatus struct {
 	requested int
 	valid     bool
-	etherAddr EtherAddr
+	etherAddr vswitch.EtherAddr
 	neigh     *C.struct_neighbor
 	mutex     sync.Mutex
 }
@@ -69,16 +69,16 @@ func (as *arpStatus) validate() {
 }
 
 type ipaddr struct {
-	addr IPv4Addr
-	mask IPv4Addr
+	addr vswitch.IPv4Addr
+	mask vswitch.IPv4Addr
 }
 
 type arpVIF struct {
 	mutex    sync.Mutex
 	vif      *vswitch.VIF
 	outbound *dpdk.Ring
-	status   map[IPv4Addr]*arpStatus
-	hwAddr   EtherAddr
+	status   map[vswitch.IPv4Addr]*arpStatus
+	hwAddr   vswitch.EtherAddr
 	addrs    []ipaddr
 }
 
@@ -86,8 +86,8 @@ func newArpVIF(vif *vswitch.VIF) *arpVIF {
 	a := &arpVIF{
 		vif:      vif,
 		outbound: vif.Outbound(),
-		hwAddr:   NewEtherAddr(vif.MACAddress()),
-		status:   make(map[IPv4Addr]*arpStatus),
+		hwAddr:   vswitch.NewEtherAddr(vif.MACAddress()),
+		status:   make(map[vswitch.IPv4Addr]*arpStatus),
 	}
 	a.updateIPAddrs()
 	return a
@@ -104,19 +104,19 @@ func (a *arpVIF) updateIPAddrs() {
 			continue
 		}
 
-		var addr, mask IPv4Addr
+		var addr, mask vswitch.IPv4Addr
 		for _, b := range ipv4 {
-			addr = (addr << 8) | IPv4Addr(b)
+			addr = (addr << 8) | vswitch.IPv4Addr(b)
 		}
 		for _, b := range i.Mask {
-			mask = (addr << 8) | IPv4Addr(b)
+			mask = (addr << 8) | vswitch.IPv4Addr(b)
 		}
 
 		a.addrs = append(a.addrs, ipaddr{addr, mask})
 	}
 }
 
-func (a *arpVIF) isTargetAddress(addr IPv4Addr) (target bool) {
+func (a *arpVIF) isTargetAddress(addr vswitch.IPv4Addr) (target bool) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
@@ -129,7 +129,7 @@ func (a *arpVIF) isTargetAddress(addr IPv4Addr) (target bool) {
 	return
 }
 
-func (a *arpVIF) getCompatibleSenderAddr(target IPv4Addr) IPv4Addr {
+func (a *arpVIF) getCompatibleSenderAddr(target vswitch.IPv4Addr) vswitch.IPv4Addr {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
@@ -144,7 +144,7 @@ func (a *arpVIF) getCompatibleSenderAddr(target IPv4Addr) IPv4Addr {
 // newARPStatus returns new arpStatus for the target.
 // If there's already one created, it returns the existing
 // instance.
-func (a *arpVIF) newARPStatus(target IPv4Addr) *arpStatus {
+func (a *arpVIF) newARPStatus(target vswitch.IPv4Addr) *arpStatus {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
@@ -157,14 +157,14 @@ func (a *arpVIF) newARPStatus(target IPv4Addr) *arpStatus {
 }
 
 // getARPStatus returns arpStatus for the target.
-func (a *arpVIF) getARPStatus(target IPv4Addr) *arpStatus {
+func (a *arpVIF) getARPStatus(target vswitch.IPv4Addr) *arpStatus {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
 	return a.status[target]
 }
 
-func (a *arpVIF) deleteARPStatus(target IPv4Addr) {
+func (a *arpVIF) deleteARPStatus(target vswitch.IPv4Addr) {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
@@ -174,7 +174,7 @@ func (a *arpVIF) deleteARPStatus(target IPv4Addr) {
 func (a *arpVIF) doARPRequest(req *arpRequest) {
 	status := a.newARPStatus(req.target)
 	status.requested = 0
-	arp := NewARPRequest(req.target, a.getCompatibleSenderAddr(req.target), a.hwAddr)
+	arp := vswitch.NewARPRequest(req.target, a.getCompatibleSenderAddr(req.target), a.hwAddr)
 
 	for {
 		// create ARP request
@@ -286,14 +286,14 @@ func (ar *arpResolver) resolve(req *arpRequest) {
 
 // findNeighborCache find struct neighbor corresponding to this neighbor.
 // Later we'll use this to check, if the entry has been used or not.
-func (ar *arpResolver) findNeighborCache(vif *vswitch.VIF, target IPv4Addr, status *arpStatus) {
+func (ar *arpResolver) findNeighborCache(vif *vswitch.VIF, target vswitch.IPv4Addr, status *arpStatus) {
 	nc := ar.router.getNeighborCache(vif)
 	if nc == nil {
 		log.Info("No neighbor cache: %v is deleted.", vif)
 		return
 	}
 	for i, cache := range nc {
-		if IPv4Addr(cache.addr) == target {
+		if vswitch.IPv4Addr(cache.addr) == target {
 			status.neigh = &ar.router.neighborCaches[vif][i]
 			return
 		}
@@ -307,7 +307,7 @@ func (ar *arpResolver) findNeighborCache(vif *vswitch.VIF, target IPv4Addr, stat
 // request should be forwarded to the kernel via TAP for now.
 func (ar *arpResolver) input(mbuf *dpdk.Mbuf) {
 	packet := mbuf.Data()
-	arp, err := ARPParse(packet)
+	arp, err := vswitch.ARPParse(packet)
 	if err != nil {
 		log.Warning("Parsing ARP packet failed: %v", err)
 		return
@@ -350,25 +350,25 @@ func (ar *arpResolver) input(mbuf *dpdk.Mbuf) {
 	//
 
 	// ?Do I have the hardware type in ar$hrd?
-	if arp.HWAddrSpc != ARPHrdEthernet {
+	if arp.HWAddrSpc != vswitch.ARPHrdEthernet {
 		log.Debug(0, "ARP: Unknown hardware type: %v", arp.HWAddrSpc)
 		return
 	}
 
 	// [optionally check the hardware length ar$hln]
-	if arp.HWAddrLen != EthernetAddrLen {
+	if arp.HWAddrLen != vswitch.EthernetAddrLen {
 		log.Debug(0, "ARP: Bad hardware address length: %v", arp.HWAddrLen)
 		return
 	}
 
 	// ?Do I speak the protocol in ar$pro?
-	if arp.ProtoAddrSpc != EthertypeIPv4 {
+	if arp.ProtoAddrSpc != vswitch.EthertypeIPv4 {
 		log.Debug(0, "ARP: Unknown protocol type: %v", arp.ProtoAddrSpc)
 		return
 	}
 
 	// [optionally check the protocol length ar$pln]
-	if arp.ProtoAddrLen != IPv4AddrLen {
+	if arp.ProtoAddrLen != vswitch.IPv4AddrLen {
 		log.Debug(0, "ARP: Bad protocol address length: %v", arp.HWAddrLen)
 		return
 	}
@@ -386,7 +386,7 @@ func (ar *arpResolver) input(mbuf *dpdk.Mbuf) {
 		// Note that lock on arpStatus is held during until we
 		// return from processing this ARP packet.
 		if !status.etherAddr.Equal(arp.SenderHWAddr) {
-			if err := ar.router.updateNeighborEntry(vifindex, arp.SenderProtoAddr, arp.SenderHWAddr); err != nil {
+			if err := ar.router.UpdateNeighborEntry(vifindex, arp.SenderProtoAddr, arp.SenderHWAddr); err != nil {
 				log.Err("Neighbor cache update failed: %v", err)
 			}
 			status.etherAddr = arp.SenderHWAddr
@@ -403,7 +403,7 @@ func (ar *arpResolver) input(mbuf *dpdk.Mbuf) {
 	// sender protocol address, sender hardware address> to
 	// the translation table.
 	if !mergeFlag && status != nil {
-		if err := ar.router.updateNeighborEntry(vifindex, arp.SenderProtoAddr, arp.SenderHWAddr); err != nil {
+		if err := ar.router.UpdateNeighborEntry(vifindex, arp.SenderProtoAddr, arp.SenderHWAddr); err != nil {
 			log.Err("Neighbor cache update failed: %v", err)
 		}
 		status.etherAddr = arp.SenderHWAddr
@@ -416,7 +416,7 @@ func (ar *arpResolver) input(mbuf *dpdk.Mbuf) {
 
 	/*
 		// ?Is the opcode ares_op$REQUEST?  (NOW look at the opcode!!)
-		if arp.Op != ARPOpRequest {
+		if arp.Op != vswitch.ARPOpRequest {
 			// We now forward ARP packet to the kernel
 			ar.router.tap.Enqueue(unsafe.Pointer(mbuf))
 			return
@@ -436,12 +436,12 @@ func (ar *arpResolver) input(mbuf *dpdk.Mbuf) {
 	*/
 }
 
-func (ar *arpResolver) deleteNeighborCache(index vswitch.VIFIndex, target IPv4Addr) {
+func (ar *arpResolver) deleteNeighborCache(index vswitch.VIFIndex, target vswitch.IPv4Addr) {
 	ar.mutex.Lock()
 	defer ar.mutex.Unlock()
 
 	if ar.router != nil {
-		ar.router.deleteNeighborEntry(index, target)
+		ar.router.DeleteNeighborEntry(index, target)
 	}
 }
 
@@ -480,7 +480,7 @@ func (ar *arpResolver) stop() {
 func ARPResolve(routerID C.vrfindex_t, target C.uint32_t, vif C.vifindex_t) {
 	if ar, ok := arpResolvers[vswitch.VRFIndex(routerID)]; ok {
 		ar.reqCh <- &arpRequest{
-			target: IPv4Addr(target),
+			target: vswitch.IPv4Addr(target),
 			vif:    vswitch.VIFIndex(vif),
 		}
 	}

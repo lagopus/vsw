@@ -673,7 +673,7 @@ func (r *RouterInstance) procRouteEntry(cmdType notifier.Type, route vswitch.Rou
 	return r.control(ROUTER_CMD_ROUTE_DELETE, unsafe.Pointer(info))
 }
 
-func (r *RouterInstance) updateNeighborEntry(index vswitch.VIFIndex, target IPv4Addr, hwaddr EtherAddr) error {
+func (r *RouterInstance) UpdateNeighborEntry(index vswitch.VIFIndex, target vswitch.IPv4Addr, hwaddr vswitch.EtherAddr) error {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
@@ -687,7 +687,7 @@ func (r *RouterInstance) updateNeighborEntry(index vswitch.VIFIndex, target IPv4
 	return r.control(ROUTER_CMD_NEIGH_UPDATE, unsafe.Pointer(ne))
 }
 
-func (r *RouterInstance) deleteNeighborEntry(index vswitch.VIFIndex, target IPv4Addr) error {
+func (r *RouterInstance) DeleteNeighborEntry(index vswitch.VIFIndex, target vswitch.IPv4Addr) error {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 

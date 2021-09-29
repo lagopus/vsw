@@ -2,7 +2,7 @@
 
 Followings are expected to be installed under /usr/local:
 
-* DPDK 18.11.1
+* DPDK 17.11.1
 
 DPDK shall be built as shared libraries for now.
 

@@ -99,6 +99,11 @@ func MempoolListDump() (string, error) {
 
 }
 
+// mbuf must be struct rte_mbuf of DPDK
+func ToMbuf(mbuf unsafe.Pointer) *Mbuf {
+	return (*Mbuf)(mbuf)
+}
+
 // Check if Mbuf has at least size of ether header
 func (mb *Mbuf) checkAndUpdateMbufLen() {
 	if mb.data_len < C.sizeof_struct_ether_hdr {

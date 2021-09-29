@@ -175,6 +175,9 @@ dup_mbuf(struct rte_mempool *mp, struct rte_mbuf *mbuf)
 {
 	struct rte_mbuf *new_mbuf = rte_pktmbuf_alloc(mp);
 
+	if (new_mbuf == NULL)
+		return NULL;
+
 	// copy common metadata section
 	memcpy(VSW_MBUF_METADATA(new_mbuf), VSW_MBUF_METADATA(mbuf), sizeof(struct vsw_common_metadata));
 
@@ -210,8 +213,16 @@ rif_proc_tx_trunk(struct rte_mempool *mp, struct rif_instance *e, struct rte_mbu
 		// XXX: We shall optimize packets forwarding. Queueing packets one-by-one
 		// is not optimal.
 		if (mbuf->pkt_len <= e->mtu) {
-			if (rte_mbuf_refcnt_read(mbuf) > 1)
-				mbuf = dup_mbuf(mp, mbuf);
+			if (rte_mbuf_refcnt_read(mbuf) > 1) {
+				struct rte_mbuf *new_mbuf = dup_mbuf(mp, mbuf);
+				if (new_mbuf == NULL) {
+					c->out_discards++;
+					vc->out_discards++;
+					rte_pktmbuf_free(mbuf);
+					continue;
+				}
+				mbuf = new_mbuf;
+			}
 
 			// In_vif is set to VIF index of RIF, so that VSI will not send back
 			// the packet during flooding.
@@ -263,8 +274,16 @@ rif_proc_rx_trunk(struct rte_mempool *mp, struct rif_instance *e, struct rte_mbu
 		// XXX: We shall optimize packets forwarding. Queueing packets one-by-one
 		// is not optimal.
 		if (mbuf->pkt_len <= e->mtu) {
-			if (rte_mbuf_refcnt_read(mbuf) > 1)
-				mbuf = dup_mbuf(mp, mbuf);
+			if (rte_mbuf_refcnt_read(mbuf) > 1) {
+				struct rte_mbuf *new_mbuf = dup_mbuf(mp, mbuf);
+				if (new_mbuf == NULL) {
+					c->in_discards++;
+					vc->in_discards++;
+					rte_pktmbuf_free(mbuf);
+					continue;
+				}
+				mbuf = new_mbuf;
+			}
 
 			struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
 			md->common.in_vif  = vifidx;
@@ -328,8 +347,16 @@ rif_proc_tx_access(struct rte_mempool *mp, struct rif_instance *e, struct rte_mb
 			continue;
 		}
 
-		if (rte_mbuf_refcnt_read(mbuf) > 1)
-			mbuf = dup_mbuf(mp, mbuf);
+		if (rte_mbuf_refcnt_read(mbuf) > 1) {
+			struct rte_mbuf *new_mbuf = dup_mbuf(mp, mbuf);
+			if (new_mbuf == NULL) {
+				c->out_discards++;
+				vc->out_discards++;
+				rte_pktmbuf_free(mbuf);
+				continue;
+			}
+			mbuf = new_mbuf;
+		}
 
 		// In_vif is set to VIF index of RIF, so that VSI will not send back
 		// the packet during flooding.
@@ -356,7 +383,7 @@ rif_proc_tx_access(struct rte_mempool *mp, struct rif_instance *e, struct rte_mb
 
 		uint64_t octets = 0;
 		while (unlikely(outbound_sent < outbound_count)) {
-			struct rte_mbuf *mbuf = mbufs[outbound_sent];
+			struct rte_mbuf *mbuf = outbound_mbufs[outbound_sent];
 
 			vsw_ether_dst_t dst = vsw_check_ether_dst(mbuf);
 			VSW_ETHER_DEC_OUT_COUNTER(c, vc, dst);
@@ -406,8 +433,16 @@ rif_proc_rx_access(struct rte_mempool *mp, struct rif_instance *e, struct rte_mb
 			continue;
 		}
 
-		if (rte_mbuf_refcnt_read(mbuf) > 1)
-			mbuf = dup_mbuf(mp, mbuf);
+		if (rte_mbuf_refcnt_read(mbuf) > 1) {
+			struct rte_mbuf *new_mbuf = dup_mbuf(mp, mbuf);
+			if (new_mbuf == NULL) {
+				c->in_discards++;
+				vc->in_discards++;
+				rte_pktmbuf_free(mbuf);
+				continue;
+			}
+			mbuf = new_mbuf;
+		}
 
 		struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
 		md->common.in_vif  = index;
@@ -438,7 +473,7 @@ rif_proc_rx_access(struct rte_mempool *mp, struct rif_instance *e, struct rte_mb
 
 		uint64_t octets = 0;
 		while (unlikely(inbound_sent < inbound_count)) {
-			struct rte_mbuf *mbuf = mbufs[inbound_sent];
+			struct rte_mbuf *mbuf = inbound_mbufs[inbound_sent];
 
 			vsw_ether_dst_t dst = vsw_check_ether_dst(mbuf);
 			VSW_ETHER_DEC_IN_COUNTER(c, vc, dst);

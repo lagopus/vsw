@@ -390,6 +390,10 @@ esp_outbound(struct rte_mbuf *m, struct ipsec_sa *sa,
   /* ESP. */
   esp = (struct esp_hdr *) rte_pktmbuf_prepend(m,
         sizeof(struct esp_hdr) + sa->iv_len);
+  if (unlikely(esp == NULL)) {
+    TUNNEL_ERROR("rte_pktmbuf_prepend failed");
+    return -EINVAL;
+  }
 
   if (IPSEC_IS_NAT_T(priv)) {
     /* use NAT-T. */

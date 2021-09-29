@@ -29,12 +29,15 @@ import "syscall"
 
 type Errno uintptr
 
+const (
+	E_RTE_NO_CONFIG = Errno(C.E_RTE_NO_CONFIG)
+	E_RTE_SECONDARY = Errno(C.E_RTE_SECONDARY)
+)
+
 func (e Errno) Error() string {
-	switch e {
-	case Errno(C.E_RTE_SECONDARY):
-		return "Operation not allowed in secondary processes"
-	case Errno(C.E_RTE_NO_CONFIG):
-		return "Missing rte_config"
-	}
-	return syscall.Errno(e).Error()
+	return C.GoString(C.rte_strerror(C.int(e)))
+}
+
+func (e Errno) Errno() syscall.Errno {
+	return syscall.Errno(e)
 }

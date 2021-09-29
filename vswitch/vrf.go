@@ -309,11 +309,9 @@ func (v *VRF) AddVIF(vif *VIF) error {
 		goto error1
 	}
 
-	// ICMP -> VIF (If not Tunnel)
-	if vif.Tunnel() == nil {
-		if err = v.tap.connect(vif.Outbound(), MatchOutVIF, vif); err != nil {
-			goto error2
-		}
+	// ICMP -> VIF
+	if err = v.tap.connect(vif.Outbound(), MatchOutVIF, vif); err != nil {
+		goto error2
 	}
 
 	// VIF -> router (DST_SELF)
@@ -710,7 +708,7 @@ func (v *VRF) routeEntryDeleted(entry Route) {
 	noti.Notify(notifier.Delete, v, entry)
 }
 
-func (v *VRF) pbrEntryAdded(entry PBREntry) {
+func (v *VRF) pbrEntryAdded(entry *PBREntry) {
 	for _, nh := range entry.NextHops {
 		if nh.Dev == nil {
 			continue
@@ -724,7 +722,7 @@ func (v *VRF) pbrEntryAdded(entry PBREntry) {
 	noti.Notify(notifier.Add, v, entry)
 }
 
-func (v *VRF) pbrEntryDeleted(entry PBREntry) {
+func (v *VRF) pbrEntryDeleted(entry *PBREntry) {
 	// TODO: Remove unused VRF from the router instance
 	noti.Notify(notifier.Delete, v, entry)
 }

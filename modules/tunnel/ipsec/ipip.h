@@ -61,7 +61,9 @@ ipip_outbound(struct rte_mbuf *m, uint32_t offset, uint8_t proto, bool is_ipv4,
   lagopus_result_t ret = LAGOPUS_RESULT_ANY_FAILURES;
   uint8_t new_tos;
 
-  set_meta_local(m);
+  /* set encap, keep_ttl metadata. */
+  set_meta_encap(m);
+  set_meta_keep_ttl(m);
 
   /* get TOS/TTL in packet or default vals. */
   new_tos = convert_ip_tos(inip4, tos);
@@ -126,7 +128,8 @@ ipip_inbound_outer(struct rte_mbuf *m, uint32_t offset,
   struct ip *outip4;
   struct ip6_hdr *outip6;
 
-  set_meta_local(m);
+  /* set keep_ttl metadata. */
+  set_meta_keep_ttl(m);
 
   /* outer. */
   outip4 = rte_pktmbuf_mtod(m, struct ip *);

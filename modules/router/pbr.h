@@ -33,25 +33,66 @@ typedef enum {
 } pbr_rt_value_t;
 
 typedef struct radix_trie_value {
+	// The key length when the rule is registered.
+	// This determines whether the rules are the same.
+	// If key is any, key length is set to 0(ANY_KEY_LEN).
+	uint32_t key_len;
+
+	// The number of port range rules that reference this value.
+	// It may be referenced from different rules.
+	uint32_t ref_cnt;
+
 	void *val;
 	pbr_rt_value_t type;
 } rt_value_t;
 
 typedef struct pbr_table {
+	uint32_t rule_num;
 	rt_value_t *top;
 	struct rte_hash *sp_hash;
 	struct rte_hash *dp_hash;
 } pbr_table_t;
 
+
+// PBR action
+struct pbr_action {
+	uint32_t priority;
+	bool pass;	// if true, forward to the default routing
+	uint8_t nexthop_count;
+};
+
+// PBR action with nexthops
+struct pbr_action_nh {
+	struct pbr_action base;
+	nexthop_t nexthops[ROUTER_MAX_PBR_NEXTHOPS];
+};
+
 struct pbr_table *
 pbr_init(const char *name);
+
 void
 pbr_fini(struct pbr_table *pt);
+
 bool
 pbr_entry_add(struct router_tables *tbls, struct pbr_entry *entry);
+
 bool
 pbr_entry_delete(struct pbr_table *pt, struct pbr_entry *entry);
-nexthop_t *
+
+struct pbr_action *
 pbr_entry_get(struct pbr_table *pt, struct rte_mbuf *mbuf);
+
+static inline struct pbr_action_nh *
+pbr_get_action_nh(struct pbr_action *act) {
+	if (act == NULL || act->nexthop_count == 0)
+		return NULL;
+	return (struct pbr_action_nh *)act;
+}
+
+// XXX: We should implement Weighted ECMP in the future
+static inline nexthop_t *
+pbr_select_nexthop(struct pbr_action_nh *act_nh) {
+	return &act_nh->nexthops[0];
+}
 
 #endif /* VSW_MODULE_ROUTER_PBR_H_ */

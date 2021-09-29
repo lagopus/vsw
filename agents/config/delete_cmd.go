@@ -46,6 +46,12 @@ var ocdcDeleteSyntax = []*parserSyntax{
 		},
 	},
 	{
+		"interfaces interface STRING tunnel config",
+		[]*parserSyntaxEntry{
+			{"remote-inet-address A.B.C.D", deleteIF, ifTunnelRemoteAddress},
+		},
+	},
+	{
 		"interfaces interface STRING subinterfaces subinterface INTEGER",
 		[]*parserSyntaxEntry{
 			{"", deleteIF, ifSubSelf},
@@ -57,6 +63,13 @@ var ocdcDeleteSyntax = []*parserSyntax{
 		[]*parserSyntaxEntry{
 			{"", deleteIF, ifSubVRRPGroup},
 			{"config virtual-address A.B.C.D...", deleteIF, ifSubVRRPVirtualAddress},
+		},
+	},
+	{
+		"network-instances network-instance STRING pbr-entries STRING",
+		[]*parserSyntaxEntry{
+			{"", deleteNI, pbrSelf},
+			{"action next-hops next-hop STRING", deleteNI, pbrNexthop},
 		},
 	},
 }
@@ -98,6 +111,19 @@ func deleteNI(v interface{}, key ocdcType, args []interface{}) (interface{}, err
 		dni.addSP(args[1].(string))
 		ni.deleteSP(args[1].(string))
 
+	case pbrSelf:
+		ruleName := args[1].(string)
+		dni.getDeletedPBR(ruleName).setSelf()
+		ni.deletePBREntry(ruleName)
+
+	case pbrNexthop:
+		ruleName := args[1].(string)
+		nhName := args[2].(string)
+		if dp := dni.getDeletedPBR(ruleName); !dp.self {
+			dp.getDeletedPBRNexthop(nhName).setSelf()
+			ni.getPBREntry(ruleName).deleteNexthopEntry(nhName)
+		}
+
 	default:
 		return nil, ocdcTypeUnexpectedError(key)
 	}
@@ -126,6 +152,9 @@ func deleteIF(v interface{}, key ocdcType, args []interface{}) (interface{}, err
 	case ifSubSelf:
 		di.getDeletedSubiface(args[1].(int)).setSelf()
 		i.deleteSubiface(args[1].(int))
+
+	case ifTunnelRemoteAddress:
+		i.getTunnel().deleteRemoteAddress(args[1].(net.IP))
 
 	case ifSubAddress:
 		dsi := di.getDeletedSubiface(args[1].(int))
@@ -177,6 +206,19 @@ type deletedNI struct {
 	// L3VRF
 	sad []uint32
 	spd []string
+	pbr map[string]*deletedPBR
+}
+
+type deletedPBR struct {
+	self    bool
+	nexthop map[string]*deletedPBRNexthop
+}
+
+type deletedPBRNexthop struct {
+	self bool
+	// TODO: Multiple interfaces are retained and
+	//       must be able to be deleted
+	//inIfs []vswitch.VIFIndex
 }
 
 type deletedIface struct {
@@ -326,12 +368,41 @@ func (di *deletedIface) String() string {
 	return str
 }
 
+func (d *deletedPBRNexthop) setSelf() {
+	d.self = true
+}
+
+func (d *deletedPBR) getDeletedPBRNexthop(name string) *deletedPBRNexthop {
+	dnh, ok := d.nexthop[name]
+	if !ok {
+		dnh = &deletedPBRNexthop{}
+		d.nexthop[name] = dnh
+	}
+	return dnh
+}
+
+func (d *deletedPBR) setSelf() {
+	d.self = true
+}
+
+func (d *deletedNI) getDeletedPBR(name string) *deletedPBR {
+	dp, ok := d.pbr[name]
+	if !ok {
+		dp = &deletedPBR{
+			nexthop: make(map[string]*deletedPBRNexthop),
+		}
+		d.pbr[name] = dp
+	}
+	return dp
+}
+
 func (o *openconfig) getDeletedNetworkInstance(name string, niType niType) *deletedNI {
 	dn, ok := o.dnis[name]
 	if !ok {
 		dn = &deletedNI{
 			name:   name,
 			niType: niType,
+			pbr:    make(map[string]*deletedPBR),
 		}
 		o.dnis[name] = dn
 	}

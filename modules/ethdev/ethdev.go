@@ -363,11 +363,11 @@ func (e *EthdevInstance) MTU() vswitch.MTU {
 	if mtu < 0 {
 		return 0
 	}
-	return vswitch.MTU(mtu)
+	return vswitch.MTU(mtu + C.ETHER_HDR_LEN)
 }
 
 func (e *EthdevInstance) SetMTU(mtu vswitch.MTU) error {
-	return e.dev.SetMTU(uint16(mtu))
+	return e.dev.SetMTU(uint16(mtu) - C.ETHER_HDR_LEN)
 }
 
 func (e *EthdevInstance) InterfaceMode() vswitch.VLANMode {

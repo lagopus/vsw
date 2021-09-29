@@ -24,6 +24,8 @@ import "C"
 import (
 	"fmt"
 	"net"
+	"strconv"
+	"sync"
 	"unsafe"
 
 	"github.com/lagopus/vsw/dpdk"
@@ -36,61 +38,114 @@ import (
 )
 
 const (
-	moduleName = "hostif"
+	moduleName        = "hostif"
+	defaultPortNumber = 30020
 )
 
 var log = vswitch.Logger
 
-type HostifModule struct {
-	base    *vswitch.BaseInstance
-	running bool
-	done    chan int
-	server  *grpc.Server
+// Config
+type hostifConfigSection struct {
+	Hostif hostifConfig
 }
 
-/*
- * If you want to expose arbitrary struct to be used with Control(), define.
- */
-type HostifConfig struct {
-	Number int
-	String string
-	Array  []string
+type hostifConfig struct {
+	Port int
 }
 
 //
-func newHostifInstance(base *vswitch.BaseInstance, i interface{}) (vswitch.Instance, error) {
-	return &HostifModule{
-		base:    base,
-		running: true,
-		done:    make(chan int),
-	}, nil
+type HostifInstance struct {
+	base    *vswitch.BaseInstance
+	mutex   sync.Mutex
+	enabled bool
 }
 
-func (him *HostifModule) Free() {
+type HostifService struct {
+	instances map[string]*HostifInstance
+	inputs    []*dpdk.Ring
+	mutex     sync.Mutex
+	server    *grpc.Server
+	done      chan struct{}
+	port      int
+	serverRc  int
 }
 
-func (him *HostifModule) ServerStart(sock net.Listener) {
-	him.server.Serve(sock)
-	close(him.done)
+func (hs *HostifService) addInstance(hi *HostifInstance) {
+	hs.mutex.Lock()
+	defer hs.mutex.Unlock()
+
+	hs.instances[hi.base.Name()] = hi
+	hs.inputs = append(hs.inputs, hi.base.Input())
 }
 
-func (him *HostifModule) Enable() error {
-	log.Printf("%s: Start()", him.base.Name())
+func (hs *HostifService) deleteInstance(hi *HostifInstance) {
+	hs.mutex.Lock()
+	defer hs.mutex.Unlock()
 
-	if !him.running {
-		return fmt.Errorf("%s: Terminated before start", him.base.Name())
+	delete(hostifService.instances, hi.base.Name())
+
+	target := hi.base.Input()
+	for i, v := range hs.inputs {
+		if v == target {
+			n := len(hs.inputs) - 1
+			hs.inputs[i] = hs.inputs[n]
+			hs.inputs[n] = nil
+			hs.inputs = hs.inputs[:n]
+			return
+		}
 	}
-	sock, err := net.Listen("tcp", ":30020")
+}
+
+func (hs *HostifService) serverStart(sock net.Listener) {
+	hs.server.Serve(sock)
+	close(hs.done)
+}
+
+func (hs *HostifService) startService() error {
+	hs.mutex.Lock()
+	defer hs.mutex.Unlock()
+
+	hs.serverRc++
+
+	// If the server is already up and running, do nothing.
+	if hs.serverRc > 1 {
+		return nil
+	}
+
+	// load config, if port is not set yet
+	if hs.port < 0 {
+		c := hostifConfigSection{hostifConfig{defaultPortNumber}}
+		vswitch.GetConfig().Decode(&c)
+		hs.port = c.Hostif.Port
+	}
+
+	sock, err := net.Listen("tcp", ":"+strconv.Itoa(hs.port))
 	if err != nil {
-		return fmt.Errorf("%s: %v", him.base.Name(), err)
+		return err
 	}
-	him.server = grpc.NewServer()
-	pb.RegisterPacketsIoServer(him.server, him)
-	go him.ServerStart(sock)
+
+	hs.server = grpc.NewServer()
+	pb.RegisterPacketsIoServer(hs.server, hs)
+	go hs.serverStart(sock)
 	return nil
 }
 
-func (him *HostifModule) SendBulk(ctx context.Context, pkts *pb.BulkPackets) (*pb.Result, error) {
+func (hs *HostifService) stopService() {
+	hs.mutex.Lock()
+	defer hs.mutex.Unlock()
+
+	hs.serverRc--
+
+	// If the server is still in use, do nothing.
+	if hs.serverRc > 0 {
+		return
+	}
+
+	hs.server.Stop()
+	<-hs.done
+}
+
+func (hs *HostifService) SendBulk(ctx context.Context, pkts *pb.BulkPackets) (*pb.Result, error) {
 	pool := vswitch.GetDpdkResource().Mempool
 
 	if pkts.N > 0 {
@@ -108,64 +163,115 @@ func (him *HostifModule) SendBulk(ctx context.Context, pkts *pb.BulkPackets) (*p
 						mbuf.Free()
 					}
 				} else {
-					log.Printf("%s: AllocMbuf() failed", him.base.Name())
+					log.Printf("%s: AllocMbuf() failed", moduleName)
 				}
 			} else {
-				log.Printf(`%s: rings["%s"] == nil`, him.base.Name(), vifname)
+				log.Printf(`%s: rings["%s"] == nil`, moduleName, vifname)
 			}
 		}
 	}
 	return new(pb.Result), nil
 }
 
-func (him *HostifModule) RecvBulk(ctx context.Context, in *pb.Null) (*pb.BulkPackets, error) {
+func (hs *HostifService) RecvBulk(ctx context.Context, in *pb.Null) (*pb.BulkPackets, error) {
 	mbufs := make([]*dpdk.Mbuf, 1024)
+	bps := &pb.BulkPackets{}
 
-	iring := him.base.Input()
+	hs.mutex.Lock()
+	defer hs.mutex.Unlock()
 
-	rxc := iring.DequeueBurstMbufs(&mbufs)
-	if rxc > 0 {
-		pkts := make([]*pb.Packet, rxc)
-		for i := uint(0); i < rxc; i++ {
-			m := mbufs[i]
-			md := (*vswitch.Metadata)(m.Metadata())
-			inVIF := vswitch.GetVIFByIndex(md.InVIF())
-			if inVIF == nil {
+	for _, iring := range hs.inputs {
+		if rxc := iring.DequeueBurstMbufs(&mbufs); rxc > 0 {
+			pkts := make([]*pb.Packet, rxc)
+			for i := uint(0); i < rxc; i++ {
+				m := mbufs[i]
+				md := (*vswitch.Metadata)(m.Metadata())
+				inVIF := vswitch.GetVIFByIndex(md.InVIF())
+				if inVIF == nil {
+					m.Free()
+					continue
+				}
+				name := inVIF.Name()
+
+				pkts[i] = &pb.Packet{
+					Len:       uint32(m.DataLen()),
+					Subifname: name,
+					Data:      append([]byte(nil), m.Data()...),
+				}
+
 				m.Free()
-				continue
 			}
-			name := inVIF.Name()
-
-			pkts[i] = &pb.Packet{
-				Len:       uint32(m.DataLen()),
-				Subifname: name,
-				Data:      append([]byte(nil), m.Data()...),
-			}
-
-			m.Free()
+			bps.N += int64(rxc)
+			bps.Packets = append(bps.Packets, pkts...)
 		}
-		bps := &pb.BulkPackets{
-			N:       int64(rxc),
-			Packets: pkts,
-		}
-		return bps, nil
 	}
 
-	bps := &pb.BulkPackets{}
 	return bps, nil
 }
 
-func (him *HostifModule) Disable() {
-	log.Printf("%s: Disable()", him.base.Name())
-	him.running = false
-	him.server.Stop()
-	<-him.done
+var hostifService *HostifService
+
+//
+func newHostifInstance(base *vswitch.BaseInstance, i interface{}) (vswitch.Instance, error) {
+	hi := &HostifInstance{base: base}
+	hostifService.addInstance(hi)
+	return hi, nil
+}
+
+func (hi *HostifInstance) Free() {
+	hi.mutex.Lock()
+	defer hi.mutex.Unlock()
+
+	if hi.enabled {
+		hostifService.stopService()
+		hi.enabled = false
+	}
+
+	hostifService.deleteInstance(hi)
+}
+
+func (hi *HostifInstance) Enable() error {
+	hi.mutex.Lock()
+	defer hi.mutex.Unlock()
+
+	// If the instance is already enabled, do nothing.
+	if hi.enabled {
+		return nil
+	}
+
+	log.Printf("%s: Start()", hi.base.Name())
+
+	if err := hostifService.startService(); err != nil {
+		return fmt.Errorf("%s: %v", hi.base.Name(), err)
+	}
+	hi.enabled = true
+	return nil
+}
+
+func (hi *HostifInstance) Disable() {
+	hi.mutex.Lock()
+	defer hi.mutex.Unlock()
+
+	if !hi.enabled {
+		return
+	}
+
+	log.Printf("%s: Disable()", hi.base.Name())
+
+	hostifService.stopService()
+	hi.enabled = false
 }
 
 /*
  * Do module registration here.
  */
 func init() {
+	hostifService = &HostifService{
+		instances: make(map[string]*HostifInstance),
+		done:      make(chan struct{}),
+		port:      -1,
+	}
+
 	if l, err := vlog.New(moduleName); err == nil {
 		log = l
 	} else {
@@ -177,7 +283,7 @@ func init() {
 		SocketId: dpdk.SOCKET_ID_ANY,
 	}
 
-	if err := vswitch.RegisterModule("hostif", newHostifInstance, rp, vswitch.TypeOther); err != nil {
+	if err := vswitch.RegisterModule(moduleName, newHostifInstance, rp, vswitch.TypeOther); err != nil {
 		log.Fatalf("Failed to register hostif: %v", err)
 	}
 }

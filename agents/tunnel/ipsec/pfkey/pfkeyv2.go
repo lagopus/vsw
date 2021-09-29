@@ -32,9 +32,6 @@ type Serializer interface {
 	Serialize(w io.Writer) error
 }
 
-// PfkeyBufferLen represents buffer length for one pfkey message.
-const PfkeyBufferLen = 4096
-
 // SadbMsg is base message header for pfkey messages.
 type SadbMsg struct {
 	SadbMsgVersion  uint8

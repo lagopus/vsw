@@ -43,6 +43,7 @@
 #include "route.h"
 #include "router.h"
 #include "router_log.h"
+#include "arpresolver.h"
 
 // VNI
 #define VXLAN_VNI_MASK (0xFFFFFF00)
@@ -66,36 +67,28 @@ struct router_runtime {
 	struct rte_hash *router_hash;
 	bool running;
 
-	struct rte_ring *notify; // receive notification from frontend.
-
 	struct router_mempools mempools; // for fragmentation.
 
-	struct rte_mbuf *mbufs[MAX_ROUTER_MBUFS];
+	struct rte_mbuf *mbufs[ROUTER_MAX_MBUFS];
 };
 
 uint32_t router_log_id = 0;
 
 static bool
-init_tables(struct router_context *ctx) {
-	struct router_tables *tbls = &ctx->tables;
+init_tables(struct router_instance *ri) {
+	struct router_tables *tbls = &ri->tables;
+	const char *vrfname = ri->base.name;
 
 	// initialize tables.
-	if (!(tbls->route = route_init(ctx->name))) {
-		ROUTER_ERROR("router: %s: route table initialize failed.", ctx->name);
+	if (!(tbls->route = route_init(vrfname))) {
+		ROUTER_ERROR("router: %s: route table initialize failed.", vrfname);
 		return false;
 	}
-	if (!(tbls->neighbor = neighbor_init(ctx->name))) {
-		ROUTER_ERROR("router: %s: neighbor table initialize failed.", ctx->name);
+
+	if (!(tbls->interface = interface_init(vrfname))) {
+		ROUTER_ERROR("router: %s: interface table initialize failed.", vrfname);
 		// route finalize
 		route_fini(tbls->route);
-		return false;
-	}
-	if (!(tbls->interface = interface_init(ctx->name))) {
-		ROUTER_ERROR("router: %s: interface table initialize failed.", ctx->name);
-		// route finalize
-		route_fini(tbls->route);
-		// neighbor finalize
-		neighbor_fini(tbls->neighbor);
 		return false;
 	}
 
@@ -109,17 +102,45 @@ update_logid() {
 		router_log_id = (uint32_t)id;
 }
 
+parse_options_t parse_options[] = {
+	[RECORDROUTE_DISABLE] = parse_options_rr_disable,
+	[RECORDROUTE_IGNORE] = parse_options_rr_ignore,
+	[RECORDROUTE_ENABLE] = parse_options_rr_enable,
+};
+
+static bool
+init_instance(struct router_instance *ri) {
+	const char *vrfname = ri->base.name;
+
+	// Prepare an array to hold ROUTER_RULE_BASE_SIZE rules.
+	// If there is not enough space, increase the array.
+	// If the free space is larger than ROUTER_RULE_BASE_SIZE, the free space decreases.
+	ri->rules = rte_zmalloc(NULL, sizeof(struct router_rule) * ROUTER_RULE_BASE_SIZE, 0);
+	if (!ri->rules) {
+		ROUTER_ERROR("router: %s: Failed to create array of rules", vrfname);
+		return false;
+	}
+	ri->rules_cap = ROUTER_RULE_BASE_SIZE;
+
+	ri->parse_options = parse_options[ri->rr_mode];
+
+	if (!init_tables(ri)) {
+		ROUTER_ERROR("router: %s: init talbes failed.", vrfname);
+		return false;
+	}
+	return true;
+}
+
 static void
-free_context(struct router_context *ctx) {
-	struct router_tables *tbls = &ctx->tables;
+fini_instance(struct router_instance *ri) {
 	// finilize tables.
+	struct router_tables *tbls = &ri->tables;
 	route_fini(tbls->route);
-	neighbor_fini(tbls->neighbor);
 	interface_fini(tbls->interface);
 	pbr_fini(tbls->pbr);
 
-	// free context
-	rte_free(ctx);
+	// free rule table
+	rte_free(ri->rules);
 }
 
 // manage ribs
@@ -511,9 +532,8 @@ process_self_addressed_mbuf(struct router_instance *ri, struct rte_mbuf *mbuf) {
 	uint32_t dstip = ntohl(iphdr->dst_addr);
 
 	// check for all rules.
-	struct router_context *ctx = ri->ctx;
-	struct router_rule *rules = ctx->rules;
-	for (int i = 0; i < ctx->rules_count; i++) {
+	struct router_rule *rules = ri->rules;
+	for (int i = 0; i < ri->rules_count; i++) {
 		struct rule *rule = &rules[i].rule;
 
 		struct vsw_packet_metadata *md = VSW_MBUF_METADATA(mbuf);
@@ -557,7 +577,7 @@ process_self_addressed_mbuf(struct router_instance *ri, struct rte_mbuf *mbuf) {
 	}
 
 	// send mbufs that didn't match to the rule.
-	mbuf_prepare_enqueue(ctx->tap.rr, mbuf);
+	mbuf_prepare_enqueue(ri->tap.rr, mbuf);
 	return true;
 }
 
@@ -569,7 +589,9 @@ process_self_addressed_mbuf(struct router_instance *ri, struct rte_mbuf *mbuf) {
  * Otherwise, outgoing interface is returned.
  */
 static struct interface *
-lookup(struct rte_mbuf *mbuf, struct router_context *ctx) {
+lookup(struct router_instance *ri, struct rte_mbuf *mbuf, bool *drop) {
+	*drop = true;
+
 	struct ipv4_hdr *ipv4 = rte_pktmbuf_mtod_offset(mbuf, struct ipv4_hdr *,
 							sizeof(struct ether_hdr));
 
@@ -584,7 +606,7 @@ lookup(struct rte_mbuf *mbuf, struct router_context *ctx) {
 	rmd->rr_loc = NULL;
 	rmd->sr_loc = NULL;
 	if (rmd->has_option) {
-		if (!ctx->parse_options(ipv4, md, ctx->tables.interface))
+		if (!ri->parse_options(ipv4, md, ri->tables.interface))
 			return NULL;
 	}
 
@@ -593,73 +615,97 @@ lookup(struct rte_mbuf *mbuf, struct router_context *ctx) {
 
 	// lookup radix trie for PBR.
 	nexthop_t *nh = NULL;
-	if (ctx->tables.pbr) {
-		nh = pbr_entry_get(ctx->tables.pbr, mbuf);
+#if 0
+	bool pbr = false;	// Set to true if we found the nexhop with PBR
+#endif
+	if (ri->tables.pbr) {
+		struct pbr_action *act = pbr_entry_get(ri->tables.pbr, mbuf);
 
-		if (nh) {
-			// drop the packet.
-			if (nh->action == PBRACTION_DROP)
-				return NULL;
-			// pass the packet to route_entry_get().
-			if (nh->action == PBRACTION_PASS)
-				nh = NULL;
+		if (act) {
+			struct pbr_action_nh *act_nh = pbr_get_action_nh(act);
+
+			if (act_nh) {
+				nexthop_t *tmp_nh = pbr_select_nexthop(act_nh);
+
+				// if VIF Index is not specified, we should find
+				// the nexthop gateway by looking the routing table.
+				// Otherwise, we need to resolve on that interface.
+				if (tmp_nh->ifindex == VIF_INVALID_INDEX) {
+					dstip = tmp_nh->gw;
+				} else {
+					// The egress VIF was specified.
+					nh = tmp_nh;
+				}
+
+#if 0
+				pbr = true;
+#endif
+			} else {
+				if (!act->pass)
+					return NULL;	// We must drop the packet
+				// fallthrough if act->pass is true.
+				// let default routing table to decide.
+			}
 		}
 	}
 
-	// when nexthop is null,
-	// pbr rule is not set or action is pass or can not found a pbr rule.
+	// There was no match in PBR, or the action was to forward to
+	// the designated nexthop gateway.
 	if (!nh) {
 		// lookup routing table
-		nh = route_entry_get(&ctx->tables, dstip);
+		nh = route_entry_get(&ri->tables, dstip);
 		if (!nh) {
-			ROUTER_DEBUG("%s: route entry not found(dstip: %s).\n", ctx->name, ip2str(dstip));
+			ROUTER_DEBUG("%s: route entry not found(dstip: %s).\n", ri->base.name, ip2str(dstip));
 			// to return unreacheable message by kernel.
 			rmd->no_outbound_napt = true;
-			return (struct interface *)&ctx->tap;
+			return (struct interface *)&ri->tap;
 		}
 	}
 
-	uint32_t ip = nh->gw == 0 ? dstip : nh->gw;
-	// Lookup the neighbor information.
-	// If gw is not 0, the packet send to gw.
-	neighbor_t *ne = neighbor_entry_get(ctx->tables.neighbor, ip);
-	if (ne) {
-		if (!nh->interface) {
-			if (nh->ifindex != VIF_INVALID_INDEX) {
-				// If ifindex of the nh is not VIF_INVALID_INDEX,
-				// search interface information using that as a key.
-				nh->interface = interface_entry_get(ctx->tables.interface, nh->ifindex);
-				ROUTER_DEBUG("nexthop ifindex: %d", nh->ifindex);
-			} else {
-				// If ifindex of the nh is VIF_INVALID_INDEX,
-				// prioritize neighbor information.
-				nh->interface = interface_entry_get(ctx->tables.interface, ne->ifindex);
-			}
-			// Add reference of a nexthop that refer to a interface
-			if (nh->interface && !interface_nexthop_reference_add(nh->interface, nh))
-				return NULL;
-		}
-		ROUTER_DEBUG("[NEIGHBOR] ifindex: %d, ip: %s, mac: %s\n",
-			     ne->ifindex, ip2str(ne->ip_addr), mac2str(ne->mac_addr));
-	}
+	// If the nexthop has a designated gateway, send to that gateway.
+	// Otherwise, the destination should be link-local.
+	if (nh->gw != 0)
+		dstip = nh->gw;
 
 	struct interface *ie = nh->interface;
-	if (!ie) {
-		// drop this packet.
-		ROUTER_INFO("interface is not found.\n");
-		return NULL;
+
+	// Lookup for the neighbor information on regular VIF.
+	if (is_iff_type_vif(&ie->base)) {
+		struct neighbor *ne = neighbor_entry_get(ie->neighbor, dstip);
+
+		// ARP resolution is required.
+		if (!ne->valid) {
+			ROUTER_DEBUG("%s: resolve %d.%d.%d.%d (VIF: %d).\n",
+			     ri->base.name, (dstip >> 24) & 0xff, (dstip >> 16) & 0xff,
+			     (dstip >>  8) & 0xff, (dstip & 0xff),
+			     ie->base.ifindex);
+
+			// request ARP resolution, iff we haven't requested yet.
+			if (!neighbor_entry_has_pending(ne))
+				ARPResolve(ri->router_id, dstip, ie->base.ifindex);
+			neighbor_entry_push_pending(ne, mbuf);
+			*drop = false;
+			return NULL;
+		}
+
+		// rewrite ether header
+		struct ether_hdr *eth_hdr = rte_pktmbuf_mtod(mbuf, struct ether_hdr *);
+		ether_addr_copy(&ie->base.mac, &(eth_hdr->s_addr));
+		ether_addr_copy(&ne->mac_addr, &(eth_hdr->d_addr));
+
+		// rewrite vlan id.
+		if (ie->base.vid != 0)
+			mbuf->vlan_tci = ie->base.vid;
 	}
 
 	// check ttl and set checksum
-	if (!(md->common.local)) {
+	if (!(md->common.keep_ttl)) {
 		// A local flag is true, this packet was come from tunnel module,
 		// at the time of encapsulation.
 		if (likely(ipv4->time_to_live > 0)) {
-			uint16_t oldvalue = *(uint16_t *)&ipv4->time_to_live;
+			uint16_t oldvalue = ipv4->time_to_live;
 			ipv4->time_to_live--;
-			uint16_t newvalue = *(uint16_t *)&ipv4->time_to_live;
-
-			rmd->cksum_diff += calc_chksum_diff_2byte(oldvalue, newvalue);
+			rmd->cksum_diff += calc_chksum_diff_2byte(oldvalue, ipv4->time_to_live);
 		}
 
 		// if ttl is 0, stop forwarding and send to kernel.
@@ -668,7 +714,7 @@ lookup(struct rte_mbuf *mbuf, struct router_context *ctx) {
 			// recalc cehcksum before send to kernel.
 			// modify ip header because decremented ttl.
 			rmd->no_outbound_napt = true;
-			return (struct interface *)&ctx->tap;
+			return (struct interface *)&ri->tap;
 		}
 	}
 
@@ -682,43 +728,13 @@ lookup(struct rte_mbuf *mbuf, struct router_context *ctx) {
 	// tap as a locally originated packet.
 	rmd->mtu = ie->base.mtu;
 
-	// ARP resolution is required for for non-Tunnel device.
-	if (!ne && !is_iff_type_tunnel(&ie->base)) {
-		ROUTER_INFO("%s: no neighbor.\n", ctx->name);
-		// to return unreacheable message by kernel.
-		return (struct interface *)&ctx->tap;
-	}
-
-	// check broadcast
-	switch (nh->broadcast_type) {
-	case IPV4_NONSTANDARD_BROADCAST:
-		ROUTER_INFO("IPV4_NONSTANDARD_BROADCAST\n");
-		return NULL;
-
-	case IPV4_LIMITED_BROADCAST:
-		ROUTER_DEBUG("IPV4_LIMITED_BROADCAST");
-		return (struct interface *)&ctx->tap;
-
-	case IPV4_DIRECTED_BROADCAST:
-		if (ie->directed_broadcast) {
-			ROUTER_DEBUG("IPV4_DIRECTED_BROADCAST(enable)\n");
-			return (struct interface *)&ctx->tap;
-		} else {
-			ROUTER_INFO("IPV4_DIRECTED_BROADCAST(disable)\n");
-			return NULL;
-		}
-
-	default:
-		break;
-	}
-
 	// need fragmentation packet
 	if (ie->base.mtu < mbuf->pkt_len) {
 		// DF bit is true, send to tap.
 		if (ipv4->fragment_offset & rte_cpu_to_be_16(IPV4_HDR_DF_FLAG)) {
 			ROUTER_DEBUG("DF bit is true, but fragmentation needed.\n");
 			rmd->no_outbound_napt = true;
-			return (struct interface *)&ctx->tap;
+			return (struct interface *)&ri->tap;
 		}
 
 		// We can't fragment packets with option header for now.
@@ -733,8 +749,7 @@ lookup(struct rte_mbuf *mbuf, struct router_context *ctx) {
 	if (rmd->has_option) {
 		// get source ip address
 		uint32_t src_addr = 0;
-		uint32_t addr = ne ? ne->ip_addr : dstip;
-		uint32_t nh_netaddr = get_networkaddr(addr, nh->netmask);
+		uint32_t nh_netaddr = get_networkaddr(dstip, nh->netmask);
 		for (int i = 0; i < ie->count; i++) {
 			uint32_t plen = ie->addr[i].prefixlen;
 			if (nh_netaddr == get_networkaddr(ie->addr[i].addr, plen)) {
@@ -757,19 +772,8 @@ lookup(struct rte_mbuf *mbuf, struct router_context *ctx) {
 		}
 	}
 
-	if (!is_iff_type_tunnel(&ie->base)) {
-		// rewrite ether header
-		struct ether_hdr *eth_hdr = rte_pktmbuf_mtod(mbuf, struct ether_hdr *);
-		ether_addr_copy(&ie->base.mac, &(eth_hdr->s_addr));
-		ether_addr_copy(&ne->mac_addr, &(eth_hdr->d_addr));
-
-		// rewrite vlan id.
-		if (ie->base.vid != 0)
-			mbuf->vlan_tci = ie->base.vid;
-	}
-
 	ROUTER_DEBUG("%s: forwarding[in:%d -> out:%d], vid[%d]",
-		     ctx->name, md->common.in_vif, ie->base.ifindex, ie->base.vid);
+		     ri->base.name, md->common.in_vif, ie->base.ifindex, ie->base.vid);
 	return ie;
 }
 
@@ -794,14 +798,13 @@ get_napt(struct rte_hash *hash, vifindex_t vif) {
  */
 static void
 routing_packets(struct router_runtime *runtime, struct router_instance *ri, uint32_t count) {
-	struct router_context *ctx = ri->ctx;
-	if (runtime == NULL || ctx == NULL) {
-		ROUTER_ERROR("router: invalid argument. runtime: %p, ctx: %p", runtime, ctx);
+	if (runtime == NULL) {
+		ROUTER_ERROR("router: invalid argument. runtime: %p", runtime);
 		return;
 	}
 
 	// For NAPT
-	struct rte_hash *ihash = ctx->tables.interface->hashmap;
+	struct rte_hash *ihash = ri->tables.interface->hashmap;
 	vifindex_t vifindex = VIF_INVALID_INDEX;
 	struct napt *napt = NULL;
 
@@ -819,15 +822,15 @@ routing_packets(struct router_runtime *runtime, struct router_instance *ri, uint
 		// Validity of packet is guaranteed as it has been checked before
 		// the packet is forwarded to tunnel from the router.
 		if (md->common.to_tap) {
-			mbuf_prepare_enqueue(ctx->tap.rr, mbuf);
+			mbuf_prepare_enqueue(ri->tap.rr, mbuf);
 			continue;
 		}
 
-		// Pass ARP packets to the kernel. We don't bother doing the rest.
+		// Pass ARP packets to the ARP resolver.
 		struct ether_hdr *hdr = rte_pktmbuf_mtod(mbuf, struct ether_hdr *);
 		if (hdr->ether_type == rte_cpu_to_be_16(ETHER_TYPE_ARP)) {
-			ROUTER_DEBUG("Send arp packet to kernel.");
-			mbuf_prepare_enqueue(ctx->tap.rr, mbuf);
+			ROUTER_DEBUG("Send arp packet to ARP resolver.");
+			ARPForward(ri->router_id, mbuf);
 			continue;
 		}
 
@@ -847,7 +850,7 @@ routing_packets(struct router_runtime *runtime, struct router_instance *ri, uint
 		}
 
 		// NAPT: process inbound
-		if ((ctx->napt_count > 0) && (!md->common.local)) {
+		if ((ri->napt_count > 0) && (!md->common.encap)) {
 			if (unlikely(md->common.in_vif != vifindex)) {
 				vifindex = md->common.in_vif;
 				napt = get_napt(ihash, vifindex);
@@ -868,7 +871,7 @@ routing_packets(struct router_runtime *runtime, struct router_instance *ri, uint
 		uint32_t dstip = ntohl(ipv4->dst_addr);
 		// drop a broadcast packet.
 		if (dstip == 0xFFFFFFFF) {
-			mbuf_prepare_enqueue(ctx->tap.rr, mbuf);
+			mbuf_prepare_enqueue(ri->tap.rr, mbuf);
 			continue;
 		}
 		if (dstip == 0) {
@@ -877,7 +880,7 @@ routing_packets(struct router_runtime *runtime, struct router_instance *ri, uint
 		}
 
 		// check all self interfaces.
-		if (interface_ip_is_self(ctx->tables.interface, dstip, md->common.in_vif)) {
+		if (interface_ip_is_self(ri->tables.interface, dstip, md->common.in_vif)) {
 			if (!process_self_addressed_mbuf(ri, mbuf)) {
 				ROUTER_DEBUG("Failed to process self-addressed packet.");
 				// We do not need to free mbuf here.
@@ -886,11 +889,21 @@ routing_packets(struct router_runtime *runtime, struct router_instance *ri, uint
 			continue;
 		}
 
+		// Multicast IP packet is dropped as it is basically not supported for now.
+		// Some multicast packets, such as VRRP, is supported separately though.
+		if (IS_IPV4_MCAST(dstip)) {
+			ROUTER_DEBUG("Drop multicast packet(%s)\n", ip2str(dstip));
+			rte_pktmbuf_free(mbuf);
+			continue;
+		}
+
 		// lookup the appropriate route for the mbuf.
 		// set interface information to flag_size in lookup().
-		struct interface *ie = lookup(mbuf, ctx);
+		bool drop;
+		struct interface *ie = lookup(ri, mbuf, &drop);
 		if (!ie) {
-			rte_pktmbuf_free(mbuf);
+			if (drop)
+				rte_pktmbuf_free(mbuf);
 			continue;
 		}
 
@@ -910,7 +923,7 @@ routing_packets(struct router_runtime *runtime, struct router_instance *ri, uint
 
 		// NAPT: process outbound
 		if ((!rmd->no_outbound_napt) &&
-		    (ctx->napt_count > 0) &&
+		    (ri->napt_count > 0) &&
 		    (md->common.out_vif != VIF_INVALID_INDEX)) {
 			if (unlikely(md->common.out_vif != vifindex)) {
 				vifindex = md->common.out_vif;
@@ -920,11 +933,6 @@ routing_packets(struct router_runtime *runtime, struct router_instance *ri, uint
 			if (napt) {
 				if (napt_outbound(napt, mbuf)) {
 					ROUTER_DEBUG("NAPT: processed outbound");
-
-					// If the destination is not resolved yet, it must be sent out
-					// as a local originated packet.
-					if (is_iff_type_tap(&ie->base))
-						md->common.local = true;
 				} else {
 					ROUTER_DEBUG("NAPT: ignored outbound");
 					rte_pktmbuf_free(mbuf);
@@ -936,7 +944,7 @@ routing_packets(struct router_runtime *runtime, struct router_instance *ri, uint
 		bool tap_rx = false;
 		size_t mtu;
 
-		if (md->common.local) {
+		if (md->common.encap) {
 			mtu = rmd->mtu;
 		} else {
 			mtu = ie->base.mtu;
@@ -973,8 +981,8 @@ routing_packets(struct router_runtime *runtime, struct router_instance *ri, uint
 	}
 
 	// bulk transfer mbufs if needed
-	for (int i = 0; i < ctx->rr_count; i++) {
-		struct router_ring *rr = ctx->rrp[i];
+	for (int i = 0; i < ri->rr_count; i++) {
+		struct router_ring *rr = ri->rrp[i];
 
 		if (rr->count == 0)
 			continue;
@@ -983,43 +991,26 @@ routing_packets(struct router_runtime *runtime, struct router_instance *ri, uint
 	}
 }
 
-parse_options_t parse_options[] = {
-	[RECORDROUTE_DISABLE] = parse_options_rr_disable,
-	[RECORDROUTE_IGNORE] = parse_options_rr_ignore,
-	[RECORDROUTE_ENABLE] = parse_options_rr_enable,
-};
-
 static bool
 router_register_instance(void *p, struct vsw_instance *base) {
 	struct router_runtime *r = p;
 	struct router_instance *ri = (struct router_instance *)base;
 
-	// set router context
-	ri->ctx = rte_zmalloc(NULL, sizeof(struct router_context), 0);
-	if (ri->ctx == NULL) {
-		ROUTER_ERROR("router: %s: rte_zmalloc() failed.", ri->base.name);
+	// Initialize router instance
+	if (!init_instance(ri))
 		return false;
-	}
-
-	ri->ctx->name = ri->base.name;
-	ri->ctx->parse_options = parse_options[ri->rr_mode];
-
-	if (!init_tables(ri->ctx)) {
-		ROUTER_ERROR("router: %s: init talbes failed.", base->name);
-		return false;
-	}
 
 	if (rte_hash_add_key_data(r->router_hash, &ri->base.id, ri) < 0) {
 		ROUTER_ERROR("router: Can't add router %s", base->name);
-		free_context(ri->ctx);
+		fini_instance(ri);
 		return false;
 	}
 
 	if (!reassemble_init(ri)) {
-		free_context(ri->ctx);
+		fini_instance(ri);
 		return false;
 	}
-	memset(&ri->death_row, 0, sizeof(struct rte_ip_frag_death_row));
+
 	return true;
 }
 
@@ -1031,7 +1022,7 @@ router_unregister_instance(void *p, struct vsw_instance *base) {
 
 	reassemble_fini(ri);
 
-	free_context(ri->ctx);
+	fini_instance(ri);
 	if (rte_hash_del_key(r->router_hash, &ri->base.id) < 0)
 		return false;
 
@@ -1040,37 +1031,50 @@ router_unregister_instance(void *p, struct vsw_instance *base) {
 
 /**
  * rule_add adds rule from frontend.
- * TODO: use radix trie.
  */
 static bool
-rule_add(struct router_context *ctx, struct router_rule *r) {
-	if (ctx->rules_count == ROUTER_RULE_MAX) {
+rule_add(struct router_instance *ri, struct router_rule *r) {
+	if (ri->rules_count == ROUTER_MAX_RULES) {
 		ROUTER_INFO("rules table is full.");
 		return false;
 	}
 
-	r->rr = get_router_ring(ctx, r->ring);
+	// Resize rules table when not enough.
+	if (ri->rules_count == ri->rules_cap) {
+		// If it fails, ri->rules will be crushed, so get it temporarily.
+		struct router_rule *tmp =
+		    rte_realloc(ri->rules,
+				sizeof(struct router_rule) * (ri->rules_cap + ROUTER_RULE_BASE_SIZE),
+				0);
+		if (!tmp) {
+			ROUTER_ERROR("[ROUTER] rule table realloc failed.");
+			return false;
+		}
+		ri->rules = tmp;
+		ri->rules_cap += ROUTER_RULE_BASE_SIZE;
+	}
+
+	r->rr = get_router_ring(ri, r->ring);
 	if (r->rr == NULL) {
 		ROUTER_ERROR("rule_add(): can't get router_ring");
 		return false;
 	}
 
 	// output info(ring, rule, mbuf)
-	ctx->rules[ctx->rules_count] = *r;
-	ctx->rules_count++;
+	ri->rules[ri->rules_count] = *r;
+	ri->rules_count++;
 
 	return true;
 }
 
 /**
  * rule_delete adds rule from frontend.
- * TODO: use radix trie.
  */
 static bool
-rule_delete(struct router_context *ctx, struct router_rule *r) {
+rule_delete(struct router_instance *ri, struct router_rule *r) {
 
-	for (int i = 0; i < ctx->rules_count; i++) {
-		struct router_rule *o = &ctx->rules[i];
+	for (int i = 0; i < ri->rules_count; i++) {
+		struct router_rule *o = &ri->rules[i];
 
 		if ((o->ring == r->ring) &&
 		    (o->rule.dstip == r->rule.dstip) &&
@@ -1079,9 +1083,24 @@ rule_delete(struct router_context *ctx, struct router_rule *r) {
 		    (o->rule.vni == r->rule.vni) &&
 		    (o->rule.dstport == r->rule.dstport) &&
 		    (o->rule.in_vif == r->rule.in_vif)) {
-			put_router_ring(ctx, o->rr);
-			ctx->rules_count--;
-			ctx->rules[i] = ctx->rules[ctx->rules_count];
+			put_router_ring(ri, o->rr);
+			ri->rules_count--;
+			ri->rules[i] = ri->rules[ri->rules_count];
+
+			// Shrink when free space in table increases
+			if ((ri->rules_count != 0) &&
+			    (ri->rules_cap - ri->rules_count) == ROUTER_RULE_BASE_SIZE) {
+				struct router_rule *tmp =
+				    rte_realloc(ri->rules,
+						sizeof(struct router_rule) * ri->rules_count,
+						0);
+				if (!tmp) {
+					ROUTER_ERROR("[ROUTER] rule table shrink failed.");
+					return false;
+				}
+				ri->rules = tmp;
+				ri->rules_cap = ri->rules_count;
+			}
 			return true;
 		}
 	}
@@ -1093,8 +1112,8 @@ rule_delete(struct router_context *ctx, struct router_rule *r) {
  * Enable NAPT
  */
 bool
-napt_enable(struct router_context *ctx, struct napt_config *c) {
-	struct interface_table *itbl = ctx->tables.interface;
+napt_enable(struct router_instance *ri, struct napt_config *c) {
+	struct interface_table *itbl = ri->tables.interface;
 	struct interface *iface;
 	uint32_t index = (uint32_t)c->vif;
 
@@ -1115,7 +1134,7 @@ napt_enable(struct router_context *ctx, struct napt_config *c) {
 		return false;
 	}
 
-	ctx->napt_count++;
+	ri->napt_count++;
 
 	return true;
 }
@@ -1124,8 +1143,8 @@ napt_enable(struct router_context *ctx, struct napt_config *c) {
  * Disable NAPT
  */
 bool
-napt_disable(struct router_context *ctx, vifindex_t *vif) {
-	struct interface_table *itbl = ctx->tables.interface;
+napt_disable(struct router_instance *ri, vifindex_t *vif) {
+	struct interface_table *itbl = ri->tables.interface;
 	struct interface *iface;
 	uint32_t index = (uint32_t)(*vif);
 
@@ -1144,7 +1163,7 @@ napt_disable(struct router_context *ctx, vifindex_t *vif) {
 	napt_free(iface->napt);
 	iface->napt = NULL;
 
-	ctx->napt_count--;
+	ri->napt_count--;
 
 	return true;
 }
@@ -1154,10 +1173,8 @@ router_control_instance(void *p, struct vsw_instance *base, void *param) {
 	struct router_instance *ri = (struct router_instance *)base;
 	struct router_control_param *rp = param;
 
-	struct router_context *ctx = ri->ctx;
-	struct neighbor_table *nt = ctx->tables.neighbor;
-	struct interface_table *it = ctx->tables.interface;
-	struct pbr_table *pt = ctx->tables.pbr;
+	struct interface_table *it = ri->tables.interface;
+	struct pbr_table *pt = ri->tables.pbr;
 
 	struct router_rule *rule = rp->info;
 	struct route_entry *re = rp->info;
@@ -1166,36 +1183,31 @@ router_control_instance(void *p, struct vsw_instance *base, void *param) {
 	struct interface_addr_entry *ia = rp->info;
 	struct pbr_entry *pe = rp->info;
 
+	const char *vrfname = ri->base.name;
+
 	// check if there's any control message from the frontend.
 	// pre check
 	switch (rp->cmd) {
-	case ROUTER_CMD_ENABLE:
-		ctx->active = true;
-		break;
-	case ROUTER_CMD_DISABLE:
-		ctx->active = false;
-		break;
-
 	case ROUTER_CMD_CONFIG_TAP:
-		ctx->tap.ring = (struct rte_ring *)rp->info;
-		ctx->tap.rr = get_router_ring(ctx, ctx->tap.ring);
-		ctx->tap.flags = IFF_TYPE_TAP;
+		ri->tap.ring = (struct rte_ring *)rp->info;
+		ri->tap.rr = get_router_ring(ri, ri->tap.ring);
+		ri->tap.flags = IFF_TYPE_TAP;
 		break;
 
 	case ROUTER_CMD_RULE_ADD:
-		return rule_add(ctx, rule);
+		return rule_add(ri, rule);
 
 	case ROUTER_CMD_RULE_DELETE:
-		return rule_delete(ctx, rule);
+		return rule_delete(ri, rule);
 
 	case ROUTER_CMD_PBRRULE_ADD:
 		if (!pt) {
-			if (!(pt = pbr_init(ctx->name)))
+			if (!(pt = pbr_init(vrfname)))
 				return false;
-			ctx->tables.pbr = pt;
+			ri->tables.pbr = pt;
 		}
-		if (!pbr_entry_add(&ctx->tables, pe)) {
-			ROUTER_ERROR("%s: Failed to add pbr rule.", ctx->name);
+		if (!pbr_entry_add(&ri->tables, pe)) {
+			ROUTER_ERROR("%s: Failed to add pbr rule.", vrfname);
 			return false;
 		}
 		break;
@@ -1205,70 +1217,91 @@ router_control_instance(void *p, struct vsw_instance *base, void *param) {
 			return false;
 
 		if (!pbr_entry_delete(pt, pe)) {
-			ROUTER_ERROR("%s: Failed to delete pbr entry.", ctx->name);
+			ROUTER_ERROR("%s: Failed to delete pbr entry.", vrfname);
 			return false;
+		}
+		// If there's no pbr entry, then free the table.
+		if (ri->tables.pbr->rule_num == 0) {
+			pbr_fini(ri->tables.pbr);
+			ri->tables.pbr = NULL;
 		}
 		break;
 	// manage the rib
 	case ROUTER_CMD_ROUTE_ADD:
-		if (!route_entry_add(&ctx->tables, re)) {
-			ROUTER_ERROR("%s: Failed to add route.", ctx->name);
+		if (!route_entry_add(&ri->tables, re)) {
+			ROUTER_ERROR("%s: Failed to add route.", vrfname);
 			return false;
 		}
 		break;
 
 	case ROUTER_CMD_ROUTE_DELETE:
-		if (!route_entry_delete(&ctx->tables, re)) {
-			ROUTER_ERROR("%s: Failed to delete route.", ctx->name);
+		if (!route_entry_delete(&ri->tables, re)) {
+			ROUTER_ERROR("%s: Failed to delete route.", vrfname);
 			return false;
 		}
 		break;
 
-	case ROUTER_CMD_NEIGH_ADD:
-		if (!neighbor_entry_update(nt, ne)) {
-			ROUTER_ERROR("%s: Failed to add neighbor entry", ctx->name);
-			return false;
+	case ROUTER_CMD_NEIGH_UPDATE:
+		{
+			struct interface *ie = interface_entry_get(it, ne->ifindex);
+			struct neighbor *neigh;
+			if (!(neigh = neighbor_entry_update(ie->neighbor, ne))) {
+				ROUTER_ERROR("%s: Failed to update neighbor entry", vrfname);
+				return false;
+			}
+
+			// XXX: if the ring is full, pending packet may be dropped.
+			struct rte_mbuf *mbuf = neighbor_entry_pop_pending(neigh);
+			if (mbuf) {
+				if (rte_ring_enqueue(ri->base.input, mbuf) < 0) {
+					ROUTER_WARNING("%s: Failed to queue pending packet", vrfname);
+					rte_pktmbuf_free(mbuf);
+				}
+			}
 		}
 		break;
 
 	case ROUTER_CMD_NEIGH_DELETE:
-		if (!neighbor_entry_delete(nt, ne)) {
-			ROUTER_ERROR("%s: Failed to delete neighbor entry", ctx->name);
-			return false;
+		{
+			struct interface *ie = interface_entry_get(it, ne->ifindex);
+			if (!neighbor_entry_delete(ie->neighbor, ne->ip)) {
+				ROUTER_ERROR("%s: Failed to delete neighbor entry", vrfname);
+				return false;
+			}
 		}
 		break;
 
 	case ROUTER_CMD_VIF_ADD:
-		if (!interface_entry_add(ctx, ie)) {
-			ROUTER_ERROR("%s: Failed to add interface.", ctx->name);
+		if (!interface_entry_add(ri, ie)) {
+			ROUTER_ERROR("%s: Failed to add interface.", vrfname);
 			return false;
 		}
 		break;
 
 	case ROUTER_CMD_VIF_DELETE:
-		if (!interface_entry_delete(ctx, ie)) {
-			ROUTER_ERROR("%s: Failed to delete interface.", ctx->name);
+		if (!interface_entry_delete(ri, ie)) {
+			ROUTER_ERROR("%s: Failed to delete interface.", vrfname);
 			return false;
 		}
 		break;
 
 	case ROUTER_CMD_VIF_ADD_IP:
 		if (!interface_ip_add(it, ia)) {
-			ROUTER_ERROR("%s: Failed to add IP address to VIF %u.", ctx->name, ia->ifindex);
+			ROUTER_ERROR("%s: Failed to add IP address to VIF %u.", vrfname, ia->ifindex);
 			return false;
 		}
 		break;
 
 	case ROUTER_CMD_VIF_DELETE_IP:
 		if (!interface_ip_delete(it, ia)) {
-			ROUTER_ERROR("%s: Failed to delete IP address from VIF %u.", ctx->name, ia->ifindex);
+			ROUTER_ERROR("%s: Failed to delete IP address from VIF %u.", vrfname, ia->ifindex);
 			return false;
 		}
 		break;
 
 	case ROUTER_CMD_VIF_UPDATE_MTU:
 		if (!interface_mtu_update(it, ie)) {
-			ROUTER_ERROR("%s: Failed to update MTU at VIF %u.", ctx->name, ie->ifindex);
+			ROUTER_ERROR("%s: Failed to update MTU at VIF %u.", vrfname, ie->ifindex);
 			return false;
 		}
 		break;
@@ -1280,15 +1313,15 @@ router_control_instance(void *p, struct vsw_instance *base, void *param) {
 		// Therefore, it is not deleted here. arp too.
 
 	case ROUTER_CMD_NAPT_ENABLE:
-		if (!napt_enable(ctx, (struct napt_config *)rp->info)) {
-			ROUTER_ERROR("%s: Failed to enable NAPT.", ctx->name);
+		if (!napt_enable(ri, (struct napt_config *)rp->info)) {
+			ROUTER_ERROR("%s: Failed to enable NAPT.", vrfname);
 			return false;
 		}
 		break;
 
 	case ROUTER_CMD_NAPT_DISABLE:
-		if (!napt_disable(ctx, (vifindex_t *)rp->info)) {
-			ROUTER_ERROR("%s: Failed to disable NAPT.", ctx->name);
+		if (!napt_disable(ri, (vifindex_t *)rp->info)) {
+			ROUTER_ERROR("%s: Failed to disable NAPT.", vrfname);
 			return false;
 		}
 		break;
@@ -1320,7 +1353,7 @@ router_init(void *param) {
 	// Create hash table for router instances
 	struct rte_hash_parameters hash_params = {
 	    .name = "routers",
-	    .entries = MAX_ROUTERS,
+	    .entries = ROUTER_MAX_ROUTERS,
 	    .key_len = sizeof(uint64_t),
 	    .hash_func = rte_jhash,
 	    .hash_func_init_val = 0,
@@ -1358,7 +1391,7 @@ router_process(void *p) {
 		if (!ri->base.enabled)
 			continue;
 
-		unsigned count = rte_ring_dequeue_burst(ri->base.input, (void **)r->mbufs, MAX_ROUTER_MBUFS, NULL);
+		unsigned count = rte_ring_dequeue_burst(ri->base.input, (void **)r->mbufs, ROUTER_MAX_MBUFS, NULL);
 		if (count > 0) {
 			ROUTER_DEBUG("name = %s count = %d ----------", ri->base.name, count);
 
@@ -1379,9 +1412,9 @@ router_deinit(void *p) {
 
 	ROUTER_DEBUG("%s(%d)", __func__, __LINE__);
 
-	// free context
+	// free instance members
 	while (rte_hash_iterate(r->router_hash, (const void **)&id, (void **)&ri, &next) >= 0) {
-		free_context(ri->ctx);
+		fini_instance(ri);
 
 		// free fragmentation table.
 		rte_ip_frag_table_destroy(ri->frag_tbl);

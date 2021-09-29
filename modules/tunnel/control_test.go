@@ -28,25 +28,30 @@ import (
 //
 
 func TestToL3CParam(t *testing.T) {
+	index := vswitch.VIFIndex(200)
 	addressType := vswitch.AF_IPv4
 	localAddr := net.ParseIP("172.16.0.2")
 	remoteAddr := net.ParseIP("172.16.0.1")
 	hopLimit := uint8(defaultHopLimit)
 	tos := int8(defaultTos)
 
-	from := createL3SetEnableCmdParam(addressType, localAddr, remoteAddr, hopLimit, tos, nil, nil)
+	from := createL3SetEnableCmdParam(index, addressType, localAddr, remoteAddr, hopLimit, tos, nil, nil)
 
 	if from == nil {
 		t.Fatalf("from nil\n")
 	}
 
-	to := toL3CParam(from);
+	to := toL3CParam(from)
 	if to == nil {
 		t.Fatalf("to nil\n")
 	}
 
 	if to.cmd != from.cmd {
 		t.Fatalf("cmd failed\n")
+	}
+
+	if to.index != from.index {
+		t.Fatalf("index failed\n")
 	}
 
 	if to.address_type != from.address_type {
@@ -157,13 +162,14 @@ func TestCreateL3SetTOSCmdParam(t *testing.T) {
 }
 
 func TestCreateL3SetEnableCmdParam(t *testing.T) {
+	index := vswitch.VIFIndex(200)
 	addressType := vswitch.AF_IPv4
 	localAddr := net.ParseIP("172.16.0.2")
 	remoteAddr := net.ParseIP("172.16.0.1")
 	hopLimit := uint8(defaultHopLimit)
 	tos := int8(defaultTos)
 
-	param := createL3SetEnableCmdParam(addressType, localAddr, remoteAddr, hopLimit, tos, nil, nil)
+	param := createL3SetEnableCmdParam(index, addressType, localAddr, remoteAddr, hopLimit, tos, nil, nil)
 
 	if param == nil {
 		t.Fatalf("param nil\n")
@@ -200,7 +206,7 @@ func TestToL2CParam(t *testing.T) {
 		t.Fatalf("from nil\n")
 	}
 
-	to := toL2CParam(from);
+	to := toL2CParam(from)
 	if to == nil {
 		t.Fatalf("to nil\n")
 	}

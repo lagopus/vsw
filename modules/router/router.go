@@ -30,13 +30,12 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"sort"
 	"sync"
-	"syscall"
 	"unsafe"
 
 	"github.com/lagopus/vsw/dpdk"
 	"github.com/lagopus/vsw/utils/notifier"
-	"github.com/lagopus/vsw/utils/ringpair"
 	"github.com/lagopus/vsw/vswitch"
 	vlog "github.com/lagopus/vsw/vswitch/log"
 )
@@ -44,30 +43,30 @@ import (
 const (
 	moduleName        = "router"
 	maxRouterRequests = 1024
+
+	// maxRouterNamesize defines the max namesize of a router instance.
+	// The name is used to create DPDK instances, thus should be small
+	// enough to meet the limit enforced by DPDK.
+	maxRouterNamesize = 12
 )
 
-// package private: read only
-var pbrAction map[vswitch.PBRAction]C.pbr_action_t = map[vswitch.PBRAction]C.pbr_action_t{
-	vswitch.PBRActionNone:    C.PBRACTION_NONE,
-	vswitch.PBRActionDrop:    C.PBRACTION_DROP,
-	vswitch.PBRActionPass:    C.PBRACTION_PASS,
-	vswitch.PBRActionForward: C.PBRACTION_FORWARD}
-
 type RouterInstance struct {
-	base       *vswitch.BaseInstance
-	service    *routerService
-	vrfidx     uint64
-	instance   *vswitch.RuntimeInstance
-	param      *C.struct_router_instance
-	enabled    bool
-	mtu        vswitch.MTU
-	vifs       map[vswitch.VIFIndex]*dpdk.Ring
-	addrsCount uint
-	notifyRule chan notifier.Notification
-	pbr        map[string]int
-	ctrls      uint
-	ctrlsErr   uint
-	mutex      sync.Mutex
+	base           *vswitch.BaseInstance
+	service        *routerService
+	vrfidx         vswitch.VRFIndex
+	instance       *vswitch.RuntimeInstance
+	param          *C.struct_router_instance
+	enabled        bool
+	mtu            vswitch.MTU
+	neighborCaches map[*vswitch.VIF][]C.struct_neighbor
+	arpResolver    *arpResolver
+	tap            *dpdk.Ring
+	addrsCount     uint
+	notifyRule     chan notifier.Notification
+	pbr            map[string]int
+	ctrls          uint
+	ctrlsErr       uint
+	mutex          sync.Mutex
 }
 
 /*
@@ -79,8 +78,7 @@ type routerService struct {
 	runtime   *vswitch.Runtime
 	mutex     sync.Mutex
 	terminate chan struct{}
-	rp        *ringpair.RingPair
-	routers   map[uint64]*RouterInstance
+	routers   map[vswitch.VRFIndex]*RouterInstance
 	running   bool
 	refcnt    uint
 	notify    chan notifier.Notification // receive routing informations
@@ -90,6 +88,7 @@ type routerService struct {
 var log = vswitch.Logger
 var rs *routerService
 var mutex sync.Mutex
+var mempool *dpdk.MemPool
 
 // TOML config
 type routerConfigSection struct {
@@ -104,7 +103,19 @@ type routerConfig struct {
 var config routerConfig
 var defaultConfig = routerConfig{
 	SlaveCore:     2,
-	RRProcessMode: "disable",
+	RRProcessMode: recordRouteDisable,
+}
+
+const (
+	recordRouteDisable = "disable"
+	recordRouteIgnore  = "ignore"
+	recordRouteEnable  = "enable"
+)
+
+var recordRouteProcessMode = map[string]C.rr_process_mode_t{
+	recordRouteDisable: C.RECORDROUTE_DISABLE,
+	recordRouteIgnore:  C.RECORDROUTE_IGNORE,
+	recordRouteEnable:  C.RECORDROUTE_ENABLE,
 }
 
 //Match rule parameter
@@ -157,20 +168,9 @@ func getRouterService() (*routerService, error) {
 		return rs, nil
 	}
 
-	// create a pair of rings for C/Go communication
-	rp := ringpair.Create(&ringpair.Config{
-		Prefix:   "router",
-		Counts:   [2]uint{maxRouterRequests},
-		SocketID: dpdk.SOCKET_ID_ANY,
-	})
-	if rp == nil {
-		rp.Free()
-		return nil, errors.New("Can't create a ringpair")
-	}
-
 	param := (*C.struct_router_runtime_param)(C.calloc(1, C.sizeof_struct_router_runtime_param))
-	param.notify = (*C.struct_rte_ring)(unsafe.Pointer(rp.Rings[0]))
-	param.pool = (*C.struct_rte_mempool)(unsafe.Pointer(vswitch.GetDpdkResource().Mempool))
+	mempool = vswitch.GetDpdkResource().Mempool
+	param.pool = (*C.struct_rte_mempool)(unsafe.Pointer(mempool))
 
 	ops := vswitch.LagopusRuntimeOps(unsafe.Pointer(&C.router_runtime_ops))
 	log.Printf("call NewRuntime with slave core(%v)\n", config.SlaveCore)
@@ -185,10 +185,8 @@ func getRouterService() (*routerService, error) {
 	rs = &routerService{
 		runtime:   rt,
 		terminate: make(chan struct{}),
-		rp:        rp,
-		routers:   make(map[uint64]*RouterInstance),
+		routers:   make(map[vswitch.VRFIndex]*RouterInstance),
 		refcnt:    1,
-		notify:    vswitch.GetNotifier().Listen(),
 	}
 
 	// register to debugsh
@@ -207,11 +205,7 @@ func (s *routerService) free() {
 	s.refcnt--
 	if s.refcnt == 0 {
 		s.stop()
-		for _, r := range s.routers {
-			r.instance.Unregister()
-		}
 		s.runtime.Terminate()
-		s.rp.Free()
 		rs = nil
 	}
 }
@@ -237,19 +231,32 @@ func (s *routerService) unregisterRouter(r *RouterInstance) {
 
 }
 
+func (s *routerService) getRouterInstance(name string) *RouterInstance {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	for _, r := range s.routers {
+		if r.base.Name() == name {
+			return r
+		}
+	}
+
+	return nil
+}
+
+func (s *routerService) getRouterByIndex(index vswitch.VRFIndex) *RouterInstance {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	return s.routers[index]
+}
+
 func (s *routerService) start() {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	if s.running {
-		return
-	}
-
+	s.notify = vswitch.GetNotifier().Listen()
 	s.running = true
-	go func() {
-		<-s.terminate
-		s.stop()
-	}()
 
 	// listen to receive routing informations.
 	go s.listen()
@@ -259,21 +266,21 @@ func (s *routerService) stop() {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	if !s.running {
-		s.terminate <- struct{}{}
-	}
+	vswitch.GetNotifier().Close(s.notify)
+	s.running = false
 }
 
 func (s *routerService) listen() {
 	for notify := range s.notify {
 		switch target := notify.Target.(type) {
 		case *vswitch.VIF:
+			// The VIF is not associated with any VRF. Ignore.
 			if target.VRF() == nil {
 				continue
 			}
-			// VIF informations.
-			vrfidx := uint64(target.VRF().Index())
-			router := s.routers[vrfidx]
+
+			// Get the router associated with the VIF.
+			router := s.getRouterByIndex(target.VRF().Index())
 			if router == nil {
 				continue
 			}
@@ -281,30 +288,29 @@ func (s *routerService) listen() {
 			switch val := notify.Value.(type) {
 			case nil:
 				log.Printf("RS:[nil]")
+
 			case vswitch.MTU:
 				log.Printf("RS:[MTU] mtu(%v)", val)
-				if err := router.updateInterfaceMTU(notify.Type, target.Index(), val); err != nil {
-					log.Err("RS: updateInterfaceMTU failed: %v", err)
+				if err := router.procInterfaceMTU(notify.Type, target.Index(), val); err != nil {
+					log.Err("RS: procInterfaceMTU failed: %v", err)
 				}
+
 			case vswitch.IPAddr:
 				log.Printf("RS:[IPAddr] vif: %v, val: %v\n", target, val)
-				if err := router.updateInterfaceIpEntry(notify.Type, target.Index(), val); err != nil {
-					log.Err("RS: updateInterfaceIpEntry failed: %v", err)
+				if err := router.procInterfaceIpEntry(notify.Type, target.Index(), val); err != nil {
+					log.Err("RS: procInterfaceIpEntry failed: %v", err)
 				}
+
 			case bool:
 				log.Printf("RS:[VIF enabled] %v", val)
-			case vswitch.Neighbour:
-				if err := router.updateNeighborEntry(notify.Type, target.Index(), val); err != nil {
-					log.Err("RS: updateNeighborEntry failed: %v", err)
-				}
+
 			default:
 				log.Err("RS: VIF(%v) not supported %v", target, val)
 			}
 
 		case *vswitch.VRF:
-			/// VRF informations.
-			vrfidx := uint64(target.Index())
-			router := s.routers[vrfidx]
+			// Get the router of the given VRF.
+			router := s.getRouterByIndex(target.Index())
 			if router == nil {
 				continue
 			}
@@ -314,19 +320,23 @@ func (s *routerService) listen() {
 				//TODO: VRF created and deleted.
 				log.Printf("RS:[VRF] vrf(%v) type(%v)",
 					target.Name(), notify.Type)
+
 			case vswitch.Route:
 				// Route added and deleted.
-				if err := router.updateRouteEntry(notify.Type, val); err != nil {
-					log.Err("RS: updateRouteEntry failed: %v", err)
+				if err := router.procRouteEntry(notify.Type, val); err != nil {
+					log.Err("RS: procRouteEntry failed: %v", err)
 				}
+
 			case *vswitch.VIF:
 				//TODO: VIF added to vrf.
 				log.Printf("RS:[VIF] vrf(%v) type(%v) vif(%v)",
 					target.Name(), notify.Type, val.Name())
-			case vswitch.PBREntry:
-				if err := router.updatePBREntry(notify.Type, val); err != nil {
-					log.Err("RS: updatePBREntry failed: %v", err)
+
+			case *vswitch.PBREntry:
+				if err := router.procPBREntry(notify.Type, val); err != nil {
+					log.Err("RS: procPBREntry failed: %v", err)
 				}
+
 			default:
 				log.Err("RS: VRF(%v) not supported %v", target, val)
 			}
@@ -363,6 +373,7 @@ func (r *RouterInstance) listenRules() {
 			if err := r.control(ROUTER_CMD_CONFIG_TAP, unsafe.Pointer(rule.Ring)); err != nil {
 				log.Printf("Config ring failed: %v", err)
 			}
+			r.tap = rule.Ring
 
 		case vswitch.MatchIPv4DstInVIF:
 			val, ok := rule.Param.(*vswitch.ScopedAddress)
@@ -460,7 +471,7 @@ func loadConfig() {
 
 var once sync.Once
 
-var routerCount uint64 = 0
+var routerCount int
 var routerCountMutex sync.Mutex
 
 func newRouterInstance(base *vswitch.BaseInstance, priv interface{}) (vswitch.Instance, error) {
@@ -479,42 +490,35 @@ func newRouterInstance(base *vswitch.BaseInstance, priv interface{}) (vswitch.In
 		return nil, err
 	}
 
-	if routerCount == C.MAX_ROUTERS {
+	if routerCount == C.ROUTER_MAX_ROUTERS {
 		return nil, errors.New("Router instance exceeded the limit.")
 	}
 	routerCount++
 
 	r := &RouterInstance{
-		base:       base,
-		service:    s,
-		vrfidx:     uint64(vrf.Index()),
-		enabled:    false,
-		mtu:        vswitch.DefaultMTU,
-		vifs:       make(map[vswitch.VIFIndex]*dpdk.Ring),
-		notifyRule: base.Rules().Notifier().Listen(),
-	}
-
-	if err := s.registerRouter(r); err != nil {
-		return nil, err
+		base:           base,
+		service:        s,
+		vrfidx:         vrf.Index(),
+		enabled:        false,
+		mtu:            vswitch.DefaultMTU,
+		neighborCaches: make(map[*vswitch.VIF][]C.struct_neighbor),
+		notifyRule:     base.Rules().Notifier().Listen(),
 	}
 
 	// r.param
 	r.param = (*C.struct_router_instance)(C.calloc(1, C.sizeof_struct_router_instance))
 	// check name
-	if len(base.Name()) > C.ROUTER_NAME_SIZE {
+	if len(base.Name()) > maxRouterNamesize {
 		return nil, fmt.Errorf("Invalid router name(too long).")
 	}
 	r.param.base.name = C.CString(base.Name())
 	r.param.base.input = (*C.struct_rte_ring)(unsafe.Pointer(base.Input()))
-	switch config.RRProcessMode {
-	case "disable":
-		r.param.rr_mode = C.RECORDROUTE_DISABLE
-	case "ignore":
-		r.param.rr_mode = C.RECORDROUTE_IGNORE
-	case "enable":
-		r.param.rr_mode = C.RECORDROUTE_ENABLE
-	default:
-		log.Printf("RI: invalid record route process mode, set default \"disable\"\n")
+	r.param.router_id = C.vrfindex_t(r.vrfidx)
+
+	if mode, ok := recordRouteProcessMode[config.RRProcessMode]; ok {
+		r.param.rr_mode = mode
+	} else {
+		log.Warning("Invalid value in rr_process_mode (%s), disabled", config.RRProcessMode)
 		r.param.rr_mode = C.RECORDROUTE_DISABLE
 	}
 
@@ -531,6 +535,14 @@ func newRouterInstance(base *vswitch.BaseInstance, priv interface{}) (vswitch.In
 
 	r.instance = ri
 
+	if err := s.registerRouter(r); err != nil {
+		return nil, err
+	}
+
+	// create ARP resolver
+	r.arpResolver = newARPResolver(r)
+	r.arpResolver.start()
+
 	// listen to receive rules.
 	go r.listenRules()
 
@@ -541,11 +553,15 @@ func (r *RouterInstance) Free() {
 	routerCountMutex.Lock()
 	defer routerCountMutex.Unlock()
 
+	r.service.unregisterRouter(r)
+
 	if r.instance != nil {
 		r.instance.Unregister()
 	}
 
-	r.service.unregisterRouter(r)
+	r.arpResolver.stop()
+
+	r.service.free()
 
 	C.free(unsafe.Pointer(r.param.base.name))
 	C.free(unsafe.Pointer(r.param))
@@ -563,6 +579,7 @@ func (r *RouterInstance) Enable() error {
 		}
 		r.enabled = true
 	}
+
 	return nil
 }
 
@@ -571,26 +588,29 @@ func (r *RouterInstance) Disable() {
 		r.instance.Disable()
 		r.enabled = false
 	}
-
-	r.service.free()
 }
 
 // for listen
-func (r *RouterInstance) updatePBREntry(cmdType notifier.Type, pbr vswitch.PBREntry) error {
+func (r *RouterInstance) procPBREntry(cmdType notifier.Type, pbr *vswitch.PBREntry) error {
+	if len(pbr.NextHops) > C.ROUTER_MAX_PBR_NEXTHOPS {
+		return fmt.Errorf("PBR Nexthops exceeded the limit; max %d entries", C.ROUTER_MAX_PBR_NEXTHOPS)
+	}
+
+	smask, _ := pbr.SrcIP.Mask.Size()
+	dmask, _ := pbr.DstIP.Mask.Size()
+
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
-	// Management pbr index
-	smask, _ := pbr.SrcIP.Mask.Size()
-	dmask, _ := pbr.DstIP.Mask.Size()
-	inif := C.vifindex_t(C.VIF_INVALID_INDEX)
-	if pbr.InputVIF != nil {
-		inif = C.vifindex_t(pbr.InputVIF.Index())
-	}
 	pe := (*C.struct_pbr_entry)(unsafe.Pointer(&r.param.p[0]))
-	*pe = C.struct_pbr_entry{}
-	pe.priority = C.int(pbr.Priority)
-	pe.in_vif = inif
+	pe.priority = C.uint(pbr.Priority)
+
+	if pbr.InputVIF != nil {
+		pe.in_vif = C.vifindex_t(pbr.InputVIF.Index())
+	} else {
+		pe.in_vif = C.vifindex_t(C.VIF_INVALID_INDEX)
+	}
+
 	pe.src_addr = ipv4toCuint32(pbr.SrcIP.IP)
 	pe.src_mask = C.uint8_t(smask)
 	pe.dst_addr = ipv4toCuint32(pbr.DstIP.IP)
@@ -600,37 +620,31 @@ func (r *RouterInstance) updatePBREntry(cmdType notifier.Type, pbr vswitch.PBREn
 	pe.dst_port.from = C.uint16_t(pbr.DstPort.Start)
 	pe.dst_port.to = C.uint16_t(pbr.DstPort.End)
 	pe.protocol = C.uint8_t(pbr.Proto)
+	pe.pass = C.bool(pbr.Pass)
+	pe.nexthop_count = C.uint8_t(len(pbr.NextHops))
 
-	// no nexthop is drop
-	length := len(pbr.NextHops)
-	if length == 0 {
-		// for drop action
-		length = 1
-	}
-	// set nexthop
-	pe.nexthop_num = C.uint32_t(length)
-	size := length * C.sizeof_struct_nexthop
-	pe.nexthops = (*C.struct_nexthop)(C.calloc(1, C.ulong(size)))
-	nexthops := (*[1 << 30]C.struct_nexthop)(unsafe.Pointer(pe.nexthops))[:length:length]
-	i := 0 // index of array
-	// If there is no nexthop, the action is DROP
-	nexthops[i].action = C.PBRACTION_DROP
-	for _, nh := range pbr.NextHops {
-		if nh.Dev != nil {
-			nexthops[i].ifindex = C.uint16_t(nh.Dev.VIFIndex())
-		} else {
-			nexthops[i].ifindex = C.VIF_INVALID_INDEX
+	if pe.nexthop_count > 0 {
+		var nhs []*vswitch.Nexthop
+		for _, nh := range pbr.NextHops {
+			nhs = append(nhs, nh)
 		}
-		nexthops[i].gw = ipv4toCuint32(nh.Gw)
-		nexthops[i].weight = C.uint32_t(nh.Weight)
-		nexthops[i].broadcast_type = C.IPV4_NO_BROADCAST
-		// Action NONE is not used in PBR
-		if nh.Action == C.PBRACTION_PASS {
-			nexthops[i].action = C.PBRACTION_PASS
-		} else {
-			nexthops[i].action = C.PBRACTION_FORWARD
+
+		// sort NextHops by Weight
+		sort.Slice(nhs, func(i, j int) bool {
+			return nhs[i].Weight > nhs[j].Weight
+		})
+
+		penh := (*C.struct_pbr_entry_nh)(unsafe.Pointer(pe))
+
+		for i, nh := range nhs {
+			if nh.Dev != nil {
+				penh.nexthops[i].out_vif = C.vifindex_t(nh.Dev.VIFIndex())
+			} else {
+				penh.nexthops[i].out_vif = C.VIF_INVALID_INDEX
+			}
+			penh.nexthops[i].gw = ipv4toCuint32(nh.Gw)
+			penh.nexthops[i].weight = C.uint32_t(nh.Weight)
 		}
-		i++
 	}
 
 	if cmdType == notifier.Add {
@@ -639,7 +653,12 @@ func (r *RouterInstance) updatePBREntry(cmdType notifier.Type, pbr vswitch.PBREn
 	return r.control(ROUTER_CMD_PBRRULE_DELETE, unsafe.Pointer(pe))
 }
 
-func (r *RouterInstance) updateRouteEntry(cmdType notifier.Type, route vswitch.Route) error {
+func (r *RouterInstance) procRouteEntry(cmdType notifier.Type, route vswitch.Route) error {
+	// Ignore Non-IPv4 route
+	if route.Dst != nil && route.Dst.IP.To4() == nil {
+		return nil
+	}
+
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
@@ -654,46 +673,41 @@ func (r *RouterInstance) updateRouteEntry(cmdType notifier.Type, route vswitch.R
 	return r.control(ROUTER_CMD_ROUTE_DELETE, unsafe.Pointer(info))
 }
 
-func (r *RouterInstance) updateNeighborEntry(cmdType notifier.Type, index vswitch.VIFIndex, neighbor vswitch.Neighbour) error {
+func (r *RouterInstance) updateNeighborEntry(index vswitch.VIFIndex, target IPv4Addr, hwaddr EtherAddr) error {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
-	// create entry.
 	ne := (*C.struct_neighbor_entry)(unsafe.Pointer(&r.param.p[0]))
-	*ne = C.struct_neighbor_entry{}
-	ne.ifindex = C.int(index)
-	ne.ip = ipv4toCuint32(neighbor.Dst)
-	mac := neighbor.LinkLocalAddr
-	if mac != nil {
-		m := (*[1 << 30]byte)(unsafe.Pointer(&ne.mac.addr_bytes))[:6:6]
-		copy(m, (mac)[:])
+	for i := 0; i < 6; i++ {
+		ne.mac.addr_bytes[i] = C.uint8_t(hwaddr[i])
 	}
-	ne.state = C.int(neighbor.State)
+	ne.ifindex = C.vifindex_t(index)
+	ne.ip = C.uint32_t(target)
 
-	switch cmdType {
-	case notifier.Add, notifier.Update:
-		// Add neighbor entry to backend hash table.
-		// And addition processing and update processing are the same processing.
-		return r.control(ROUTER_CMD_NEIGH_ADD, unsafe.Pointer(ne))
-
-	case notifier.Delete:
-		// Remove neighbor entry from bakend hash table.
-		return r.control(ROUTER_CMD_NEIGH_DELETE, unsafe.Pointer(ne))
-
-	default:
-		return fmt.Errorf("Unknown cmdType: %v", cmdType)
-	}
-
-	return nil
+	return r.control(ROUTER_CMD_NEIGH_UPDATE, unsafe.Pointer(ne))
 }
 
-func (r *RouterInstance) updateInterfaceIpEntry(cmdType notifier.Type, vifindex vswitch.VIFIndex, ip vswitch.IPAddr) error {
+func (r *RouterInstance) deleteNeighborEntry(index vswitch.VIFIndex, target IPv4Addr) error {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
+
+	ne := (*C.struct_neighbor_entry)(unsafe.Pointer(&r.param.p[0]))
+	ne.ifindex = C.vifindex_t(index)
+	ne.ip = C.uint32_t(target)
+
+	return r.control(ROUTER_CMD_NEIGH_DELETE, unsafe.Pointer(ne))
+}
+
+func (r *RouterInstance) procInterfaceIpEntry(cmdType notifier.Type, vifindex vswitch.VIFIndex, ip vswitch.IPAddr) error {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	// update IP addresses held by ARP resolver
+	r.arpResolver.updateIPAddr(vifindex)
 
 	var cmd routerCmd
 	if cmdType == notifier.Add {
-		if r.addrsCount == C.IPADDR_MAX_NUM {
+		if r.addrsCount == C.ROUTER_MAX_VIF_IPADDRS {
 			return errors.New("Number of self IP addresses exceeded the limit")
 		}
 		cmd = ROUTER_CMD_VIF_ADD_IP
@@ -707,20 +721,20 @@ func (r *RouterInstance) updateInterfaceIpEntry(cmdType notifier.Type, vifindex 
 	ie := (*C.struct_interface_addr_entry)(unsafe.Pointer(&r.param.p[0]))
 	*ie = C.struct_interface_addr_entry{}
 	ie.addr = ipv4toCuint32(ip.IP)
-	ie.ifindex = C.uint32_t(vifindex)
+	ie.ifindex = C.vifindex_t(vifindex)
 	ie.prefixlen = C.uint32_t(plen)
 
 	// update interface table.
 	return r.control(cmd, unsafe.Pointer(ie))
 }
 
-func (r *RouterInstance) updateInterfaceMTU(cmtType notifier.Type, vifindex vswitch.VIFIndex, mtu vswitch.MTU) error {
+func (r *RouterInstance) procInterfaceMTU(cmtType notifier.Type, vifindex vswitch.VIFIndex, mtu vswitch.MTU) error {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
 	ie := (*C.struct_interface_entry)(unsafe.Pointer(&r.param.p[0]))
 	*ie = C.struct_interface_entry{}
-	ie.ifindex = C.uint32_t(vifindex)
+	ie.ifindex = C.vifindex_t(vifindex)
 	ie.mtu = C.uint16_t(mtu)
 
 	// MTU only supports Notifier.Update
@@ -741,7 +755,7 @@ const (
 	ROUTER_CMD_VIF_UPDATE_MTU = routerCmd(C.ROUTER_CMD_VIF_UPDATE_MTU)
 	ROUTER_CMD_ROUTE_ADD      = routerCmd(C.ROUTER_CMD_ROUTE_ADD)
 	ROUTER_CMD_ROUTE_DELETE   = routerCmd(C.ROUTER_CMD_ROUTE_DELETE)
-	ROUTER_CMD_NEIGH_ADD      = routerCmd(C.ROUTER_CMD_NEIGH_ADD)
+	ROUTER_CMD_NEIGH_UPDATE   = routerCmd(C.ROUTER_CMD_NEIGH_UPDATE)
 	ROUTER_CMD_NEIGH_DELETE   = routerCmd(C.ROUTER_CMD_NEIGH_DELETE)
 	ROUTER_CMD_NAPT_ENABLE    = routerCmd(C.ROUTER_CMD_NAPT_ENABLE)
 	ROUTER_CMD_NAPT_DISABLE   = routerCmd(C.ROUTER_CMD_NAPT_DISABLE)
@@ -751,13 +765,11 @@ const (
 
 // static functions for control
 func ipv4toCuint32(ip net.IP) C.uint32_t {
-	ip = ip.To4()
-	if ip == nil {
-		return 0
+	if ip := ip.To4(); ip != nil {
+		return C.uint32_t(ip[0])<<24 | C.uint32_t(ip[1])<<16 |
+			C.uint32_t(ip[2])<<8 | C.uint32_t(ip[3])
 	}
-	addr := int(ip[0])<<24 | int(ip[1])<<16 | int(ip[2])<<8 | int(ip[3])
-	return C.uint32_t(addr)
-
+	return 0
 }
 
 func (r *RouterInstance) setRouteEntry(rt *vswitch.Route) (*C.struct_route_entry, error) {
@@ -767,9 +779,6 @@ func (r *RouterInstance) setRouteEntry(rt *vswitch.Route) (*C.struct_route_entry
 	if rt.Dst != nil {
 		prefixlen, _ = rt.Dst.Mask.Size()
 		dst = rt.Dst.IP
-		if dst.To4() == nil {
-			return nil, fmt.Errorf("not supported ip addresss(%v).", rt.Dst)
-		}
 	}
 	dstip := ipv4toCuint32(dst)
 
@@ -787,37 +796,25 @@ func (r *RouterInstance) setRouteEntry(rt *vswitch.Route) (*C.struct_route_entry
 		length = 1
 	}
 	// allocation nexthops array
-	size := length * C.sizeof_struct_nexthop
-	route.nexthops = (*C.struct_nexthop)(C.calloc(1, C.ulong(size)))
-	nexthops := (*[1 << 30]C.struct_nexthop)(unsafe.Pointer(route.nexthops))[:length:length]
-
-	// get broadcast type
-	bt := C.IPV4_NO_BROADCAST
-	if rt.Type == syscall.RTN_BROADCAST {
-		if (dstip & 1) == 1 {
-			bt = C.IPV4_DIRECTED_BROADCAST
-		} else {
-			bt = C.IPV4_NONSTANDARD_BROADCAST
-		}
-	}
+	size := length * C.sizeof_nexthop_t
+	route.nexthops = (*C.nexthop_t)(C.calloc(1, C.size_t(size)))
+	nexthops := (*[1 << 30]C.nexthop_t)(unsafe.Pointer(route.nexthops))[:length:length]
 
 	// set nexthops
 	route.nexthop_num = C.uint32_t(length)
 	if len(rt.Nexthops) == 0 {
 		// len(v.Nexthops) is 0, no v.Nexthops.
 		// use v.Interface and v.Nexthop
-		nexthops[0].ifindex = C.uint16_t(rt.Dev.VIFIndex())
+		nexthops[0].ifindex = C.vifindex_t(rt.Dev.VIFIndex())
 		nexthops[0].weight = 0
 		nexthops[0].gw = ipv4toCuint32(rt.Gw)
 		nexthops[0].netmask = C.uint8_t(prefixlen)
-		nexthops[0].broadcast_type = C.uint8_t(bt)
 	} else {
 		for i, nh := range rt.Nexthops {
-			nexthops[i].ifindex = C.uint16_t(nh.Dev.VIFIndex())
+			nexthops[i].ifindex = C.vifindex_t(nh.Dev.VIFIndex())
 			nexthops[i].weight = C.uint32_t(nh.Weight)
 			nexthops[i].gw = ipv4toCuint32(nh.Gw)
 			nexthops[i].netmask = C.uint8_t(prefixlen)
-			nexthops[i].broadcast_type = C.uint8_t(bt)
 		}
 	}
 
@@ -848,14 +845,17 @@ func (r *RouterInstance) AddVIF(vif *vswitch.VIF) error {
 	defer r.mutex.Unlock()
 
 	ips := vif.ListIPAddrs()
-	if r.addrsCount+uint(len(ips)) > C.IPADDR_MAX_NUM {
+	if r.addrsCount+uint(len(ips)) > C.ROUTER_MAX_VIF_IPADDRS {
 		return errors.New("Can register nomore IP addresses")
 	}
+
+	// Add VIF to the ARP resolver
+	r.arpResolver.addVIF(vif)
 
 	// add vif
 	ie := (*C.struct_interface_entry)(unsafe.Pointer(&r.param.p[0]))
 	*ie = C.struct_interface_entry{}
-	ie.ifindex = C.uint32_t(vif.Index())
+	ie.ifindex = C.vifindex_t(vif.Index())
 	ie.ring = (*C.struct_rte_ring)(unsafe.Pointer(vif.Input()))
 	ie.mtu = C.uint16_t(vif.MTU())
 	ie.vid = C.uint16_t(vif.VID())
@@ -873,6 +873,11 @@ func (r *RouterInstance) AddVIF(vif *vswitch.VIF) error {
 		return err
 	}
 
+	// save neighbor cache if available
+	if vif.Tunnel() == nil {
+		r.neighborCaches[vif] = (*[1 << 30]C.struct_neighbor)(unsafe.Pointer(ie.cache))[:ie.cache_size:ie.cache_size]
+	}
+
 	// add ip addresses
 	for _, ip := range ips {
 		// send backend process
@@ -880,7 +885,7 @@ func (r *RouterInstance) AddVIF(vif *vswitch.VIF) error {
 		addr := (*C.struct_interface_addr_entry)(unsafe.Pointer(&r.param.p[0]))
 		*addr = C.struct_interface_addr_entry{}
 		addr.addr = ipv4toCuint32(ip.IP)
-		addr.ifindex = C.uint32_t(vif.Index())
+		addr.ifindex = C.vifindex_t(vif.Index())
 		addr.prefixlen = C.uint32_t(plen)
 
 		// We intentionally ignore error here.
@@ -891,6 +896,7 @@ func (r *RouterInstance) AddVIF(vif *vswitch.VIF) error {
 		}
 		r.addrsCount++
 	}
+
 	return nil
 }
 
@@ -905,7 +911,7 @@ func (r *RouterInstance) DeleteVIF(vif *vswitch.VIF) error {
 		addr := (*C.struct_interface_addr_entry)(unsafe.Pointer(&r.param.p[0]))
 		*addr = C.struct_interface_addr_entry{}
 		addr.addr = ipv4toCuint32(ip.IP)
-		addr.ifindex = C.uint32_t(vif.Index())
+		addr.ifindex = C.vifindex_t(vif.Index())
 		addr.prefixlen = C.uint32_t(plen)
 
 		// We intentionally ignore error here
@@ -919,8 +925,23 @@ func (r *RouterInstance) DeleteVIF(vif *vswitch.VIF) error {
 
 	ie := (*C.struct_interface_entry)(unsafe.Pointer(&r.param.p[0]))
 	*ie = C.struct_interface_entry{}
-	ie.ifindex = C.uint32_t(vif.Index())
-	return r.control(ROUTER_CMD_VIF_DELETE, unsafe.Pointer(ie))
+	ie.ifindex = C.vifindex_t(vif.Index())
+	if err := r.control(ROUTER_CMD_VIF_DELETE, unsafe.Pointer(ie)); err != nil {
+		return err
+	}
+
+	// Delete VIF from the ARP resolver
+	r.arpResolver.deleteVIF(vif)
+
+	delete(r.neighborCaches, vif)
+	return nil
+}
+
+func (r *RouterInstance) getNeighborCache(vif *vswitch.VIF) []C.struct_neighbor {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	return r.neighborCaches[vif]
 }
 
 func (r *RouterInstance) AddOutputDevice(dev vswitch.OutputDevice) error {
@@ -936,7 +957,7 @@ func (r *RouterInstance) AddOutputDevice(dev vswitch.OutputDevice) error {
 	// For now, we assume we only get VRF.
 	ie := (*C.struct_interface_entry)(unsafe.Pointer(&r.param.p[0]))
 	*ie = C.struct_interface_entry{}
-	ie.ifindex = C.uint32_t(dev.VIFIndex())
+	ie.ifindex = C.vifindex_t(dev.VIFIndex())
 	ie.ring = (*C.struct_rte_ring)(unsafe.Pointer(dev.Input()))
 	ie.flags = C.IFF_TYPE_VRF
 
@@ -960,7 +981,7 @@ func (r *RouterInstance) DeleteOutputDevice(dev vswitch.OutputDevice) error {
 	// For now, we assume we only get VRF.
 	ie := (*C.struct_interface_entry)(unsafe.Pointer(&r.param.p[0]))
 	*ie = C.struct_interface_entry{}
-	ie.ifindex = C.uint32_t(dev.VIFIndex())
+	ie.ifindex = C.vifindex_t(dev.VIFIndex())
 
 	if err := r.control(ROUTER_CMD_VIF_DELETE, unsafe.Pointer(ie)); err != nil {
 		return err
@@ -1009,7 +1030,7 @@ func init() {
 		log.Fatalf("Can't create logger: %s", moduleName)
 	}
 	rp := &vswitch.RingParam{
-		Count:    C.MAX_ROUTER_MBUFS,
+		Count:    C.ROUTER_MAX_MBUFS,
 		SocketId: dpdk.SOCKET_ID_ANY,
 	}
 

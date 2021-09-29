@@ -78,16 +78,17 @@ type LinkStatuser interface {
 }
 
 type Interface struct {
-	name       string
-	driver     string
-	private    interface{}
-	vids       map[VID]*VIF
-	vifs       []*VIF
-	base       *BaseInstance
-	mac        macAddress
-	instance   InterfaceInstance
-	tunnel     *L2Tunnel
-	lastChange time.Time
+	name          string
+	driver        string
+	private       interface{}
+	vids          map[VID]*VIF
+	vifs          []*VIF
+	base          *BaseInstance
+	mac           macAddress
+	instance      InterfaceInstance
+	tunnel        *L2Tunnel
+	tunnelEnabled bool
+	lastChange    time.Time
 }
 
 type VLANMode int
@@ -185,6 +186,7 @@ func NewInterface(driver, name string, priv interface{}) (*Interface, error) {
 			base.free()
 			return nil, fmt.Errorf("Can't connect L2 tunnel to VRF: %v", err)
 		}
+		iface.tunnelEnabled = true
 	}
 
 	return iface, nil
@@ -209,7 +211,11 @@ func (i *Interface) Free() {
 	ifMgr.mutex.Lock()
 	defer ifMgr.mutex.Unlock()
 
-	i.Tunnel().VRF().deleteL2Tunnel(i)
+	if i.tunnelEnabled {
+		i.tunnel.VRF().deleteL2Tunnel(i)
+		i.tunnelEnabled = false
+	}
+
 	i.freeAllVIF()
 	i.base.free()
 	i.mac.free()
@@ -233,6 +239,13 @@ func (i *Interface) IsEnabled() bool {
 }
 
 func (i *Interface) Enable() error {
+	if i.tunnel != nil && !i.tunnelEnabled {
+		if err := i.tunnel.VRF().addL2Tunnel(i); err != nil {
+			return err
+		}
+		i.tunnelEnabled = true
+	}
+
 	i.lastChange = time.Now()
 	return i.base.enable()
 }
@@ -240,6 +253,11 @@ func (i *Interface) Enable() error {
 func (i *Interface) Disable() {
 	i.lastChange = time.Now()
 	i.base.disable()
+
+	if i.tunnelEnabled {
+		i.tunnel.VRF().deleteL2Tunnel(i)
+		i.tunnelEnabled = false
+	}
 }
 
 func (i *Interface) input() *dpdk.Ring {

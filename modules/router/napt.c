@@ -78,6 +78,7 @@ struct napt_dst_ports {
 	uint64_t *ports; // bit masks for used ports
 	int16_t len;     // length of napt_dst.ports
 	int16_t offset;  // offsets of port number
+	int count;	 // number of ports allocated
 };
 
 struct fragment_key {
@@ -101,6 +102,9 @@ struct napt {
 
 	struct rte_mempool *pool;
 	struct rte_mempool *fragment_pool;
+
+	int max_ports;
+	int max_dst_buckets;
 };
 
 // RFC6335 defines the port range that NAPT may use.
@@ -143,7 +147,7 @@ napt_outbound_hash_func(const void *key, uint32_t length, uint32_t initval) {
 
 static struct rte_hash *
 napt_create_outbound_hash_table(struct napt_config *config) {
-	char hash_name[64];
+	char hash_name[RTE_HASH_NAMESIZE];
 
 	snprintf(hash_name, sizeof(hash_name), "napt-out-%u", config->vif);
 
@@ -180,7 +184,7 @@ napt_inbound_hash_func(const void *key, uint32_t length, uint32_t initval) {
 
 static struct rte_hash *
 napt_create_inbound_hash_table(struct napt_config *config) {
-	char hash_name[64];
+	char hash_name[RTE_HASH_NAMESIZE];
 
 	snprintf(hash_name, sizeof(hash_name), "napt-in-%u", config->vif);
 
@@ -204,7 +208,7 @@ napt_8byte_hash_func(const void *key, uint32_t length, uint32_t initval) {
 
 static struct rte_hash *
 napt_create_dst_hash_table(struct napt_config *config) {
-	char hash_name[64];
+	char hash_name[RTE_HASH_NAMESIZE];
 
 	snprintf(hash_name, sizeof(hash_name), "napt-dst-%u", config->vif);
 
@@ -222,7 +226,7 @@ napt_create_dst_hash_table(struct napt_config *config) {
 
 static struct rte_hash *
 napt_create_fragment_hash_table(struct napt_config *config) {
-	char hash_name[64];
+	char hash_name[RTE_HASH_NAMESIZE];
 
 	snprintf(hash_name, sizeof(hash_name), "napt-frag-%u", config->vif);
 
@@ -260,7 +264,7 @@ napt_check_config(struct napt_config *config) {
 
 static struct rte_mempool *
 napt_alloc_mempool(struct napt_config *config) {
-	char name[64];
+	char name[RTE_MEMPOOL_NAMESIZE];
 	snprintf(name, sizeof name, "mp-napt-%u", config->vif);
 	return rte_mempool_create(name,
 				  config->max_entries, sizeof(struct napt_entry), 0, 0,
@@ -271,7 +275,7 @@ napt_alloc_mempool(struct napt_config *config) {
 
 static struct rte_mempool *
 napt_alloc_fragment_mempool(struct napt_config *config) {
-	char name[64];
+	char name[RTE_MEMPOOL_NAMESIZE];
 	snprintf(name, sizeof name, "mp-frag-%u", config->vif);
 	return rte_mempool_create(name,
 				  config->frag_entries, sizeof(struct fragment_info), 0, 0,
@@ -320,6 +324,9 @@ napt_create(struct napt_config *config) {
 	napt->config = *config;
 	napt->config.wan_addr = htonl(napt->config.wan_addr);
 
+	napt->max_ports = (int)napt->config.port_max - (int)napt->config.port_min + 1;
+	napt->max_dst_buckets = (napt->max_ports + 63) / 64;
+
 	return napt;
 
 error:
@@ -338,6 +345,9 @@ napt_free(struct napt *napt) {
 	rte_mempool_free(napt->fragment_pool);
 	rte_free(napt);
 }
+
+static int
+napt_purge_expired_entries(struct napt *napt);
 
 static bool
 napt_allocate_port(struct napt *napt, struct napt_outbound_hash_key *nkey, struct napt_entry *entry) {
@@ -371,6 +381,11 @@ napt_allocate_port(struct napt *napt, struct napt_outbound_hash_key *nkey, struc
 		entry->ports = dp;
 	}
 
+	if (dp->count == napt->max_ports) {
+		if (napt_purge_expired_entries(napt) == 0)
+			return false;
+	}
+
 	int n; // bucket #
 
 	// search empty bucket
@@ -379,10 +394,8 @@ napt_allocate_port(struct napt *napt, struct napt_outbound_hash_key *nkey, struc
 			goto port_allocation; // found one
 	}
 
-	// No space left. Expand if possible. Upto 16,384 entries per destination.
-	// This makes max number of dp->len is 256.
-	// TODO: Fix magic number.
-	if (dp->len == 256) {
+	// No space left. Expand if possible.
+	if (dp->len == napt->max_dst_buckets) {
 		// can't expand anymore
 		return false;
 	}
@@ -402,10 +415,17 @@ napt_allocate_port(struct napt *napt, struct napt_outbound_hash_key *nkey, struc
 port_allocation:
 	// We should have free port in this bucket.
 	offset = __builtin_ffsll(dp->ports[n]) - 1;
+	uint32_t ext_port = napt->config.port_min + n * 64 + offset;
+
+	// Port number shall not exceed the upper boundary
+	if (ext_port > (uint32_t)napt->config.port_max)
+		return false;
+
 	dp->ports[n] &= ~(1UL << offset);
+	dp->count++;
 
 	// TODO: offset port base to randomize
-	entry->ext_port = htons(napt->config.port_min + n * 64 + offset);
+	entry->ext_port = htons(ext_port);
 
 	return true;
 }
@@ -436,6 +456,8 @@ napt_free_port(struct napt *napt, struct napt_dst_ports *dp, uint16_t port) {
 			dp->ports = rte_realloc(dp->ports, sizeof(uint64_t) * dp->len, 0);
 		}
 	}
+
+	dp->count--;
 }
 
 static void
@@ -607,6 +629,34 @@ err1:
 	return NULL;
 }
 
+/**
+ * Search inbound NAPT entry.
+ *
+ * If not found or expired, returns NULL.
+ */
+static struct napt_entry *
+napt_search_inbound_entry(struct napt *napt, struct napt_inbound_hash_key *key) {
+	struct napt_entry *data;
+	time_t now = time(NULL);
+
+	if (rte_hash_lookup_data(napt->inbound_hash, key, (void **)&data) >= 0) {
+		// Found one.  Check if the entry is still valid.
+		if (data->expire >= now) {
+			// Update the expire time.
+			if (!data->fin_rst)
+				data->expire = now + napt->config.aging_time;
+			return data;
+		}
+
+		ROUTER_DEBUG("NAPT: expired %ld < %ld", data->expire, now);
+
+		// Free the expired port.
+		napt_free_port(napt, data->ports, data->ext_port);
+	}
+
+	return NULL;
+}
+
 static bool
 napt_outbound_icmp(struct napt *napt, struct ipv4_hdr *ip_hdr, struct icmp_hdr *icmp_hdr) {
 	// ICMP packet other than echo request shall be dropped.
@@ -647,7 +697,6 @@ napt_outbound_icmp(struct napt *napt, struct ipv4_hdr *ip_hdr, struct icmp_hdr *
 
 static bool
 napt_rewrite_icmp_echo_reply(struct napt *napt, struct ipv4_hdr *ip_hdr, struct icmp_hdr *icmp_hdr) {
-	struct napt_entry *data;
 	struct napt_inbound_hash_key key = {
 	    .src_addr = ip_hdr->src_addr,
 	    .src_port = 0, // Must be zero for ICMP
@@ -656,7 +705,9 @@ napt_rewrite_icmp_echo_reply(struct napt *napt, struct ipv4_hdr *ip_hdr, struct 
 	};
 
 	// Drop packet, if we cannot find the entry.
-	if (rte_hash_lookup_data(napt->inbound_hash, &key, (void **)&data) < 0) {
+	struct napt_entry *data = napt_search_inbound_entry(napt, &key);
+	if (data == NULL) {
+		ROUTER_INFO("NAPT search inbound entry failed.");
 		return false; // TODO: Log error
 	}
 
@@ -682,7 +733,6 @@ struct l4_hdr {
 
 static bool
 napt_rewrite_icmp_message(struct napt *napt, struct ipv4_hdr *ip_hdr, struct icmp_hdr *icmp_hdr) {
-	struct napt_entry *data;
 	struct ipv4_hdr *inner_ip_hdr = (void *)icmp_hdr + sizeof(struct icmp_hdr);
 
 	// Rewrite
@@ -698,7 +748,8 @@ napt_rewrite_icmp_message(struct napt *napt, struct ipv4_hdr *ip_hdr, struct icm
 		};
 
 		// Drop packet, if we cannot find the entry.
-		if (rte_hash_lookup_data(napt->inbound_hash, &key, (void **)&data) < 0) {
+		struct napt_entry *data = napt_search_inbound_entry(napt, &key);
+		if (data == NULL) {
 			ROUTER_INFO("NAPT INBOUND no entry found (src: %08x:%d, dst: %d, proto=%d).",
 				    ntohl(key.src_addr), ntohs(key.src_port), ntohs(key.dst_port), key.protocol_id);
 			return false; // TODO: Log error
@@ -737,7 +788,8 @@ napt_rewrite_icmp_message(struct napt *napt, struct ipv4_hdr *ip_hdr, struct icm
 		};
 
 		// Drop packet, if we cannot find the entry.
-		if (rte_hash_lookup_data(napt->inbound_hash, &key, (void **)&data) < 0) {
+		struct napt_entry *data = napt_search_inbound_entry(napt, &key);
+		if (data == NULL) {
 			ROUTER_INFO("NAPT INBOUND no entry found (src: %08x:%d, dst: %d, proto=%d).",
 				    ntohl(key.src_addr), ntohs(key.src_port), ntohs(key.dst_port), key.protocol_id);
 			return false; // TODO: Log error
@@ -831,7 +883,6 @@ napt_outbound_udp(struct napt *napt, struct ipv4_hdr *ip_hdr, struct udp_hdr *ud
 
 static bool
 napt_inbound_udp(struct napt *napt, struct ipv4_hdr *ip_hdr, struct udp_hdr *udp_hdr) {
-	struct napt_entry *data;
 	struct napt_inbound_hash_key key = {
 	    .src_addr = ip_hdr->src_addr,
 	    .src_port = udp_hdr->src_port,
@@ -840,7 +891,8 @@ napt_inbound_udp(struct napt *napt, struct ipv4_hdr *ip_hdr, struct udp_hdr *udp
 	};
 
 	// Drop packet, if we cannot find the entry.
-	if (rte_hash_lookup_data(napt->inbound_hash, &key, (void **)&data) < 0) {
+	struct napt_entry *data = napt_search_inbound_entry(napt, &key);
+	if (data == NULL) {
 		// ROUTER_INFO("NAPT INBOUND UDP no entry found.");
 		return false; // TODO: Log error
 	}
@@ -933,7 +985,6 @@ napt_outbound_tcp(struct napt *napt, struct ipv4_hdr *ip_hdr, struct tcp_hdr *tc
 
 static bool
 napt_inbound_tcp(struct napt *napt, struct ipv4_hdr *ip_hdr, struct tcp_hdr *tcp_hdr) {
-	struct napt_entry *data;
 	struct napt_inbound_hash_key key = {
 	    .src_addr = ip_hdr->src_addr,
 	    .src_port = tcp_hdr->src_port,
@@ -942,7 +993,8 @@ napt_inbound_tcp(struct napt *napt, struct ipv4_hdr *ip_hdr, struct tcp_hdr *tcp
 	};
 
 	// Drop packet, if we cannot find the entry.
-	if (rte_hash_lookup_data(napt->inbound_hash, &key, (void **)&data) < 0) {
+	struct napt_entry *data = napt_search_inbound_entry(napt, &key);
+	if (data == NULL) {
 		// ROUTER_INFO("NAPT INBOUND UDP no entry found.");
 		return false; // TODO: Log error
 	}

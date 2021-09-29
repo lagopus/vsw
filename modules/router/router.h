@@ -33,8 +33,6 @@
 #define VERSION_IPV4 0x04
 #define VERSION_IPV6 0x06
 
-#define ROUTER_RULE_MAX 32
-
 #define MAX_RECORDROUTE_OPTIONS 2
 
 // Router Runtime
@@ -44,13 +42,13 @@ struct router_mempools {
 };
 
 static inline struct router_ring*
-get_router_ring(struct router_context *ctx, struct rte_ring *ring) {
+get_router_ring(struct router_instance *ri, struct rte_ring *ring) {
 	if (!ring)
 		return NULL;
 
 	struct router_ring *free_rr = NULL;
-	for (int i = 0; i < MAX_ROUTER_VIFS + 1; i++) {
-		struct router_ring *rr = &ctx->router_ring[i];
+	for (int i = 0; i < ROUTER_MAX_VIFS + 1; i++) {
+		struct router_ring *rr = &ri->router_ring[i];
 
 		if (rr->ring == ring) {
 			rr->rc++;
@@ -67,14 +65,14 @@ get_router_ring(struct router_context *ctx, struct rte_ring *ring) {
 	free_rr->ring = ring;
 	free_rr->rc++;
 
-	ctx->rrp[ctx->rr_count] = free_rr;
-	ctx->rr_count++;
+	ri->rrp[ri->rr_count] = free_rr;
+	ri->rr_count++;
 
 	return free_rr;
 }
 
 static inline void
-put_router_ring(struct router_context *ctx, struct router_ring *rr) {
+put_router_ring(struct router_instance *ri, struct router_ring *rr) {
 	if (!rr)
 		return;
 
@@ -84,10 +82,10 @@ put_router_ring(struct router_context *ctx, struct router_ring *rr) {
 
 	rr->ring = NULL;
 
-	for (int i = 0; i < ctx->rr_count; i++) {
-		if (ctx->rrp[i] == rr) {
-			ctx->rr_count--;
-			ctx->rrp[i] = ctx->rrp[ctx->rr_count];
+	for (int i = 0; i < ri->rr_count; i++) {
+		if (ri->rrp[i] == rr) {
+			ri->rr_count--;
+			ri->rrp[i] = ri->rrp[ri->rr_count];
 			rr->sent = rr->dropped = 0;
 		}
 	}
@@ -113,7 +111,7 @@ mbuf_prepare_enqueue(struct router_ring *rr, struct rte_mbuf *mbuf) {
 	rr->mbufs[rr->count] = mbuf;
 	rr->count++;
 
-	if (rr->count == MAX_ROUTER_MBUFS)
+	if (rr->count == ROUTER_MAX_MBUFS)
 		mbuf_flush(rr);
 }
 

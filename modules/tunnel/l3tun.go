@@ -360,6 +360,7 @@ func (l *l3TunnelVIF) Enable() error {
 		}
 
 		tunnel := l.vif.Tunnel()
+		index := l.vif.Index()
 		addressType := tunnel.AddressType()
 		localAddr := tunnel.LocalAddress()
 		// IP in IP, GRE requires only one address.
@@ -369,7 +370,7 @@ func (l *l3TunnelVIF) Enable() error {
 		inboudOutput := (*C.struct_rte_ring)(unsafe.Pointer(l.vif.Output()))
 		outboudOutput := (*C.struct_rte_ring)(unsafe.Pointer(l.vif.Rules().Output(vswitch.MatchIPv4Dst)))
 
-		cparam := createL3SetEnableCmdParam(addressType, localAddr, remoteAddr,
+		cparam := createL3SetEnableCmdParam(index, addressType, localAddr, remoteAddr,
 			hopLimit, tos, inboudOutput, outboudOutput)
 		if err := l.doControl(cparam); err != nil {
 			log.Logger.Err("[%s] Enable failed: %v", l.vif.Name(), err)

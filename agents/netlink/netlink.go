@@ -36,22 +36,9 @@ const agentName = "netlink"
 var log = vswitch.Logger
 var netlinkInstance *NetlinkAgent
 
-var stateToNudState = map[int]vswitch.NudState{
-	netlink.NUD_NONE:       vswitch.NudStateNone,
-	netlink.NUD_INCOMPLETE: vswitch.NudStateIncomplete,
-	netlink.NUD_REACHABLE:  vswitch.NudStateReachable,
-	netlink.NUD_STALE:      vswitch.NudStateStale,
-	netlink.NUD_DELAY:      vswitch.NudStateDelay,
-	netlink.NUD_PROBE:      vswitch.NudStateProbe,
-	netlink.NUD_FAILED:     vswitch.NudStateFailed,
-	netlink.NUD_NOARP:      vswitch.NudStateNoArp,
-	netlink.NUD_PERMANENT:  vswitch.NudStatePermanent,
-}
-
 type NetlinkAgent struct {
 	vswch  chan notifier.Notification
 	ruch   chan netlink.RouteUpdate
-	ndch   chan netlink.NeighUpdate
 	nldone chan struct{}
 	vrfs   map[string]*netlink.Vrf
 	taps   map[string]*netlink.Tuntap
@@ -398,34 +385,6 @@ func (n *NetlinkAgent) handleRouteUpdate(ru netlink.RouteUpdate) {
 	}
 }
 
-func (n *NetlinkAgent) handleNeighbourUpdate(nu netlink.NeighUpdate) {
-	vif, ok := n.links[nu.LinkIndex].(*vswitch.VIF)
-	if !ok {
-		return
-	}
-
-	// This is same as deleting
-	if nu.HardwareAddr == nil {
-		nu.Type = syscall.RTM_DELNEIGH
-	}
-
-	if nu.Type == syscall.RTM_NEWNEIGH {
-		entry := vswitch.Neighbour{
-			Dst:           nu.IP,
-			LinkLocalAddr: nu.HardwareAddr,
-			State:         stateToNudState[nu.State],
-		}
-
-		if !vif.AddEntry(entry) {
-			log.Printf("Netlink Agent: Neigh entry add failed for %v: %v", vif, entry)
-		}
-	} else if nu.Type == syscall.RTM_DELNEIGH {
-		if !vif.DeleteEntry(nu.IP) {
-			log.Printf("Netlink Agent: Neigh entry delete failed for %v: %v", vif, nu.IP)
-		}
-	}
-}
-
 func (n *NetlinkAgent) listen() {
 	for {
 		select {
@@ -453,9 +412,6 @@ func (n *NetlinkAgent) listen() {
 						n.configTapLinkStatus(vif, value)
 					}
 
-				case vswitch.Neighbour:
-					// Don't care. Came from me.
-
 				case net.HardwareAddr:
 					if noti.Type == notifier.Update {
 						n.configTapMAC(vif, value)
@@ -476,6 +432,9 @@ func (n *NetlinkAgent) listen() {
 				case vswitch.Route:
 					// Don't care. This should have came out from me.
 
+				case *vswitch.PBREntry:
+					// Don't care. We don't support PBR in netlink agent.
+
 				default:
 					log.Printf("Netlink Agent: Unexpectd value: %v\n", vif)
 				}
@@ -490,12 +449,6 @@ func (n *NetlinkAgent) listen() {
 			log.Printf("Netlink Agent: RU: %v", ru)
 			n.handleRouteUpdate(ru)
 
-		case nu, ok := <-n.ndch:
-			if !ok {
-				return
-			}
-			log.Printf("Netlink Agent: NU: %v\n", nu)
-			n.handleNeighbourUpdate(nu)
 		}
 	}
 }
@@ -503,7 +456,6 @@ func (n *NetlinkAgent) listen() {
 func (n *NetlinkAgent) Enable() error {
 	// Initialize Netlink Agent
 	n.ruch = make(chan netlink.RouteUpdate)
-	n.ndch = make(chan netlink.NeighUpdate)
 	n.nldone = make(chan struct{})
 	n.vrfs = make(map[string]*netlink.Vrf)
 	n.taps = make(map[string]*netlink.Tuntap)
@@ -515,10 +467,6 @@ func (n *NetlinkAgent) Enable() error {
 
 	if err := netlink.RouteSubscribe(n.ruch, n.nldone); err != nil {
 		return fmt.Errorf("Netlink Agent: Can't receive route update: %v", err)
-	}
-
-	if err := netlink.NeighSubscribe(n.ndch, n.nldone); err != nil {
-		return fmt.Errorf("Netlink Agent: Can't receive neighbour update: %v", err)
 	}
 
 	go func() {
@@ -536,7 +484,6 @@ func (n *NetlinkAgent) Disable() {
 	// Clean ups
 	close(n.nldone)
 	close(n.ruch)
-	close(n.ndch)
 	n.vrfs = nil
 	n.taps = nil
 	n.links = nil

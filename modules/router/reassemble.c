@@ -212,11 +212,11 @@ bool
 reassemble_init(struct router_instance *ri) {
 	char hash_name[RTE_HASH_NAMESIZE];
 	// Interface information.
-	int ret = snprintf(hash_name, sizeof(hash_name), "reassemble_%s", (const char *)ri->ctx->name);
+	int ret = snprintf(hash_name, sizeof(hash_name), "reassemble_%s", (const char *)ri->base.name);
 	if (ret < 0)
 		return false;
 	ROUTER_DEBUG("[REASSEMBLE] (%s) interface table name: %s\n",
-		     ri->ctx->name, hash_name);
+		     ri->base.name, hash_name);
 	// Create hash table for reassemble packet
 	struct rte_hash_parameters reassemble_hash_params = {
 	    .name = hash_name,
@@ -243,6 +243,8 @@ reassemble_init(struct router_instance *ri) {
 		ROUTER_ERROR("[REASSEMBLE] failed to create fragment table.");
 		return false;
 	}
+
+	memset(&ri->death_row, 0, sizeof(struct rte_ip_frag_death_row));
 	return true;
 }
 

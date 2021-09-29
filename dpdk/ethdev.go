@@ -245,7 +245,7 @@ func (re *EthDev) MTU() int {
 }
 
 func (re *EthDev) SetMTU(mtu uint16) error {
-	if rc := int(C.rte_eth_dev_set_mtu(C.uint16_t(re.port_id), C.uint16_t(mtu)-C.ETHER_HDR_LEN)); rc < 0 {
+	if rc := int(C.rte_eth_dev_set_mtu(C.uint16_t(re.port_id), C.uint16_t(mtu))); rc < 0 {
 		return syscall.Errno(-rc)
 	}
 	return nil

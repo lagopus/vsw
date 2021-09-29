@@ -53,7 +53,6 @@ type VIF struct {
 	mutex      sync.Mutex
 	lastChange time.Time
 	*IPAddrs
-	*Neighbours
 	*VRRP
 }
 
@@ -89,7 +88,6 @@ func newVIF(i *Interface, name string) (*VIF, error) {
 	v.counter = NewCounter()
 	v.lastChange = time.Now()
 	v.IPAddrs = newIPAddrs(v)
-	v.Neighbours = newNeighbours(v)
 	v.base = newSubInstance(i.base, v.name)
 	v.VRRP = newVRRP(v)
 	if v.VRRP == nil {

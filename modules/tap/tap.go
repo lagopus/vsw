@@ -30,6 +30,7 @@ import (
 	"github.com/lagopus/vsw/utils/notifier"
 	"github.com/lagopus/vsw/vswitch"
 	vlog "github.com/lagopus/vsw/vswitch/log"
+	"golang.org/x/net/ipv4"
 )
 
 const (
@@ -53,12 +54,20 @@ type TapInstance struct {
 	base    *vswitch.BaseInstance
 	noti    *notifier.Notifier
 	notiCh  chan notifier.Notification
+	vswCh   chan notifier.Notification
 	txCh    chan vifInfo
 	rxCh    chan struct{}
+	done    chan struct{}
 	enabled bool
 	wg      sync.WaitGroup
 	rs      int
 	vrf     string
+
+	// For ICMP Echo Reply
+	vifs    map[vswitch.VIFIndex]struct{}     // For listening notifications about IP address updates
+	ipAddrs map[uint32]struct{}               // For checking if a destination is self interface
+	tunnels map[vswitch.VIFIndex]*vswitch.VIF // For checking if an InvIF is a tunnel
+	mutex   sync.Mutex
 }
 
 func newTapInstance(base *vswitch.BaseInstance, i interface{}) (vswitch.Instance, error) {
@@ -68,12 +77,17 @@ func newTapInstance(base *vswitch.BaseInstance, i interface{}) (vswitch.Instance
 	}
 
 	t := &TapInstance{
-		base: base,
-		pool: vswitch.GetDpdkResource().Mempool,
-		noti: base.Rules().Notifier(),
-		txCh: make(chan vifInfo, 1),
-		rxCh: make(chan struct{}, 1),
-		vrf:  vrf,
+		base:    base,
+		pool:    vswitch.GetDpdkResource().Mempool,
+		noti:    base.Rules().Notifier(),
+		vswCh:   vswitch.GetNotifier().Listen(),
+		txCh:    make(chan vifInfo, 1),
+		rxCh:    make(chan struct{}, 1),
+		done:    make(chan struct{}, 1),
+		vrf:     vrf,
+		vifs:    make(map[vswitch.VIFIndex]struct{}),
+		tunnels: make(map[vswitch.VIFIndex]*vswitch.VIF),
+		ipAddrs: make(map[uint32]struct{}),
 	}
 	t.notiCh = t.noti.Listen()
 	go t.listener()
@@ -83,31 +97,98 @@ func newTapInstance(base *vswitch.BaseInstance, i interface{}) (vswitch.Instance
 
 func (t *TapInstance) Free() {
 	t.noti.Close(t.notiCh)
+	vswitch.GetNotifier().Close(t.vswCh)
 	close(t.txCh)
+	close(t.done)
 }
 
 func (t *TapInstance) listener() {
-	for n := range t.notiCh {
-		rule, ok := n.Value.(vswitch.Rule)
-		if !ok || rule.Match != vswitch.MatchOutVIF {
-			continue
-		}
+	for {
+		select {
+		case n := <-t.notiCh:
+			rule, ok := n.Value.(vswitch.Rule)
+			if !ok || rule.Match != vswitch.MatchOutVIF {
+				continue
+			}
 
-		vif, ok := rule.Param.(*vswitch.VIF)
-		if !ok {
-			continue
-		}
+			vif, ok := rule.Param.(*vswitch.VIF)
+			if !ok {
+				continue
+			}
 
-		switch n.Type {
-		case notifier.Add:
-			ch := make(chan *dpdk.Mbuf)
-			t.txCh <- vifInfo{vif, ch}
-			go t.readFromTap(vif, ch)
+			switch n.Type {
+			case notifier.Add:
+				t.mutex.Lock()
+				if vif.Tunnel() != nil {
+					t.tunnels[vif.Index()] = vif
+					t.mutex.Unlock()
+					continue
+				}
 
-		case notifier.Delete:
-			// Deletion comes for free. If the netlink closes the tap,
-			// Read in readFromTap fails which causes channel to be closed.
-			// txTask then stops reading from the channel.
+				t.vifs[vif.Index()] = struct{}{}
+
+				for _, addr := range vif.ListIPAddrs() {
+					if addr.IP = addr.IP.To4(); addr.IP == nil {
+						continue
+					}
+					ip := uint32(addr.IP[0])<<24 | uint32(addr.IP[1])<<16 | uint32(addr.IP[2])<<8 | uint32(addr.IP[3])
+					t.ipAddrs[ip] = struct{}{}
+				}
+				t.mutex.Unlock()
+
+				ch := make(chan *dpdk.Mbuf)
+				t.txCh <- vifInfo{vif, ch}
+				go t.readFromTap(vif, ch)
+
+			case notifier.Delete:
+				// Deletion comes for free. If the netlink closes the tap,
+				// Read in readFromTap fails which causes channel to be closed.
+				// txTask then stops reading from the channel.
+				t.mutex.Lock()
+				delete(t.vifs, vif.Index())
+				delete(t.tunnels, vif.Index())
+				for _, addr := range vif.ListIPAddrs() {
+					if addr.IP = addr.IP.To4(); addr.IP == nil {
+						continue
+					}
+					ip := uint32(addr.IP[0])<<24 | uint32(addr.IP[1])<<16 | uint32(addr.IP[2])<<8 | uint32(addr.IP[3])
+					delete(t.ipAddrs, ip)
+				}
+				t.mutex.Unlock()
+			}
+
+		case vn := <-t.vswCh:
+			addr, ok := vn.Value.(vswitch.IPAddr)
+			if !ok {
+				continue
+			}
+
+			vif, ok := vn.Target.(*vswitch.VIF)
+			if !ok {
+				continue
+			}
+
+			t.mutex.Lock()
+			if _, ok := t.vifs[vif.Index()]; !ok {
+				t.mutex.Unlock()
+				continue
+			}
+
+			if addr.IP = addr.IP.To4(); addr.IP == nil {
+				t.mutex.Unlock()
+				continue
+			}
+			ip := uint32(addr.IP[0])<<24 | uint32(addr.IP[1])<<16 | uint32(addr.IP[2])<<8 | uint32(addr.IP[3])
+			switch vn.Type {
+			case notifier.Add:
+				t.ipAddrs[ip] = struct{}{}
+			case notifier.Delete:
+				delete(t.ipAddrs, ip)
+			}
+			t.mutex.Unlock()
+
+		case <-t.done:
+			return
 		}
 	}
 }
@@ -204,6 +285,38 @@ func (t *TapInstance) readFromTap(vif *vswitch.VIF, ch chan *dpdk.Mbuf) {
 	}
 }
 
+// builtinICMP return an ICMP Echo Request if received packet came from a tunnel interface.
+func (t *TapInstance) builtinICMP(mbuf *dpdk.Mbuf, md *vswitch.Metadata) bool {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+
+	tun, ok := t.tunnels[md.InVIF()]
+	if !ok {
+		log.Debug(0, "InVIF is not Tunnel interface.")
+		return false
+	}
+	iph, err := ipv4Header(mbuf)
+	if err != nil || iph.protocol != int(vswitch.IPP_ICMP) {
+		log.Debug(0, "The protocol is not ICMP.")
+		return false
+	}
+	icmpm := icmpMessage(mbuf, iph.optSize, iph.dataSize)
+	if icmpm.icmpType() != ipv4.ICMPTypeEcho {
+		log.Debug(0, "The packet is not ICMP Echo Request.")
+		return false
+	}
+	if _, ok := t.ipAddrs[iph.dst]; !ok {
+		log.Debug(0, "The destination is not self interface.")
+		return false
+	}
+
+	log.Debug(0, "Receive ICMP Echo Request")
+	rewriteICMPEchoToReply(mbuf)
+	tun.Outbound().EnqueueMbuf(mbuf)
+
+	return true
+}
+
 func (t *TapInstance) rxTask() {
 	input := t.base.Input()
 	mbufs := make([]*dpdk.Mbuf, queueLength)
@@ -211,8 +324,11 @@ func (t *TapInstance) rxTask() {
 		n := input.DequeueBurstMbufs(&mbufs)
 		for _, mbuf := range mbufs[:n] {
 			md := (*vswitch.Metadata)(mbuf.Metadata())
+			if t.builtinICMP(mbuf, md) {
+				continue
+			}
 
-			if md.Local() {
+			if md.Encap() {
 				// Concatenate scattered Mbuf
 				p := mbuf.Data()[14:]
 				nxt := mbuf.Next()

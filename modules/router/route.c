@@ -78,7 +78,7 @@ routelist_update(struct route_table *rt) {
 /**
  * Push route entry to free list.
  */
-void
+static void
 routelist_push(struct route_table *rt, int id) {
 	rt->entries[id].next = rt->free;
 	rt->free = id;
@@ -127,8 +127,8 @@ routelist_create(struct route_table *rt) {
  */
 static void
 print_nexthop_entry(nexthop_t *nh) {
-	ROUTER_DEBUG("      gw ip: %s, weight: %d, netmask: %d, broadcast type: %d\n",
-		     ip2str(nh->gw), nh->weight, nh->netmask, nh->broadcast_type);
+	ROUTER_DEBUG("      gw ip: %s, weight: %d, netmask: %d",
+		     ip2str(nh->gw), nh->weight, nh->netmask);
 
 	struct interface *ie = nh->interface;
 	struct interface_entry *base = &ie->base;
@@ -175,44 +175,13 @@ print_route_list(struct route_table *rt) {
 	}
 }
 
-/**
- * Delete metric from route entry.
- */
 static void
-fib_delete(route_t *r, uint32_t metric) {
-	fib_t **f = &r->fib;
-	fib_t *p = r->fib;
-	while (p) {
-		if (p->metric == metric) {
-			*f = p->next;
-
-			// Delete reference of a nexthop from an interface info
-			for (int i = 0; i < p->nexthop_num; i++) {
-				if (p->nexthop[i].interface)
-					interface_nexthop_reference_delete(p->nexthop[i].interface, &p->nexthop[i]);
-			}
-
-			free(p->nexthop);
-			rte_free(p);
-			break;
-		}
-		f = &(*f)->next;
-		p = p->next;
-	}
-}
-
-/**
- * Add metric to route entry.
- */
-static void
-fib_add(route_t *r, fib_t *new) {
-	fib_t **f = &r->fib;
-
-	while ((*f != NULL) && ((*f)->metric < new->metric))
-		f = &((*f)->next);
-
-	new->next = *f;
-	*f = new;
+fib_free(fib_t *fib) {
+	// Delete reference of a nexthop from an interface info
+	for (int i = 0; i < fib->nexthop_num; i++)
+		interface_nexthop_reference_delete(fib->nexthop[i].interface, &fib->nexthop[i]);
+	free(fib->nexthop);
+	rte_free(fib);
 }
 
 /**
@@ -236,14 +205,56 @@ fib_create(struct interface_table *it, struct route_entry *entry) {
 		f->nexthop[i].interface = interface_entry_get(it, entry->nexthops[i].ifindex);
 
 		// Add reference of a nexthop that refer to a interface
-		if (f->nexthop[i].interface &&
-		    !interface_nexthop_reference_add(f->nexthop[i].interface, &f->nexthop[i])) {
-			rte_free(f);
+		if (!interface_nexthop_reference_add(f->nexthop[i].interface, &f->nexthop[i])) {
+			f->nexthop_num = i;
+			fib_free(f);
 			return NULL;
 		}
 	}
 
 	return f;
+}
+
+/**
+ * Add metric to route entry.
+ *
+ * The existing entry which has the same metric as the new one
+ * is replaced with the new entry.
+ */
+static void
+fib_add(route_t *r, fib_t *new) {
+	fib_t **f = &r->fib;
+
+	while ((*f != NULL) && ((*f)->metric < new->metric))
+		f = &((*f)->next);
+
+	// Replace the old one with the new one, iff the metrics
+	// are the same. Otherwise, insert.
+	if ((*f != NULL) && ((*f)->metric == new->metric)) {
+		new->next = (*f)->next;
+		fib_free(*f);
+	} else {
+		new->next = *f;
+	}
+	*f = new;
+}
+
+/**
+ * Delete metric from route entry.
+ */
+static void
+fib_delete(route_t *r, uint32_t metric) {
+	fib_t **f = &r->fib;
+	while (*f) {
+		if ((*f)->metric == metric) {
+			fib_t *p = *f;
+			*f = p->next;
+			fib_free(p);
+			return;
+		}
+		f = &(*f)->next;
+	}
+	ROUTER_ERROR("[ROUTE] requested to delete unknown fib entry (metric: %u)", metric);
 }
 
 /**
@@ -331,13 +342,14 @@ route_entry_delete(struct router_tables *t, struct route_entry *entry) {
 /**
  * Add a route entry to route table.
  * If entry exists, update.
+ *
+ * The metric of the route entry must be unique. Thus, we
+ * replace the old one with the new one, if the metrics are
+ * the same. fib_add() guarantees this.
  */
 bool
 route_entry_add(struct router_tables *t, struct route_entry *entry) {
 	// Newly added or updated, create a new fib entry and nexthops.
-	// XXX: An entry with the same metric does not come.
-	//      If same metric entry will be come,
-	//      do not create entry.
 	fib_t *f = fib_create(t->interface, entry);
 	if (!f) {
 		ROUTER_ERROR("Failed to create metric entry.");
@@ -404,7 +416,6 @@ route_entry_get(struct router_tables *tbls, const uint32_t dst) {
 		return NULL;
 	}
 
-	// Lookup failed
 	// Lookup failed
 	if (ret < 0) {
 		ROUTER_ERROR("[ROUTE] rte_lpm_lookup() failed, err = %d.", ret);

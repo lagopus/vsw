@@ -87,6 +87,7 @@ struct ipsec_traffic {
 
 typedef lagopus_result_t
 (*prepare_one_packet_proc_t)(struct rte_mbuf *pkt,
+                             vifindex_t vif_index,
                              uint8_t *proto,
                              size_t size_of_ip,
                              struct traffic_type *t_ipsec,
@@ -122,6 +123,7 @@ struct ipsec_data {
 
 lagopus_result_t
 prepare_one_packet_inbound(struct rte_mbuf *pkt,
+                           vifindex_t vif_index,
                            uint8_t *proto,
                            size_t size_of_ip,
                            struct traffic_type *t_ipsec,
@@ -153,6 +155,9 @@ prepare_one_packet_inbound(struct rte_mbuf *pkt,
       return LAGOPUS_RESULT_UNKNOWN_PROTO;
     }
 
+    /* set in_vif index. */
+    set_meta_vif(pkt, vif_index);
+
     t_ipsec->pkts[(t_ipsec->num)++] = pkt;
     return LAGOPUS_RESULT_OK;
   }
@@ -163,12 +168,14 @@ prepare_one_packet_inbound(struct rte_mbuf *pkt,
 
 lagopus_result_t
 prepare_one_packet_outbound(struct rte_mbuf *pkt,
+                            vifindex_t vif_index,
                             uint8_t *proto,
                             size_t size_of_ip,
                             struct traffic_type *t_ipsec,
                             struct traffic_type *t_ike,
                             struct traffic_type *t_ip) {
   struct ipsec_mbuf_metadata *priv = get_priv(pkt);
+  (void) vif_index;
 
   /* IP packet. */
   if (likely(rte_pktmbuf_adj(pkt, ETHER_HDR_LEN) != NULL)) {
@@ -224,13 +231,15 @@ prepare_one_packet(struct module *myself,
 
   if (eth->ether_type == rte_cpu_to_be_16(ETHER_TYPE_IPv4)) {
     /* IPv4. */
-    ret = data->prepare_one_packet_proc(pkt, &ip->ip_p,
+    ret = data->prepare_one_packet_proc(pkt, data->vif_index,
+                                        &ip->ip_p,
                                         sizeof(struct ip),
                                         &t->ipsec, &t->ike, &t->ip4);
   } else if (eth->ether_type == rte_cpu_to_be_16(ETHER_TYPE_IPv6)) {
     /* IPv6. */
     struct ip6_hdr *ip6 = (struct ip6_hdr *) ip;
-    ret = data->prepare_one_packet_proc(pkt, &ip6->ip6_nxt,
+    ret = data->prepare_one_packet_proc(pkt, data->vif_index,
+                                        &ip6->ip6_nxt,
                                         sizeof(struct ip6_hdr),
                                         &t->ipsec, &t->ike, &t->ip6);
   } else {
@@ -306,7 +315,10 @@ prepare_tx_pkt(struct module *myself, struct rte_mbuf *pkt,
 
   ip = rte_pktmbuf_mtod(pkt, struct ip *);
 
+  /* NOTE: Headroom size is checked in advance.                 */
+  /*       cf. process_pkts_inbound(), process_pkts_outbound(). */
   ethhdr = (struct ether_hdr *)rte_pktmbuf_prepend(pkt, ETHER_HDR_LEN);
+  assert(ethhdr != NULL);
 
   if (ip->ip_v == IPVERSION) {
     struct ipv4_hdr *ipv4_hdr = (struct ipv4_hdr *) ip;
@@ -438,6 +450,16 @@ process_pkts_inbound(struct module *module,
   /* SP/ACL Inbound check ipsec and ip4 */
   for (i = 0; i < nb_pkts_in; i++) {
     m = traffic->ipsec.pkts[i];
+
+    /* Pre-Check if Headroom has free space for ether header. */
+    /* Execute rte_pktmbuf_prepend() in prepare_tx_pkt().     */
+    if (unlikely(rte_pktmbuf_headroom(m) < ETHER_HDR_LEN)) {
+      TUNNEL_DEBUG("DROP: Headroom isn't enough.");
+      iface_stats_update_errors(stats);
+      rte_pktmbuf_free(m);
+      continue;
+    }
+
     ip = rte_pktmbuf_mtod(m, struct ip *);
     if (ip->ip_v == IPVERSION) {
       idx = traffic->ip4.num++;
@@ -564,6 +586,16 @@ process_pkts_outbound(struct module *module,
 
   for (i = 0; i < nb_pkts_out; i++) {
     m = traffic->ipsec.pkts[i];
+
+    /* Pre-Check if Headroom has free space for ether header. */
+    /* Execute rte_pktmbuf_prepend() in prepare_tx_pkt().     */
+    if (unlikely(rte_pktmbuf_headroom(m) < ETHER_HDR_LEN)) {
+      TUNNEL_DEBUG("DROP: Headroom isn't enough.");
+      iface_stats_update_errors(stats);
+      rte_pktmbuf_free(m);
+      continue;
+    }
+
     ip = rte_pktmbuf_mtod(m, struct ip *);
     if (ip->ip_v == IPVERSION) {
       idx = traffic->ip4.num++;

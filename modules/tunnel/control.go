@@ -81,11 +81,12 @@ func createL3SetTOSCmdParam(tos int8) *C.struct_l3tun_control_param {
 	}
 }
 
-func createL3SetEnableCmdParam(addressType vswitch.AddressFamily,
+func createL3SetEnableCmdParam(index vswitch.VIFIndex, addressType vswitch.AddressFamily,
 	localAddr net.IP, remoteAddr net.IP, hopLimit uint8, tos int8,
 	inboudOutput *C.struct_rte_ring, outboudOutput *C.struct_rte_ring) *C.struct_l3tun_control_param {
 	return &C.struct_l3tun_control_param{
 		cmd:             C.l3tun_cmd_t(C.L3TUN_CMD_SET_ENABLE),
+		index:           C.vifindex_t(index),
 		address_type:    C.uint16_t(uint16(addressType)),
 		local_addr:      ip2ipAddr(localAddr),
 		remote_addr:     ip2ipAddr(remoteAddr),

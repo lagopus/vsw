@@ -307,7 +307,7 @@ struct router_mbuf_metadata {
 	bool reassemble_packet;
 	bool has_option;
 	bool no_outbound_napt;		    // true if the packet's shouldn't be NAPTed during outbound.
-} __rte_cache_aligned;
+};
 
 struct router_instance {
 	struct vsw_instance base;
